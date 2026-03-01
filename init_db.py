@@ -1,0 +1,63 @@
+from db import get_connection
+
+def init_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA foreign_keys = ON;")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tenants (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        evotor_api_key TEXT NOT NULL,
+        moysklad_token TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS event_store (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK (event_type IN ('sale','product','stock')),
+        event_key TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('NEW','PROCESSING','DONE','RETRY','FAILED')),
+        retries INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER,
+        last_error_code TEXT,
+        last_error_message TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+    """)
+
+    cursor.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_event_unique
+    ON event_store(tenant_id, event_key)
+    """)
+
+    cursor.execute("""
+    CREATE INDEX IF NOT EXISTS idx_event_status_retry
+    ON event_store(status, next_retry_at)
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS processed_events (
+        tenant_id TEXT NOT NULL,
+        event_key TEXT NOT NULL,
+        result_ref TEXT,
+        processed_at INTEGER NOT NULL,
+        PRIMARY KEY (tenant_id, event_key),
+        FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+    print("DB initialized")
+
+if __name__ == "__main__":
+    init_db()
