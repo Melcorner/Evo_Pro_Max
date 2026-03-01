@@ -73,6 +73,17 @@ async def evotor_webhook(tenant_id: str, body: EvotorWebhook):
 
     cursor.execute("SELECT id FROM tenants WHERE id = ?", (tenant_id,))
     row = cursor.fetchone()
+
+# если событие уже обработано — игнорируем дубль
+    cursor.execute("""
+        SELECT 1 FROM processed_events
+        WHERE tenant_id = ? AND event_key = ?
+    """, (tenant_id, event_key))
+
+    if cursor.fetchone() is not None:
+        conn.close()
+        return {"status": "already_processed"}
+
     if row is None:
         conn.close()
         raise HTTPException(status_code=404, detail="tenant not found")
@@ -101,3 +112,19 @@ async def evotor_webhook(tenant_id: str, body: EvotorWebhook):
 
     conn.close()
     return {"status": "accepted", "event_id": event_id}
+
+@app.get("/processed")
+def list_processed():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT tenant_id, event_key, result_ref, processed_at
+        FROM processed_events
+        ORDER BY processed_at DESC
+        LIMIT 50
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [dict(r) for r in rows]

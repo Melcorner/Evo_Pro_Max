@@ -41,12 +41,25 @@ def process_one_event():
         print(f"Processing event {event_id}")
         time.sleep(1)
 
-        # помечаем DONE
+        now = int(time.time())
+
+        #помечаем DONE
         cursor.execute("""
             UPDATE event_store
             SET status = 'DONE', updated_at = ?
             WHERE id = ?
-        """, (int(time.time()), event_id))
+        """, (now, event_id))
+
+        # фиксируем идемпотентность: событие обработано
+        cursor.execute("""
+            INSERT OR IGNORE INTO processed_events (tenant_id, event_key, result_ref, processed_at)
+            VALUES (?, ?, ?, ?)
+        """, (
+            row["tenant_id"],
+            row["event_key"],
+            None,
+            now
+        ))
 
         conn.commit()
 
