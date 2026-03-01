@@ -1,9 +1,14 @@
 import time
 import uuid
+import logging
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
+from logger import setup_logging
+
+setup_logging()
+log = logging.getLogger("api")
 
 from db import get_connection
 
@@ -60,10 +65,14 @@ from fastapi import HTTPException, Request
 
 @app.post("/webhooks/evotor/{tenant_id}")
 async def evotor_webhook(tenant_id: str, body: EvotorWebhook):
+    log.info(f"Webhook received tenant_id={tenant_id}")
+
     payload = body.dict()
 
     event_key = payload.get("event_id") or str(uuid.uuid4())
     event_type = payload.get("type") or "sale"
+
+    log.info(f"Webhook parsed tenant_id={tenant_id} event_type={event_type} event_key={event_key}")
 
     now = int(time.time())
     event_id = str(uuid.uuid4())
@@ -82,6 +91,9 @@ async def evotor_webhook(tenant_id: str, body: EvotorWebhook):
 
     if cursor.fetchone() is not None:
         conn.close()
+
+        log.info(f"Already processed tenant_id={tenant_id} event_key={event_key}")
+
         return {"status": "already_processed"}
 
     if row is None:
@@ -111,6 +123,9 @@ async def evotor_webhook(tenant_id: str, body: EvotorWebhook):
         return {"status": "duplicate_or_error", "detail": str(e)}
 
     conn.close()
+
+    log.info(f"Event stored NEW event_id={event_id} tenant_id={tenant_id} event_key={event_key}")
+
     return {"status": "accepted", "event_id": event_id}
 
 @app.get("/processed")
@@ -127,4 +142,19 @@ def list_processed():
     rows = cursor.fetchall()
     conn.close()
 
+    return [dict(r) for r in rows]
+
+@app.get("/events/retry")
+def list_retry():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, tenant_id, event_key, status, retries, next_retry_at, last_error_message
+        FROM event_store
+        WHERE status IN ('RETRY','FAILED')
+        ORDER BY updated_at DESC
+        LIMIT 50
+    """)
+    rows = cursor.fetchall()
+    conn.close()
     return [dict(r) for r in rows]

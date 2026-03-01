@@ -1,5 +1,11 @@
 import time
 import uuid
+import logging
+
+from logger import setup_logging
+
+setup_logging()
+log = logging.getLogger("worker")
 
 from db import get_connection
 
@@ -8,13 +14,14 @@ def process_one_event():
     conn = get_connection()
     cursor = conn.cursor()
 
-    # забираем одно NEW событие
+    now = int(time.time()) 
+
     cursor.execute("""
         SELECT * FROM event_store
-        WHERE status = 'NEW'
+        WHERE (status = 'NEW') OR (status = 'RETRY' AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND retries < 5)
         ORDER BY created_at
         LIMIT 1
-    """)
+    """, (now,))
     row = cursor.fetchone()
 
     if not row:
@@ -22,12 +29,13 @@ def process_one_event():
         return False
 
     event_id = row["id"]
+    log.info(f"Picked event_id={event_id} status={row['status']} retries={row['retries']} event_key={row['event_key']}")
 
     # пытаемся захватить (важно для будущих параллельных воркеров)
     cursor.execute("""
         UPDATE event_store
         SET status = 'PROCESSING', updated_at = ?
-        WHERE id = ? AND status = 'NEW'
+        WHERE id = ? AND status IN('NEW','RETRY')
     """, (int(time.time()), event_id))
 
     if cursor.rowcount == 0:
@@ -35,9 +43,12 @@ def process_one_event():
         return True  # кто-то уже взял
 
     conn.commit()
+    log.info(f"Locked event_id={event_id} -> PROCESSING")
 
     try:
+        raise Exception("test retry")
         # здесь потом будет реальная логика sync
+        log.info(f"Processing event={event_id}")
         print(f"Processing event {event_id}")
         time.sleep(1)
 
@@ -62,21 +73,40 @@ def process_one_event():
         ))
 
         conn.commit()
+        log.info(f"DONE event_id={event_id} event_key={row['event_key']}")
 
     except Exception as e:
-        cursor.execute("""
-            UPDATE event_store
-            SET status = 'RETRY',
-                retries = retries + 1,
-                next_retry_at = ?,
-                last_error_message = ?
-            WHERE id = ?
-        """, (
-            int(time.time()) + 60,
-            str(e),
-            event_id
-        ))
-        conn.commit()
+        now = int(time.time())
+
+        # retries после инкремента
+        new_retries = row["retries"] + 1
+        delay = 60 * (2 ** (new_retries - 1))  # 60,120,240,480,960
+
+        # если попыток стало 5 — считаем окончательно проваленным
+        if new_retries >= 5:
+            cursor.execute("""
+                UPDATE event_store
+                SET status = 'FAILED',
+                    retries = ?,
+                    next_retry_at = NULL,
+                    last_error_message = ?,
+                    updated_at = ?
+                WHERE id = ?
+            """, (new_retries, str(e), now, event_id))
+            conn.commit()
+            log.error(f"FAILED event_id={event_id} event_key={row['event_key']} retries={row['retries']} err={e}")
+        else:
+            cursor.execute("""
+                UPDATE event_store
+                SET status = 'RETRY',
+                    retries = ?,
+                    next_retry_at = ?,
+                    last_error_message = ?,
+                    updated_at = ?
+                WHERE id = ?
+            """, (new_retries, now + delay, str(e), now, event_id))
+            conn.commit()
+            log.warning(f"RETRY event_id={event_id} event_key={row['event_key']} retries={new_retries} next_retry_at={now+delay} err={e}")
 
     conn.close()
     return True
