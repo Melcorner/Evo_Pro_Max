@@ -3,6 +3,7 @@ import uuid
 import logging
 
 from logger import setup_logging
+from sale_handler import handle_sale
 
 setup_logging()
 log = logging.getLogger("worker")
@@ -46,11 +47,14 @@ def process_one_event():
     log.info(f"Locked event_id={event_id} -> PROCESSING")
 
     try:
-        raise Exception("test retry")
-        # здесь потом будет реальная логика sync
-        log.info(f"Processing event={event_id}")
-        print(f"Processing event {event_id}")
-        time.sleep(1)
+        #raise Exception("test retry")
+        log.info(f"Processing event_id={event_id} event_type={row['event_type']}")
+
+        if row["event_type"] == "sale":
+            result_ref = handle_sale(row)
+        else:
+            log.info(f"Unknown event_type={row['event_type']}, using stub")
+            result_ref = "stub"
 
         now = int(time.time())
 
@@ -68,7 +72,7 @@ def process_one_event():
         """, (
             row["tenant_id"],
             row["event_key"],
-            None,
+            result_ref,
             now
         ))
 
