@@ -54,6 +54,29 @@ def init_db():
         FOREIGN KEY (tenant_id) REFERENCES tenants(id)
     )
     """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS mappings (
+        tenant_id TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        evotor_id TEXT NOT NULL,
+        ms_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+
+        UNIQUE (tenant_id, entity_type, evotor_id),
+        UNIQUE (tenant_id, entity_type, ms_id)
+    )
+    """)
+
+    cursor.execute("""
+    CREATE INDEX IF NOT EXISTS idx_mappings_evotor 
+        ON mappings(tenant_id, entity_type, evotor_id)
+    """)
+
+    cursor.execute("""
+    CREATE INDEX IF NOT EXISTS idx_mappings_ms 
+    ON mappings(tenant_id, entity_type, ms_id)
+    """)
 
     conn.commit()
     conn.close()

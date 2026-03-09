@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
 from logger import setup_logging
+from endpoints.mappings import router as mappings_router
 
 setup_logging()
 log = logging.getLogger("api")
@@ -13,6 +14,7 @@ log = logging.getLogger("api")
 from db import get_connection
 
 app = FastAPI()
+app.include_router(mappings_router)
 
 class EvotorWebhook(BaseModel):
     type: str
@@ -158,3 +160,6 @@ def list_retry():
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+
