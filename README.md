@@ -17,9 +17,12 @@
  - Worker с optimistic locking
  - Retry с exponential backoff
  - Перевод в FAILED после лимита попыток
+ - Классификация ошибок RETRY / FAILED
+ - Запись ошибок в таблицу errors
+ - Сохранение payload_snapshot для диагностики
+ - Dispatch событий через event_dispatcher
  - E2E тест сценария
  - Структурированное логирование
-
 ---
 
 ## 🧱 Архитектура
@@ -41,12 +44,77 @@
 Таблица processed_events гарантирует, что одно событие не будет обработано дважды.
 
 ---
+## ⚠️ Обработка ошибок и orchestration
 
+### Классификация ошибок
+
+В проект добавлен helper `classify_error(e)`, который разделяет ошибки на два класса:
+
+**RETRY**
+- timeout
+- connection error
+- HTTP 429
+- HTTP 5xx
+
+**FAILED**
+- HTTP 400
+- HTTP 401
+- HTTP 403
+- HTTP 422
+
+Это позволяет worker принимать корректное решение:
+- повторять событие при временной ошибке
+- завершать событие как FAILED при фатальной ошибке
+
+---
+
+### Таблица errors
+
+Добавлена отдельная таблица `errors`, в которую сохраняются ошибки обработки событий.
+
+Для каждой ошибки сохраняются:
+- `event_id`
+- `tenant_id`
+- `error_code`
+- `message`
+- `payload_snapshot`
+- `created_at`
+
+Это даёт возможность:
+- разбирать причины сбоев
+- анализировать payload, на котором упала обработка
+- хранить историю ошибок отдельно от event_store
+
+---
+
+### Dispatch событий
+
+Worker больше не содержит бизнес-логики обработки типов событий.
+
+Теперь worker отвечает только за orchestration:
+1. выбор события из event_store
+2. перевод в PROCESSING
+3. вызов dispatch
+4. перевод в DONE / RETRY / FAILED
+5. запись в processed_events
+6. запись в errors
+
+Вызов конкретного обработчика вынесен в `event_dispatcher.py`.
+
+Это упрощает расширение системы под новые use-case:
+- sale
+- product
+- stock
+
+---
 ## 📦 Структура проекта
 
     integration-bus/
     ├── main.py              # FastAPI приложение (ingest)
     ├── worker.py            # фоновый обработчик событий
+    ├── event_dispatcher.py  # dispatch по event_type
+    ├── error_logic.py       # классификация ошибок RETRY / FAILED
+    ├── error_store.py       # запись ошибок в таблицу errors
     ├── db.py                # подключение к SQLite
     ├── init_db.py           # создание схемы БД
     ├── logger.py            # настройка логирования
@@ -170,9 +238,9 @@ Worker начнёт обрабатывать события.
 
     GET /tenants
 
-Список событий
+События на повторной обработке
 
-    GET /events
+    GET /events/retry
 
 Обработанные события
 
