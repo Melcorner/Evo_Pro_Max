@@ -18,11 +18,12 @@ def process_one_event():
     conn = get_connection()
     cursor = conn.cursor()
 
-    now = int(time.time()) 
+    now = int(time.time())
 
     cursor.execute("""
         SELECT * FROM event_store
-        WHERE (status = 'NEW') OR (status = 'RETRY' AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND retries < 5)
+        WHERE (status = 'NEW')
+           OR (status = 'RETRY' AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND retries < 5)
         ORDER BY created_at
         LIMIT 1
     """, (now,))
@@ -35,11 +36,11 @@ def process_one_event():
     event_id = row["id"]
     log.info(f"Picked event_id={event_id} status={row['status']} retries={row['retries']} event_key={row['event_key']}")
 
-    # пытаемся захватить (важно для будущих параллельных воркеров)
+    # пытаемся захватить событие
     cursor.execute("""
         UPDATE event_store
         SET status = 'PROCESSING', updated_at = ?
-        WHERE id = ? AND status IN('NEW','RETRY')
+        WHERE id = ? AND status IN ('NEW','RETRY')
     """, (int(time.time()), event_id))
 
     if cursor.rowcount == 0:
@@ -50,21 +51,20 @@ def process_one_event():
     log.info(f"Locked event_id={event_id} -> PROCESSING")
 
     try:
-        #raise Exception("test retry")
         log.info(f"Processing event_id={event_id} event_type={row['event_type']}")
 
         result_ref = dispatch_event(row)
 
         now = int(time.time())
 
-        #помечаем DONE
+        # помечаем DONE
         cursor.execute("""
             UPDATE event_store
             SET status = 'DONE', updated_at = ?
             WHERE id = ?
         """, (now, event_id))
 
-        # фиксируем идемпотентность: событие обработано
+        # фиксируем идемпотентность
         cursor.execute("""
             INSERT OR IGNORE INTO processed_events (tenant_id, event_key, result_ref, processed_at)
             VALUES (?, ?, ?, ?)
@@ -77,6 +77,8 @@ def process_one_event():
 
         conn.commit()
         log.info(f"DONE event_id={event_id} event_key={row['event_key']}")
+        conn.close()
+        return True
 
     except Exception as e:
         now = int(time.time())
@@ -102,7 +104,7 @@ def process_one_event():
         )
 
         if decision == FAILED:
-           cursor.execute("""
+            cursor.execute("""
                 UPDATE event_store
                 SET status = 'FAILED',
                     retries = ?,
@@ -112,66 +114,68 @@ def process_one_event():
                 WHERE id = ?
             """, (new_retries, err, now, event_id))
 
-        insert_error(conn, row, error_code, err)
+            insert_error(conn, row, error_code, err)
 
-        conn.commit()
-        log.error(
-            "FAILED event_id=%s event_key=%s retries=%s err=%s",
-            event_id,
-            row["event_key"],
-            new_retries,
-            err,
-        )
-        return
+            conn.commit()
+            log.error(
+                "FAILED event_id=%s event_key=%s retries=%s err=%s",
+                event_id,
+                row["event_key"],
+                new_retries,
+                err,
+            )
+            conn.close()
+            return True
 
-            # decision == RETRY
-    delay = 60 * (2 ** (new_retries - 1))  # 60,120,240,480,960
+        # decision == RETRY
+        delay = 60 * (2 ** (new_retries - 1))  # 60,120,240,480,960
 
-    if new_retries >= 5:
-                cursor.execute("""
-                    UPDATE event_store
-                    SET status = 'FAILED',
-                        retries = ?,
-                        next_retry_at = NULL,
-                        last_error_message = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                """, (new_retries, err, now, event_id))
+        if new_retries >= 5:
+            cursor.execute("""
+                UPDATE event_store
+                SET status = 'FAILED',
+                    retries = ?,
+                    next_retry_at = NULL,
+                    last_error_message = ?,
+                    updated_at = ?
+                WHERE id = ?
+            """, (new_retries, err, now, event_id))
 
-                insert_error(conn, row, error_code, err)
+            insert_error(conn, row, error_code, err)
 
-                conn.commit()
-                log.error(
-                    "FAILED event_id=%s event_key=%s retries=%s err=%s",
-                    event_id,
-                    row["event_key"],
-                    new_retries,
-                    err,
-                )
-    else:
-                cursor.execute("""
-                    UPDATE event_store
-                    SET status = 'RETRY',
-                        retries = ?,
-                        next_retry_at = ?,
-                        last_error_message = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                """, (new_retries, now + delay, err, now, event_id))
+            conn.commit()
+            log.error(
+                "FAILED event_id=%s event_key=%s retries=%s err=%s",
+                event_id,
+                row["event_key"],
+                new_retries,
+                err,
+            )
+        else:
+            cursor.execute("""
+                UPDATE event_store
+                SET status = 'RETRY',
+                    retries = ?,
+                    next_retry_at = ?,
+                    last_error_message = ?,
+                    updated_at = ?
+                WHERE id = ?
+            """, (new_retries, now + delay, err, now, event_id))
 
-                insert_error(conn, row, error_code, err)
+            insert_error(conn, row, error_code, err)
 
-                conn.commit()
-                log.warning(
-                    "RETRY event_id=%s event_key=%s retries=%s next_retry_at=%s err=%s",
-                    event_id,
-                    row["event_key"],
-                    new_retries,
-                    now + delay,
-                    err,
-                )
-    return
+            conn.commit()
+            log.warning(
+                "RETRY event_id=%s event_key=%s retries=%s next_retry_at=%s err=%s",
+                event_id,
+                row["event_key"],
+                new_retries,
+                now + delay,
+                err,
+            )
 
+        conn.close()
+        return True
 
 def main_loop():
     print("Worker started")
