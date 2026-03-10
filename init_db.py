@@ -69,6 +69,22 @@ def init_db():
     """)
 
     cursor.execute("""
+    CREATE TABLE IF NOT EXISTS errors (
+        id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        error_code TEXT,
+        message TEXT NOT NULL,
+        payload_snapshot TEXT,
+        created_at INTEGER NOT NULL
+    )
+    """)
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_event_id ON errors(event_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_tenant_id ON errors(tenant_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_created_at ON errors(created_at)")
+    
+    cursor.execute("""
     CREATE INDEX IF NOT EXISTS idx_mappings_evotor 
         ON mappings(tenant_id, entity_type, evotor_id)
     """)

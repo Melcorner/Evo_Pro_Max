@@ -165,6 +165,9 @@ def create_mapping(data: MappingCreate):
     return {
         "status": "ok"
     }
+# ==============================================================================
+# DELETE /mappings
+# ==============================================================================
 
 @router.delete("/", summary="Удалить маппинг по tenant/entity/evotor_id")
 def delete_mapping(data: MappingDelete = Body(...)):
