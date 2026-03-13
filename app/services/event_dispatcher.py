@@ -1,4 +1,4 @@
-from sale_handler import handle_sale
+from app.handlers.sale_handler import handle_sale
 
 
 def dispatch_event(row):

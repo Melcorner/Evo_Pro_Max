@@ -128,23 +128,49 @@ Worker больше не содержит бизнес-логики обрабо
 
 ```text
 integration-bus/
-├── main.py                 # FastAPI приложение (ingest)
-├── worker.py               # Фоновый обработчик событий
-├── event_dispatcher.py     # Dispatch по event_type
-├── sale_handler.py         # Use-case обработчик sale
-├── sale_mapper.py          # Преобразование sale payload в формат MoySklad
-├── moysklad_client.py      # HTTP client для MoySklad API
-├── mapping_store.py        # Хранилище mappings (Evotor ↔ MoySklad)
-├── error_logic.py          # Классификация ошибок RETRY / FAILED
-├── error_store.py          # Запись ошибок в таблицу errors
-├── db.py                   # Подключение к SQLite
-├── init_db.py              # Создание схемы БД
-├── logger.py               # Настройка логирования
-├── e2e_test.py             # End-to-end тест
-├── endpoints/              # Дополнительные API endpoints
-├── requirements.txt
-├── app.db                  # SQLite база (создаётся автоматически)
-└── README.md
+├── app/
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── events.py
+│   │   ├── mappings.py
+│   │   ├── tenants.py
+│   │   └── webhooks.py
+│   ├── clients/
+│   │   ├── __init__.py
+│   │   └── moysklad_client.py
+│   ├── handlers/
+│   │   ├── __init__.py
+│   │   └── sale_handler.py
+│   ├── mappers/
+│   │   ├── __init__.py
+│   │   └── sale_mapper.py
+│   ├── scripts/
+│   │   ├── __init__.py
+│   │   └── init_db.py
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── error_logic.py
+│   │   └── event_dispatcher.py
+│   ├── stores/
+│   │   ├── __init__.py
+│   │   ├── error_store.py
+│   │   └── mapping_store.py
+│   ├── workers/
+│   │   ├── __init__.py
+│   │   └── worker.py
+│   ├── __init__.py
+│   ├── db.py
+│   ├── logger.py
+│   └── main.py
+├── data/
+├── tests/
+│   ├── e2e_test.py
+│   ├── test_db.py
+│   └── test_sale.py
+├── venv/
+├── .gitignore
+├── README.md
+└── requirements.txt
 ```
 
 ---
@@ -190,7 +216,7 @@ pip install -r requirements.txt
 ### 4. Инициализировать базу данных
 
 ```bash
-python init_db.py
+python -m app.scripts.init_db
 ```
 
 Ожидаемый вывод:
@@ -208,7 +234,7 @@ DB initialized
 ### Терминал 1 — API сервер
 
 ```bash
-uvicorn main:app --reload
+uvicorn app.main:app --reload
 ```
 
 Swagger будет доступен по адресу:
@@ -219,9 +245,18 @@ http://127.0.0.1:8000/docs
 
 ### Терминал 2 — Worker
 
+**macOS / Linux**
+
 ```bash
 export MS_BASE_URL=https://httpbin.org
-python worker.py
+python -m app.workers.worker
+```
+
+**Windows PowerShell**
+
+```powershell
+$env:MS_BASE_URL="https://httpbin.org"
+python -m app.workers.worker
 ```
 
 Worker начнёт обрабатывать события.
@@ -229,7 +264,13 @@ Worker начнёт обрабатывать события.
 ### Терминал 3 — E2E тест (опционально)
 
 ```bash
-python e2e_test.py
+python tests/e2e_test.py
+```
+
+Ожидаемый результат:
+
+```text
+✅ E2E OK: DONE + processed_events
 ```
 
 ---
@@ -298,36 +339,57 @@ timestamp | level | logger | message
 
 ## 🛠️ Полезные эндпоинты
 
-Проверка сервера:
+### Проверка сервера
 
 ```text
 GET /health
 ```
 
-Список tenants:
+### Работа с tenant'ами
 
 ```text
+POST /tenants
 GET /tenants
 ```
 
-События на повторной обработке:
+### Webhook
 
 ```text
-GET /events/retry
+POST /webhooks/evotor/{tenant_id}
 ```
 
-Обработанные события:
+### Диагностика событий
 
 ```text
+GET /events
+GET /events/retry
 GET /processed
 ```
 
-Mappings:
+### Mappings
 
 ```text
 GET /mappings
 POST /mappings
 DELETE /mappings
+```
+
+---
+
+## Тестовый сценарий обработки
+
+Текущий end-to-end сценарий:
+
+```text
+1. Создание tenant
+2. Отправка webhook
+3. Сохранение события в event_store
+4. Захват события worker'ом
+5. Обработка события через sale_handler
+6. Преобразование данных через sale_mapper
+7. Отправка данных через moysklad_client
+8. Запись результата в processed_events
+9. Перевод события в DONE
 ```
 
 ---

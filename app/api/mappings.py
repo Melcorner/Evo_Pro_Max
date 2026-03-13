@@ -6,8 +6,8 @@ from typing import Optional, List
 from fastapi import APIRouter, Query, HTTPException, Body
 from pydantic import BaseModel
 
-from db import get_connection
-from mapping_store import MappingStore
+from app.db import get_connection
+from app.stores.mapping_store import MappingStore
 
 log = logging.getLogger("mappings_endpoint")
 

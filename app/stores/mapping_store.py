@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Optional
 
-from db import get_connection
+from app.db import get_connection
 
 log = logging.getLogger("mapping_store")
 

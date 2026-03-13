@@ -2,16 +2,16 @@ import time
 import uuid
 import logging
 
-from logger import setup_logging
-from sale_handler import handle_sale
-from error_logic import classify_error, RETRY, FAILED
-from error_store import insert_error
-from event_dispatcher import dispatch_event
+from app.logger import setup_logging
+from app.handlers.sale_handler import handle_sale
+from app.services.error_logic import classify_error, RETRY, FAILED
+from app.stores.error_store import insert_error
+from app.services.event_dispatcher import dispatch_event
 
 setup_logging()
 log = logging.getLogger("worker")
 
-from db import get_connection
+from app.db import get_connection
 
 
 def process_one_event():
