@@ -1,5 +1,5 @@
 import logging
-from mapping_store import MappingStore
+from app.stores.mapping_store import MappingStore
 
 log = logging.getLogger("sale_mapper")
 

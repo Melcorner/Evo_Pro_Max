@@ -3,7 +3,7 @@ import uuid
 import requests
 import sqlite3
 
-DB_PATH = "app.db"
+DB_PATH = "data/app.db"
 API = "http://127.0.0.1:8000"
 
 

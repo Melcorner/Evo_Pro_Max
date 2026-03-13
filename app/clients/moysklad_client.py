@@ -2,7 +2,7 @@ import requests
 import logging
 import os
 
-from db import get_connection
+from app.db import get_connection
 
 log = logging.getLogger("moysklad")
 

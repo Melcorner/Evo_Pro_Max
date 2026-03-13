@@ -1,7 +1,7 @@
 import json
 import logging
-from mapping_store import MappingStore
-from sale_mapper import map_sale_to_ms
+from app.stores.mapping_store import MappingStore
+from app.mappers.sale_mapper import map_sale_to_ms
 
 # Логирование в консоль
 logging.basicConfig(level=logging.INFO)

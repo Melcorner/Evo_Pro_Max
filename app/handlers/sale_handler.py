@@ -1,8 +1,8 @@
 import json
 import logging
 
-from moysklad_client import MoySkladClient
-from sale_mapper import map_sale_to_ms
+from app.clients.moysklad_client import MoySkladClient
+from app.mappers.sale_mapper import map_sale_to_ms
 
 log = logging.getLogger("sale_handler")
 
