@@ -76,3 +76,34 @@ class MoySkladClient:
         r.raise_for_status()
 
         return r.json()
+    
+    def create_sale_document(self, payload):
+        if "httpbin.org" in self.BASE_URL:
+            url = f"{self.BASE_URL}/post"
+        else:
+            url = f"{self.BASE_URL}/entity/demand"
+
+        log.info(f"Creating sale document url={url}")
+        log.info(f"Sale payload={payload}")
+
+        r = requests.post(
+            url,
+            headers=self._headers(),
+            json=payload,
+            timeout=15
+        )
+
+        log.info(f"MoySklad response={r.status_code}")
+
+        r.raise_for_status()
+        response_json = r.json()
+
+        if "httpbin.org" in self.BASE_URL:
+            result_ref = "httpbin:created"
+        else:
+            result_ref = response_json.get("id")
+        return {
+            "success": True,
+            "result_ref": result_ref,
+            "raw_response": response_json
+        }
