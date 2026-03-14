@@ -2,7 +2,7 @@ import json
 import time
 import uuid
 import logging
-from typing import Optional
+from typing import Optional, List, Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -17,6 +17,10 @@ class EvotorWebhook(BaseModel):
     type: str
     event_id: str
     amount: Optional[int] = None
+    positions: Optional[List[Any]] = None
+
+    class Config:
+        extra = "allow"
 
 
 @router.post("/webhooks/evotor/{tenant_id}")
