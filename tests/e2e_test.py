@@ -14,7 +14,6 @@ def db_conn():
 
 
 def ensure_tenant():
-    # создаём tenant через API (простее, чем руками)
     resp = requests.post(f"{API}/tenants", json={
         "name": "E2E Tenant",
         "evotor_api_key": "k",
@@ -28,7 +27,10 @@ def send_webhook(tenant_id, event_key):
     resp = requests.post(f"{API}/webhooks/evotor/{tenant_id}", json={
         "type": "sale",
         "event_id": event_key,
-        "amount": 100
+        "positions": [
+            {"product_id": "p1", "quantity": 2, "price": 500},
+            {"product_id": "p2", "quantity": 1, "price": 300}
+        ]
     })
     resp.raise_for_status()
     return resp.json()
@@ -50,6 +52,9 @@ def wait_done(tenant_id, event_key, timeout_sec=15):
 
         if row and row["status"] == "DONE":
             return True
+
+        if row and row["status"] == "FAILED":
+            raise SystemExit(f"❌ Event went to FAILED — check worker logs")
 
         time.sleep(1)
     return False
