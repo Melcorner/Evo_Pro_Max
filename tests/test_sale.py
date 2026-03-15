@@ -21,15 +21,10 @@ class DummyClient:
 # --------------------------------------------------
 def handle_sale(event_row, store):
     payload = json.loads(event_row["payload_json"])
-    product_id = payload.get("product_id")
 
-    # ищем mapping
-    ms_id = store.get_by_evotor_id(event_row["tenant_id"], "product", product_id)
-    if not ms_id:
-        print(f"TODO: no mapping for product {product_id}")
 
     # формируем MS payload
-    ms_payload = map_sale_to_ms(payload)
+    ms_payload = map_sale_to_ms(payload, event_row["tenant_id"])
 
     # используем dummy client
     client = DummyClient(event_row["tenant_id"])
@@ -43,7 +38,7 @@ def handle_sale(event_row, store):
 # SELF-TEST
 # --------------------------------------------------
 if __name__ == "__main__":
-    store = MappingStore(db_path=":memory:")
+    store = MappingStore()
 
     # Добавим тестовый mapping
     store.upsert_mapping("tenant1", "product", "evo_123", "ms_456")
@@ -55,8 +50,14 @@ if __name__ == "__main__":
         "tenant_id": "tenant1",
         "payload_json": json.dumps({
             "event_id": "sale_1",
-            "product_id": "evo_123",
-            "amount": 100
+            "tenant_id": "tenant1",
+            "positions": [
+            {
+                "product_id": "evo_123",
+                "quantity": 1,
+                "price": 100
+            }
+            ]
         })
     }
 
@@ -67,8 +68,14 @@ if __name__ == "__main__":
         "tenant_id": "tenant1",
         "payload_json": json.dumps({
             "event_id": "sale_2",
-            "product_id": "evo_999",
-            "amount": 50
+            "tenant_id": "tenant2",
+            "positions": [
+            {
+                "product_id": "evo_999",
+                "quantity": 1,
+                "price": 50
+            }
+            ]
         })
     }
 
