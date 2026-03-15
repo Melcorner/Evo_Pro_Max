@@ -1,6 +1,5 @@
 import requests
 
-
 RETRY = "RETRY"
 FAILED = "FAILED"
 

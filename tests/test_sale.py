@@ -83,6 +83,9 @@ if __name__ == "__main__":
     handle_sale(event_with_mapping, store)
 
     print("--- Test without mapping ---")
-    handle_sale(event_without_mapping, store)
+    try:
+        handle_sale(event_without_mapping, store)
+    except Exception as e:
+        print("Expected error:", e)
 
     print(">>> Self-test complete <<<")

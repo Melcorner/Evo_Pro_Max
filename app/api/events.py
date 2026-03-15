@@ -37,6 +37,29 @@ def list_failed_events():
     conn.close()
     return rows
 
+@router.get("/events/{event_id}")
+def get_event(event_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            payload_json,
+            status,
+            retries,
+            next_retry_at,
+            last_error_message
+        FROM event_store
+        WHERE id = ?
+    """, (event_id,))
+
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    return dict(row)
 
 @router.post("/events/{event_id}/requeue")
 def requeue_event(event_id: str):

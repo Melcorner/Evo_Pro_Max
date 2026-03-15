@@ -9,7 +9,10 @@ class SalePayloadError(ValueError):
     """Фатальная ошибка валидации payload — не требует retry."""
     status_code = 422
 
-
+class MappingNotFoundError(ValueError):
+    """Ошибка отсутствия mapping — может быть RETRY или FAILED."""
+    status_code = 404
+    
 def validate_sale_payload(payload: dict):
     """
     Проверяет входящий payload перед маппингом.
