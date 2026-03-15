@@ -44,11 +44,17 @@ def get_event(event_id: str):
 
     cur.execute("""
         SELECT
+            id,
+            tenant_id,
+            event_type,
+            event_key,
             payload_json,
             status,
             retries,
             next_retry_at,
-            last_error_message
+            last_error_message,
+            created_at,
+            updated_at
         FROM event_store
         WHERE id = ?
     """, (event_id,))

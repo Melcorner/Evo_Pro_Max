@@ -6,168 +6,145 @@
 
 `Webhook → Event Store → Worker → Dispatch → Handler → Mapper → MoySklad API`
 
-Цель — показать надёжную обработку событий с:
-- идемпотентностью
-- повторными попытками
-- классификацией ошибок
-- журналированием ошибок
-- базовой интеграцией с MoySklad
-
 ---
 
-## 🚀 Возможности проекта
+## Возможности
 
-- Приём webhook событий
-- Хранение событий в `event_store`
-- Exactly-once обработка через `processed_events`
-- Worker с optimistic locking
-- Retry с exponential backoff
-- Перевод в `FAILED` после лимита попыток
+- Приём и хранение webhook событий с идемпотентностью
+- Worker с optimistic locking и exponential backoff retry
 - Классификация ошибок `RETRY / FAILED`
-- Запись ошибок в таблицу `errors`
-- Сохранение `payload_snapshot` для диагностики
-- Dispatch событий через `event_dispatcher`
-- Базовый client для MoySklad API
-- Базовый sale-handler и sale-mapper
-- Mapping storage (`mapping_store`)
+- Маппинг Evotor ID → MoySklad ID через `mapping_store`
+- Формирование `assortment.meta` для MoySklad API
+- `MappingNotFoundError` при отсутствии маппинга
+- Сохранение `response_body` ответа МойСклад при ошибках
+- Ручная повторная обработка FAILED событий через `requeue`
+- REST API для диагностики событий и ошибок
 - E2E тест сценария
-- Структурированное логирование
 
 ---
 
-## 🧱 Архитектура
+## Архитектура
 
 ### Ingest Layer
-Принимает webhook и сохраняет событие в `event_store` со статусом `NEW`.
+
+Webhook `POST /webhooks/evotor/{tenant_id}` принимает событие и сохраняет его в `event_store` со статусом `NEW`.
 
 ### Sync Worker
-Фоновый процесс, который:
-1. Берёт события `NEW` или `RETRY`
-2. Переводит их в `PROCESSING`
-3. Вызывает `dispatch_event(...)`
-4. Помечает событие как `DONE`, `RETRY` или `FAILED`
+
+Фоновый процесс:
+
+- Выбирает событие `NEW` или `RETRY`
+- Переводит в `PROCESSING` (optimistic lock)
+- Вызывает `dispatch_event(row)`
+- Переводит в `DONE`, `RETRY` или `FAILED`
+- Записывает в `processed_events` (идемпотентность)
+- Записывает в `errors` при неудаче
 
 ### Dispatch Layer
-`event_dispatcher.py` определяет, какой use-case должен обработать событие по `event_type`.
+
+`event_dispatcher.py` маршрутизирует событие по `event_type` к нужному handler'у.
 
 ### Handler Layer
-Например, `sale_handler.py` отвечает за orchestration конкретного сценария (`sale`).
+
+`sale_handler.py` оркестрирует сценарий продажи: вызывает маппер, отправляет в МойСклад, логирует ошибки маппинга.
 
 ### Mapper Layer
-`sale_mapper.py` подготавливает payload для MoySklad.  
-`mapping_store.py` хранит соответствия между идентификаторами Evotor и MoySklad.
+
+`sale_mapper.py` трансформирует payload Evotor в формат МойСклад:
+
+- валидирует обязательные поля (`event_id`, `positions`)
+- разрешает `evotor_id → ms_id` через `MappingStore`
+- формирует `assortment.meta` с `href` / `type` / `mediaType`
+- вычисляет `sum` по позициям
+- устанавливает `syncId = event_id`
 
 ### Idempotency Layer
-Таблица `processed_events` гарантирует, что одно и то же событие не будет обработано дважды.
+
+`processed_events` гарантирует exactly-once обработку.
 
 ---
 
-## ⚠️ Обработка ошибок и orchestration
+## Обработка ошибок
 
-### Классификация ошибок
+### Классификация
 
-В проект добавлен helper `classify_error(e)`, который разделяет ошибки на два класса.
+| Тип ошибки                              | Решение |
+| --------------------------------------- | ------- |
+| Timeout / ConnectionError               | RETRY   |
+| HTTP 429                                | RETRY   |
+| HTTP 5xx                                | RETRY   |
+| HTTP 400 / 401 / 403 / 422              | FAILED  |
+| `SalePayloadError` (невалидный payload) | FAILED  |
+| `MappingNotFoundError` (нет маппинга)   | FAILED  |
+| Остальные неизвестные                   | RETRY   |
 
-**RETRY**
-- timeout
-- connection error
-- HTTP 429
-- HTTP 5xx
+### Retry политика
 
-**FAILED**
-- HTTP 400
-- HTTP 401
-- HTTP 403
-- HTTP 422
-
-Это позволяет worker принимать корректное решение:
-- повторять событие при временной ошибке
-- завершать событие как `FAILED` при фатальной ошибке
-
----
+- Exponential backoff: `1m → 2m → 4m → 8m → 16m`
+- Максимум 5 попыток, затем → `FAILED`
 
 ### Таблица `errors`
 
-Добавлена отдельная таблица `errors`, в которую сохраняются ошибки обработки событий.
+При переходе в `FAILED` сохраняется запись с:
 
-Для каждой ошибки сохраняются:
-- `event_id`
-- `tenant_id`
-- `error_code`
-- `message`
-- `payload_snapshot`
-- `created_at`
-
-Это позволяет:
-- разбирать причины сбоев
-- анализировать payload, на котором упала обработка
-- хранить историю ошибок отдельно от `event_store`
+- `event_id`, `tenant_id`
+- `error_code` — HTTP статус (если есть)
+- `message` — текст ошибки
+- `payload_snapshot` — копия payload на момент ошибки
+- `response_body` — тело ответа МойСклад (если есть)
 
 ---
 
-### Dispatch событий
+## Жизненный цикл события
 
-Worker больше не содержит бизнес-логики обработки типов событий.
-
-Теперь worker отвечает только за orchestration:
-1. выбор события из `event_store`
-2. перевод в `PROCESSING`
-3. вызов dispatch
-4. перевод в `DONE / RETRY / FAILED`
-5. запись в `processed_events`
-6. запись в `errors`
-
-Это упрощает расширение системы под новые use-case:
-- `sale`
-- `product`
-- `stock`
+```text
+NEW → PROCESSING → DONE
+                ↘
+                RETRY (до 5 раз) → FAILED
+                                        ↓
+                                   requeue → NEW
+```
 
 ---
 
-## 📦 Структура проекта
+## Структура проекта
 
 ```text
 integration-bus/
 ├── app/
 │   ├── api/
-│   │   ├── __init__.py
-│   │   ├── events.py
-│   │   ├── mappings.py
-│   │   ├── tenants.py
-│   │   └── webhooks.py
+│   │   ├── errors.py       — GET /errors
+│   │   ├── events.py       — GET /events, GET /events/{id}, POST /events/{id}/requeue
+│   │   ├── mappings.py     — GET/POST/DELETE /mappings
+│   │   ├── tenants.py      — CRUD /tenants
+│   │   └── webhooks.py     — POST /webhooks/evotor/{tenant_id}
 │   ├── clients/
-│   │   ├── __init__.py
 │   │   └── moysklad_client.py
 │   ├── handlers/
-│   │   ├── __init__.py
 │   │   └── sale_handler.py
 │   ├── mappers/
-│   │   ├── __init__.py
 │   │   └── sale_mapper.py
 │   ├── scripts/
-│   │   ├── __init__.py
-│   │   └── init_db.py
+│   │   └── init_db.py      — инициализация и миграции БД
 │   ├── services/
-│   │   ├── __init__.py
 │   │   ├── error_logic.py
 │   │   └── event_dispatcher.py
 │   ├── stores/
-│   │   ├── __init__.py
 │   │   ├── error_store.py
 │   │   └── mapping_store.py
 │   ├── workers/
-│   │   ├── __init__.py
 │   │   └── worker.py
-│   ├── __init__.py
 │   ├── db.py
 │   ├── logger.py
 │   └── main.py
 ├── data/
+│   └── app.db
 ├── tests/
 │   ├── e2e_test.py
 │   ├── test_db.py
-│   └── test_sale.py
-├── venv/
+│   ├── test_sale.py
+│   └── test_sale2.py
+├── conftest.py
 ├── .gitignore
 ├── README.md
 └── requirements.txt
@@ -175,14 +152,14 @@ integration-bus/
 
 ---
 
-## ⚙️ Требования
+## Требования
 
 - Python 3.11+
 - macOS / Linux / Windows
 
 ---
 
-## 🔧 Установка и запуск
+## Установка и запуск
 
 ### 1. Клонировать проект
 
@@ -219,17 +196,13 @@ pip install -r requirements.txt
 python -m app.scripts.init_db
 ```
 
-Ожидаемый вывод:
-
-```text
-DB initialized
-```
+`init_db` идемпотентен — безопасно запускать повторно, применяет недостающие миграции.
 
 ---
 
-## ▶️ Запуск проекта
+## Запуск
 
-Проект запускается в трёх терминалах.
+Проект запускается в двух терминалах.
 
 ### Терминал 1 — API сервер
 
@@ -237,187 +210,120 @@ DB initialized
 uvicorn app.main:app --reload
 ```
 
-Swagger будет доступен по адресу:
-
-```text
-http://127.0.0.1:8000/docs
-```
+Swagger: `http://127.0.0.1:8000/docs`
 
 ### Терминал 2 — Worker
 
-**macOS / Linux**
+macOS / Linux:
 
 ```bash
 export MS_BASE_URL=https://httpbin.org
 python -m app.workers.worker
 ```
 
-**Windows PowerShell**
+Windows PowerShell:
 
 ```powershell
 $env:MS_BASE_URL="https://httpbin.org"
 python -m app.workers.worker
 ```
 
-Worker начнёт обрабатывать события.
+---
 
-### Терминал 3 — E2E тест (опционально)
+## E2E тест
+
+Перед запуском убедитесь, что API сервер и worker запущены.
 
 ```bash
 python tests/e2e_test.py
 ```
 
+Тест автоматически:
+
+1. Создаёт tenant
+2. Регистрирует маппинги для `p1` и `p2`
+3. Отправляет webhook с двумя позициями
+4. Ждёт перехода события в `DONE`
+5. Проверяет запись в `processed_events`
+
 Ожидаемый результат:
 
 ```text
+Tenant: <uuid>
+Mappings registered: p1, p2
+Sending webhook: e2e-<uuid>
 ✅ E2E OK: DONE + processed_events
 ```
 
 ---
 
-## 🧪 Ручное тестирование webhook
+## Unit тесты
 
-Открыть Swagger:
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-### Шаги
-1. Создать tenant через `POST /tenants`
-2. Скопировать `tenant_id`
-3. Отправить webhook через `POST /webhooks/evotor/{tenant_id}`
-
-### Пример body
-
-```json
-{
-  "type": "sale",
-  "event_id": "sale-001",
-  "amount": 100
-}
+```bash
+pytest tests/test_sale.py tests/test_sale2.py -v
 ```
 
 ---
 
-## 🔄 Жизненный цикл события
+## API эндпоинты
 
-```text
-NEW → PROCESSING → DONE
-                ↘
-                RETRY → FAILED
-```
+### Инфраструктура
 
----
+| Метод | URL       | Описание          |
+| ----- | --------- | ----------------- |
+| GET   | `/health` | Проверка сервера  |
 
-## ♻️ Retry политика
+### Tenants
 
-- exponential backoff: `1m, 2m, 4m, 8m, 16m`
-- максимум `5` попыток
-- после лимита событие переводится в `FAILED`
-
----
-
-## 🧾 Логирование
-
-Формат логов:
-
-```text
-timestamp | level | logger | message
-```
-
-Логи пишутся в stdout.
-
-Основные логгеры:
-- `api`
-- `worker`
-- `sale_handler`
-- `sale_mapper`
-- `moysklad`
-
----
-
-## 🛠️ Полезные эндпоинты
-
-### Проверка сервера
-
-```text
-GET /health
-```
-
-### Работа с tenant'ами
-
-```text
-POST /tenants
-GET /tenants
-```
+| Метод | URL        | Описание         |
+| ----- | ---------- | ---------------- |
+| POST  | `/tenants` | Создать tenant   |
+| GET   | `/tenants` | Список tenants   |
 
 ### Webhook
 
-```text
-POST /webhooks/evotor/{tenant_id}
-```
+| Метод | URL                              | Описание                      |
+| ----- | -------------------------------- | ----------------------------- |
+| POST  | `/webhooks/evotor/{tenant_id}`   | Принять событие от Evotor     |
+
+### Маппинги
+
+| Метод  | URL          | Описание                                                |
+| ------ | ------------ | ------------------------------------------------------- |
+| GET    | `/mappings`  | Список маппингов (фильтр по `tenant_id`, `entity_type`) |
+| POST   | `/mappings/` | Создать или обновить маппинг                            |
+| DELETE | `/mappings/` | Удалить маппинг                                         |
 
 ### Диагностика событий
 
-```text
-GET /events
-GET /events/retry
-GET /processed
-```
+| Метод | URL                         | Описание                        |
+| ----- | --------------------------- | ------------------------------- |
+| GET   | `/events`                   | Все события (последние 100)     |
+| GET   | `/events/retry`             | События в статусе RETRY         |
+| GET   | `/events/failed`            | События в статусе FAILED        |
+| GET   | `/events/{id}`              | Детали события                  |
+| POST  | `/events/{id}/requeue`      | Перевести FAILED → NEW          |
 
-### Mappings
+### Ошибки
 
-```text
-GET /mappings
-POST /mappings
-DELETE /mappings
-```
-
----
-
-## Тестовый сценарий обработки
-
-Текущий end-to-end сценарий:
-
-```text
-1. Создание tenant
-2. Отправка webhook
-3. Сохранение события в event_store
-4. Захват события worker'ом
-5. Обработка события через sale_handler
-6. Преобразование данных через sale_mapper
-7. Отправка данных через moysklad_client
-8. Запись результата в processed_events
-9. Перевод события в DONE
-```
+| Метод | URL       | Описание                                             |
+| ----- | --------- | ---------------------------------------------------- |
+| GET   | `/errors` | Журнал ошибок (параметры: `limit`, `offset`)         |
 
 ---
 
-## ✅ Текущее состояние
+## Логирование
 
-На текущем этапе проект уже умеет:
+Формат: `timestamp | level | logger | message`
 
-- принимать webhook
-- сохранять события в `event_store`
-- обрабатывать события worker'ом
-- классифицировать ошибки как `RETRY / FAILED`
-- сохранять ошибки в таблицу `errors`
-- отправлять базовый sale payload в MoySklad API
-- использовать test mode через `httpbin`
-- хранить mappings между Evotor и MoySklad
+Основные логгеры: `api`, `worker`, `sale_handler`, `sale_mapper`, `moysklad`
 
 ---
 
-## 🔮 Дальнейшее развитие
+## Дальнейшее развитие
 
-Планируемые улучшения:
-
-- Sale payload с позициями и `syncId`
-- Использование `mapping_store` внутри `sale_handler / sale_mapper`
 - Поддержка сценариев `product` и `stock`
 - Метрики и мониторинг
-- Batch processing
-- Dead-letter queue
 - Dockerization
-- Дополнительные диагностические endpoints (`/events`, `/events/{id}`, `/errors`)
+- Dead-letter queue
+- Batch processing

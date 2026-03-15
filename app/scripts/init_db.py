@@ -95,6 +95,11 @@ def init_db():
     ON mappings(tenant_id, entity_type, ms_id)
     """)
 
+    # Migrations: add columns that may be missing in older databases
+    existing = {row[1] for row in cursor.execute("PRAGMA table_info(errors)")}
+    if "response_body" not in existing:
+        cursor.execute("ALTER TABLE errors ADD COLUMN response_body TEXT")
+
     conn.commit()
     conn.close()
     print("DB initialized")

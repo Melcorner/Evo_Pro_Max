@@ -31,8 +31,8 @@ def insert_error(conn, row, error_code, message, response_body=None):
         row["tenant_id"],
         error_code,
         message,
-        response_body,
         payload_snapshot,
+        response_body,
         int(time.time())
     ))
 

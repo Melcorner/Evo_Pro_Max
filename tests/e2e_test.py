@@ -23,6 +23,17 @@ def ensure_tenant():
     return resp.json()["id"]
 
 
+def setup_mappings(tenant_id):
+    for evotor_id, ms_id in [("p1", "ms-product-001"), ("p2", "ms-product-002")]:
+        resp = requests.post(f"{API}/mappings/", json={
+            "tenant_id": tenant_id,
+            "entity_type": "product",
+            "evotor_id": evotor_id,
+            "ms_id": ms_id,
+        })
+        resp.raise_for_status()
+
+
 def send_webhook(tenant_id, event_key):
     resp = requests.post(f"{API}/webhooks/evotor/{tenant_id}", json={
         "type": "sale",
@@ -77,6 +88,8 @@ def main():
     event_key = "e2e-" + str(uuid.uuid4())
 
     print("Tenant:", tenant_id)
+    setup_mappings(tenant_id)
+    print("Mappings registered: p1, p2")
     print("Sending webhook:", event_key)
 
     send_webhook(tenant_id, event_key)

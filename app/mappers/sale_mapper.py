@@ -10,7 +10,7 @@ class SalePayloadError(ValueError):
     status_code = 422
 
 class MappingNotFoundError(ValueError):
-    """Ошибка отсутствия mapping — может быть RETRY или FAILED."""
+    """Ошибка отсутствия mapping — классифицируется как FAILED (status_code=404)."""
     status_code = 404
     
 def validate_sale_payload(payload: dict):
@@ -95,9 +95,6 @@ def map_sale_to_ms(payload: dict, tenant_id: str = None) -> dict:
                     "mediaType": "application/json"
                 }
             }
-        else:
-            # Маппинга нет — кладём raw product_id для диагностики
-            ms_position["product_id"] = evotor_product_id
 
         ms_positions.append(ms_position)
 
