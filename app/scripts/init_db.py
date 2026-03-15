@@ -76,6 +76,7 @@ def init_db():
         error_code TEXT,
         message TEXT NOT NULL,
         payload_snapshot TEXT,
+        response_body TEXT,
         created_at INTEGER NOT NULL
     )
     """)

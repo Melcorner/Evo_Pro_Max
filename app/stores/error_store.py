@@ -3,7 +3,7 @@ import time
 import uuid
 
 
-def insert_error(conn, row, error_code: str | None, message: str):
+def insert_error(conn, row, error_code, message, response_body=None):
     """
     Сохраняет запись об ошибке в таблицу errors.
     row - это строка события из event_store
@@ -22,6 +22,7 @@ def insert_error(conn, row, error_code: str | None, message: str):
             error_code,
             message,
             payload_snapshot,
+            response_body,
             created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
