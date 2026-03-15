@@ -73,7 +73,9 @@ def map_sale_to_ms(payload: dict, tenant_id: str = None) -> dict:
             if ms_product_id:
                 log.info(f"Position[{i}]: mapping found {evotor_product_id} -> {ms_product_id}")
             else:
-                log.warning(f"Position[{i}]: no mapping for product_id={evotor_product_id}, using raw id")
+                raise MappingNotFoundError(
+                    f"Mapping not found for product_id={evotor_product_id}"
+                )
 
         # Формируем позицию в формате МойСклад
         ms_position = {
