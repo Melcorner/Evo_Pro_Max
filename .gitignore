@@ -5,3 +5,14 @@ __pycache__/
 data/*.db
 .DS_Store
 *.db
+
+# Утилитарные скрипты
+cleanup.py
+checkdb.py
+fixdb.py
+reset.py
+testbd.py
+
+# ngrok
+ngrok.exe
+ngrok.yml
