@@ -84,12 +84,12 @@
       {
         "product_id": "bbb5b5a8-6e3d-45ff-b16d-18b95926cbc9",
         "product_name": "GP Alkaline AAx4",
-        "quantity": 2,
+        "quantity": 1,
         "price": 1.0,
-        "sum": 2.0
+        "sum": 1.0
       }
     ],
-    "sum": 2.0
+    "sum": 1.0
   }
 }
 ```
