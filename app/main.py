@@ -8,6 +8,7 @@ from app.api.webhooks import router as webhooks_router
 from app.api.events import router as events_router
 from app.api.mappings import router as mappings_router
 from app.api.errors import router as errors_router
+from app.api.evotor import router as evotor_router
 
 setup_logging()
 log = logging.getLogger("api")
@@ -19,6 +20,7 @@ app.include_router(webhooks_router)
 app.include_router(events_router)
 app.include_router(mappings_router)
 app.include_router(errors_router)
+app.include_router(evotor_router)
 
 
 @app.get("/health")

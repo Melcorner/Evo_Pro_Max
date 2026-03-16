@@ -4,7 +4,7 @@ import uuid
 import logging
 from typing import Optional, List, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.db import get_connection
@@ -13,29 +13,66 @@ router = APIRouter()
 log = logging.getLogger("api.webhooks")
 
 
-class EvotorWebhook(BaseModel):
-    type: str
-    event_id: str
-    amount: Optional[int] = None
-    positions: Optional[List[Any]] = None
-
-    class Config:
-        extra = "allow"
-
-
 @router.post("/webhooks/evotor/{tenant_id}")
-async def evotor_webhook(tenant_id: str, body: EvotorWebhook):
-    log.info(f"Webhook received tenant_id={tenant_id}")
+async def evotor_webhook(tenant_id: str, request: Request):
+    try:
+        raw_body = await request.json()
+    except Exception as e:
+        log.error(f"Failed to parse request body: {e}")
+        return {"status": "error", "detail": "invalid json"}
 
-    payload = body.dict()
+    log.info(f"RAW EVOTOR BODY tenant_id={tenant_id} body={json.dumps(raw_body, ensure_ascii=False)}")
 
-    event_key = payload.get("event_id") or str(uuid.uuid4())
-    event_type = payload.get("type") or "sale"
+    # Событие установки приложения — сохраняем токен клиента
+    if "token" in raw_body and "userUuid" in raw_body:
+        evotor_token = raw_body.get("token")
+        evotor_user_id = raw_body.get("userId") or raw_body.get("userUuid")
 
-    log.info(f"Webhook parsed tenant_id={tenant_id} event_type={event_type} event_key={event_key}")
+        log.info(f"Install event tenant_id={tenant_id} userId={evotor_user_id} token={evotor_token}")
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tenants
+            SET evotor_user_id = ?, evotor_token = ?
+            WHERE id = ?
+        """, (evotor_user_id, evotor_token, tenant_id))
+        conn.commit()
+        conn.close()
+
+        log.info(f"Evotor token saved tenant_id={tenant_id}")
+        return {"status": "accepted"}
+
+    # Определяем event_id
+    event_id = (
+        raw_body.get("id") or
+        raw_body.get("event_id") or
+        str(uuid.uuid4())
+    )
+
+    # Определяем тип события
+    event_type_raw = (
+        raw_body.get("type") or
+        raw_body.get("event_type") or
+        "sale"
+    )
+
+    event_type_map = {
+        "SELL": "sale",
+        "sell": "sale",
+        "Receipt": "sale",
+        "receipt": "sale",
+    }
+    event_type = event_type_map.get(event_type_raw, event_type_raw.lower())
+
+    log.info(f"Webhook parsed tenant_id={tenant_id} event_type={event_type} event_key={event_id}")
+
+    if event_type not in ("sale", "product", "stock"):
+        log.warning(f"Unknown event_type={event_type} raw={event_type_raw} — skipping")
+        return {"status": "skipped", "reason": f"unknown event_type: {event_type_raw}"}
 
     now = int(time.time())
-    event_id = str(uuid.uuid4())
+    event_store_id = str(uuid.uuid4())
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -50,11 +87,11 @@ async def evotor_webhook(tenant_id: str, body: EvotorWebhook):
     cursor.execute("""
         SELECT 1 FROM processed_events
         WHERE tenant_id = ? AND event_key = ?
-    """, (tenant_id, event_key))
+    """, (tenant_id, event_id))
 
     if cursor.fetchone() is not None:
         conn.close()
-        log.info(f"Already processed tenant_id={tenant_id} event_key={event_key}")
+        log.info(f"Already processed tenant_id={tenant_id} event_key={event_id}")
         return {"status": "already_processed"}
 
     try:
@@ -66,11 +103,11 @@ async def evotor_webhook(tenant_id: str, body: EvotorWebhook):
             )
             VALUES (?, ?, ?, ?, ?, 'NEW', 0, NULL, ?, ?)
         """, (
-            event_id,
+            event_store_id,
             tenant_id,
             event_type,
-            event_key,
-            json.dumps(payload),
+            event_id,
+            json.dumps(raw_body, ensure_ascii=False),
             now,
             now
         ))
@@ -81,6 +118,6 @@ async def evotor_webhook(tenant_id: str, body: EvotorWebhook):
 
     conn.close()
 
-    log.info(f"Event stored NEW event_id={event_id} tenant_id={tenant_id} event_key={event_key}")
+    log.info(f"Event stored NEW event_id={event_store_id} tenant_id={tenant_id} event_key={event_id}")
 
-    return {"status": "accepted", "event_id": event_id}
+    return {"status": "accepted", "event_id": event_store_id}
