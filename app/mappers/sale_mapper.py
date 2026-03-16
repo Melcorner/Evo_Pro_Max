@@ -18,9 +18,6 @@ class MappingNotFoundError(ValueError):
 
 
 def validate_sale_payload(payload: dict):
-    """
-    Валидирует payload в формате Эвотор.
-    """
     if not payload.get("id"):
         raise SalePayloadError("Missing required field: id")
 
@@ -69,18 +66,16 @@ def map_sale_to_ms(
     ms_store_id: str = None,
     ms_agent_id: str = None,
 ) -> dict:
-    """
-    Маппит payload формата Эвотор в формат МойСклад demand.
-    """
     log.info("Mapping sale payload")
 
     validate_sale_payload(payload)
 
-    event_id = payload.get("id")   # id документа из Эвотора
+    event_id = payload.get("id")
     body = payload.get("body", {})
 
-    if not sync_id:
-        raise SalePayloadError("Missing required field: sync_id")
+    # sync_id — если не передан явно, берём из id документа Эвотор
+    effective_sync_id = sync_id or event_id
+
     raw_positions = body.get("positions", [])
 
     store = MappingStore() if tenant_id else None
@@ -111,8 +106,8 @@ def map_sale_to_ms(
 
         ms_position = {
             "quantity": quantity,
-            "price": int(price * 100),
-            "sum": int(line_sum * 100),
+            "price": round(price * 100),      # round() вместо int() — фикс float
+            "sum": round(line_sum * 100),
         }
 
         if ms_product_id:
@@ -121,14 +116,13 @@ def map_sale_to_ms(
         ms_positions.append(ms_position)
 
     ms_payload = {
-        "syncId": sync_id,
+        "syncId": effective_sync_id,
         "name": f"Sale {event_id}",
         "description": "Created from Evotor webhook",
         "positions": ms_positions,
-        "sum": int(total_sum * 100),
+        "sum": round(total_sum * 100),
     }
 
-    # Обязательные поля МойСклад
     if ms_organization_id:
         ms_payload["organization"] = _meta("organization", ms_organization_id)
     if ms_store_id:
@@ -136,7 +130,6 @@ def map_sale_to_ms(
     if ms_agent_id:
         ms_payload["agent"] = _meta("counterparty", ms_agent_id)
 
-    log.info(f"Mapped sale payload syncId={sync_id} positions={len(ms_positions)} sum={total_sum}")
-
+    log.info(f"Mapped sale payload syncId={effective_sync_id} positions={len(ms_positions)} sum={total_sum}")
 
     return ms_payload
