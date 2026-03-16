@@ -29,3 +29,23 @@ temp/
 # ngrok
 ngrok.exe
 ngrok.yml
+
+# Python
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# OS
+Thumbs.db
