@@ -2,9 +2,9 @@ import json
 import time
 import uuid
 import logging
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.db import get_connection
@@ -13,22 +13,98 @@ router = APIRouter()
 log = logging.getLogger("api.webhooks")
 
 
-@router.post("/webhooks/evotor/{tenant_id}")
-async def evotor_webhook(tenant_id: str, request: Request):
-    try:
-        raw_body = await request.json()
-    except Exception as e:
-        log.error(f"Failed to parse request body: {e}")
-        return {"status": "error", "detail": "invalid json"}
+class EvotorPosition(BaseModel):
+    product_id: str
+    product_name: Optional[str] = None
+    quantity: float
+    price: float
+    sum: Optional[float] = None
 
-    log.info(f"RAW EVOTOR BODY tenant_id={tenant_id} body={json.dumps(raw_body, ensure_ascii=False)}")
+    class Config:
+        extra = "allow"
+
+
+class EvotorBody(BaseModel):
+    positions: List[EvotorPosition]
+    sum: Optional[float] = None
+
+    class Config:
+        extra = "allow"
+
+
+class EvotorWebhook(BaseModel):
+    type: str
+    id: str
+    store_id: Optional[str] = None
+    device_id: Optional[str] = None
+    body: Optional[EvotorBody] = None
+
+    class Config:
+        extra = "allow"
+
+
+def _normalize_receipt_created(body_dict: dict) -> tuple[str, str, dict] | tuple[None, None, None]:
+    """
+    Преобразует Evotor ReceiptCreated во внутренний формат события.
+    Возвращает:
+      (event_type, event_key, normalized_payload)
+    либо (None, None, None), если тип пока не поддерживаем.
+    """
+    data = body_dict.get("data") or {}
+    receipt_doc_type = data.get("type")
+
+    # Пока поддерживаем только чек продажи
+    if receipt_doc_type not in ("SELL", "sell"):
+        return None, None, None
+
+    positions = []
+    for item in data.get("items", []):
+        quantity = item.get("quantity", 0)
+        price = item.get("price", 0)
+        line_sum = item.get("sumPrice")
+        if line_sum is None:
+            line_sum = quantity * price
+
+        positions.append({
+            "product_id": item.get("id"),
+            "product_name": item.get("name"),
+            "quantity": quantity,
+            "price": price,
+            "sum": line_sum,
+        })
+
+    normalized_payload = {
+        # Для payload продажи оставляем id документа/чека Эвотора
+        "id": body_dict.get("id") or data.get("id") or str(uuid.uuid4()),
+        "type": receipt_doc_type,
+        "store_id": body_dict.get("store_id") or data.get("storeId"),
+        "device_id": body_dict.get("device_id") or data.get("deviceId"),
+        "body": {
+            "positions": positions,
+            "sum": data.get("totalAmount"),
+        },
+        # Сырые данные можно оставить для отладки
+        "source_event_type": body_dict.get("type"),
+        "source_data": data,
+    }
+
+    event_type = "sale"
+    event_key = normalized_payload["id"]
+    return event_type, event_key, normalized_payload
+
+
+@router.post("/webhooks/evotor/{tenant_id}")
+async def evotor_webhook(tenant_id: str, raw_body: EvotorWebhook):
+    body_dict = raw_body.dict()
+
+    log.info(f"RAW EVOTOR BODY tenant_id={tenant_id} body={json.dumps(body_dict, ensure_ascii=False)}")
 
     # Событие установки приложения — сохраняем токен клиента
-    if "token" in raw_body and "userUuid" in raw_body:
-        evotor_token = raw_body.get("token")
-        evotor_user_id = raw_body.get("userId") or raw_body.get("userUuid")
+    if "token" in body_dict and "userUuid" in body_dict:
+        evotor_token = body_dict.get("token")
+        evotor_user_id = body_dict.get("userId") or body_dict.get("userUuid")
 
-        log.info(f"Install event tenant_id={tenant_id} userId={evotor_user_id} token={evotor_token}")
+        log.info(f"Install event tenant_id={tenant_id} userId={evotor_user_id} token_exists={bool(evotor_token)}")
 
         conn = get_connection()
         cursor = conn.cursor()
@@ -43,27 +119,29 @@ async def evotor_webhook(tenant_id: str, request: Request):
         log.info(f"Evotor token saved tenant_id={tenant_id}")
         return {"status": "accepted"}
 
-    # Определяем event_id
-    event_id = (
-        raw_body.get("id") or
-        raw_body.get("event_id") or
-        str(uuid.uuid4())
-    )
+    event_type_raw = body_dict.get("type") or "sale"
 
-    # Определяем тип события
-    event_type_raw = (
-        raw_body.get("type") or
-        raw_body.get("event_type") or
-        "sale"
-    )
+    # Спец-обработка нового формата Evotor
+    if event_type_raw == "ReceiptCreated":
+        event_type, event_id, normalized_payload = _normalize_receipt_created(body_dict)
 
-    event_type_map = {
-        "SELL": "sale",
-        "sell": "sale",
-        "Receipt": "sale",
-        "receipt": "sale",
-    }
-    event_type = event_type_map.get(event_type_raw, event_type_raw.lower())
+        if not event_type:
+            log.warning(f"Unsupported ReceiptCreated subtype tenant_id={tenant_id} raw_type={event_type_raw}")
+            return {"status": "skipped", "reason": "unsupported receipt subtype"}
+
+        payload_to_store = normalized_payload
+    else:
+        # Старый формат / уже нормализованные события
+        event_id = body_dict.get("id") or str(uuid.uuid4())
+
+        event_type_map = {
+            "SELL": "sale",
+            "sell": "sale",
+            "Receipt": "sale",
+            "receipt": "sale",
+        }
+        event_type = event_type_map.get(event_type_raw, event_type_raw.lower())
+        payload_to_store = body_dict
 
     log.info(f"Webhook parsed tenant_id={tenant_id} event_type={event_type} event_key={event_id}")
 
@@ -107,7 +185,7 @@ async def evotor_webhook(tenant_id: str, request: Request):
             tenant_id,
             event_type,
             event_id,
-            json.dumps(raw_body, ensure_ascii=False),
+            json.dumps(payload_to_store, ensure_ascii=False),
             now,
             now
         ))

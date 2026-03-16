@@ -9,10 +9,9 @@ log = logging.getLogger("moysklad")
 
 class MoySkladClient:
 
-    #BASE_URL = "https://api.moysklad.ru/api/remap/1.2"
     BASE_URL = os.getenv(
-    "MS_BASE_URL",
-    "https://api.moysklad.ru/api/remap/1.2"
+        "MS_BASE_URL",
+        "https://api.moysklad.ru/api/remap/1.2"
     )
 
     def __init__(self, tenant_id):
@@ -40,43 +39,18 @@ class MoySkladClient:
     def _headers(self):
         return {
             "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Accept-Encoding": "gzip"
         }
 
     def ping(self):
         url = f"{self.BASE_URL}/entity/organization"
-
         log.info("MoySklad ping")
-
         r = requests.get(url, headers=self._headers(), timeout=10)
-
         log.info(f"MoySklad status={r.status_code}")
-
         r.raise_for_status()
-
         return r.json()
 
-    def create_document(self, payload):
-        if "httpbin.org" in self.BASE_URL:
-            url = f"{self.BASE_URL}/post"
-        else:
-            url = f"{self.BASE_URL}/entity/demand"
-
-        log.info(f"Creating demand document url={url}")
-
-        r = requests.post(
-            url,
-            headers=self._headers(),
-            json=payload,
-            timeout=15
-        )
-
-        log.info(f"MoySklad response={r.status_code}")
-
-        r.raise_for_status()
-
-        return r.json()
-    
     def create_sale_document(self, payload):
         if "httpbin.org" in self.BASE_URL:
             url = f"{self.BASE_URL}/post"
@@ -95,6 +69,13 @@ class MoySkladClient:
 
         log.info(f"MoySklad response={r.status_code}")
 
+        if not r.ok:
+            try:
+                error_body = r.json()
+                log.error(f"MoySklad error body={error_body}")
+            except Exception:
+                log.error(f"MoySklad error text={r.text}")
+
         r.raise_for_status()
         response_json = r.json()
 
@@ -102,6 +83,7 @@ class MoySkladClient:
             result_ref = "httpbin:created"
         else:
             result_ref = response_json.get("id")
+
         return {
             "success": True,
             "result_ref": result_ref,

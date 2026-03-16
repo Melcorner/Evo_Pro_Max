@@ -106,6 +106,12 @@ def init_db():
         cursor.execute("ALTER TABLE tenants ADD COLUMN evotor_user_id TEXT")
     if "evotor_token" not in existing_tenants:
         cursor.execute("ALTER TABLE tenants ADD COLUMN evotor_token TEXT")
+    if "ms_organization_id" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN ms_organization_id TEXT")
+    if "ms_store_id" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN ms_store_id TEXT")
+    if "ms_agent_id" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN ms_agent_id TEXT")
 
     conn.commit()
     conn.close()

@@ -4,6 +4,8 @@ from app.stores.mapping_store import MappingStore
 
 log = logging.getLogger("sale_mapper")
 
+MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
+
 
 class SalePayloadError(ValueError):
     """Фатальная ошибка валидации payload — не требует retry."""
@@ -18,16 +20,6 @@ class MappingNotFoundError(ValueError):
 def validate_sale_payload(payload: dict):
     """
     Валидирует payload в формате Эвотор.
-
-    Ожидаемый формат:
-    {
-        "type": "SELL",
-        "id": "...",
-        "body": {
-            "positions": [...],
-            "sum": 1.0
-        }
-    }
     """
     if not payload.get("id"):
         raise SalePayloadError("Missing required field: id")
@@ -59,7 +51,24 @@ def validate_sale_payload(payload: dict):
             raise SalePayloadError(f"Position[{i}]: invalid price={price}")
 
 
-def map_sale_to_ms(payload: dict, tenant_id: str = None) -> dict:
+def _meta(entity_type: str, entity_id: str) -> dict:
+    return {
+        "meta": {
+            "href": f"{MS_BASE}/entity/{entity_type}/{entity_id}",
+            "type": entity_type,
+            "mediaType": "application/json"
+        }
+    }
+
+
+def map_sale_to_ms(
+    payload: dict,
+    sync_id: str = None,
+    tenant_id: str = None,
+    ms_organization_id: str = None,
+    ms_store_id: str = None,
+    ms_agent_id: str = None,
+) -> dict:
     """
     Маппит payload формата Эвотор в формат МойСклад demand.
     """
@@ -67,8 +76,11 @@ def map_sale_to_ms(payload: dict, tenant_id: str = None) -> dict:
 
     validate_sale_payload(payload)
 
-    event_id = payload.get("id")
+    event_id = payload.get("id")   # id документа из Эвотора
     body = payload.get("body", {})
+
+    if not sync_id:
+        raise SalePayloadError("Missing required field: sync_id")
     raw_positions = body.get("positions", [])
 
     store = MappingStore() if tenant_id else None
@@ -82,7 +94,6 @@ def map_sale_to_ms(payload: dict, tenant_id: str = None) -> dict:
         line_sum = item.get("sum") or quantity * price
         total_sum += line_sum
 
-        # Резолвим product_id Эвотора -> ms_id МойСклад
         ms_product_id = None
         if store and tenant_id and evotor_product_id:
             ms_product_id = store.get_by_evotor_id(
@@ -98,8 +109,6 @@ def map_sale_to_ms(payload: dict, tenant_id: str = None) -> dict:
                     f"name={item.get('product_name')}"
                 )
 
-        # Формируем позицию в формате МойСклад
-        # МойСклад принимает цены в копейках
         ms_position = {
             "quantity": quantity,
             "price": int(price * 100),
@@ -107,24 +116,27 @@ def map_sale_to_ms(payload: dict, tenant_id: str = None) -> dict:
         }
 
         if ms_product_id:
-            ms_position["assortment"] = {
-                "meta": {
-                    "href": f"https://api.moysklad.ru/api/remap/1.2/entity/product/{ms_product_id}",
-                    "type": "product",
-                    "mediaType": "application/json"
-                }
-            }
+            ms_position["assortment"] = _meta("product", ms_product_id)
 
         ms_positions.append(ms_position)
 
     ms_payload = {
-        "syncId": event_id,
+        "syncId": sync_id,
         "name": f"Sale {event_id}",
         "description": "Created from Evotor webhook",
         "positions": ms_positions,
         "sum": int(total_sum * 100),
     }
 
-    log.info(f"Mapped sale payload syncId={event_id} positions={len(ms_positions)} sum={total_sum}")
+    # Обязательные поля МойСклад
+    if ms_organization_id:
+        ms_payload["organization"] = _meta("organization", ms_organization_id)
+    if ms_store_id:
+        ms_payload["store"] = _meta("store", ms_store_id)
+    if ms_agent_id:
+        ms_payload["agent"] = _meta("counterparty", ms_agent_id)
+
+    log.info(f"Mapped sale payload syncId={sync_id} positions={len(ms_positions)} sum={total_sum}")
+
 
     return ms_payload
