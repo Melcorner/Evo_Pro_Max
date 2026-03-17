@@ -91,6 +91,13 @@ def process_one_event():
             error_code = str(getattr(e.response, "status_code", ""))
         elif hasattr(e, "status_code"):
             error_code = str(getattr(e, "status_code", ""))
+        
+        response_body = None
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                response_body = e.response.text
+            except Exception:
+                response_body = None
 
         log.warning(
             "Handler error event_id=%s event_key=%s tenant_id=%s event_type=%s retries=%s decision=%s err=%s",
@@ -114,7 +121,7 @@ def process_one_event():
                 WHERE id = ?
             """, (new_retries, err, now, event_id))
 
-            insert_error(conn, row, error_code, err)
+            insert_error(conn, row, error_code, err, response_body)
 
             conn.commit()
             log.error(
@@ -141,7 +148,7 @@ def process_one_event():
                 WHERE id = ?
             """, (new_retries, err, now, event_id))
 
-            insert_error(conn, row, error_code, err)
+            insert_error(conn, row, error_code, err, response_body)
 
             conn.commit()
             log.error(
@@ -162,7 +169,7 @@ def process_one_event():
                 WHERE id = ?
             """, (new_retries, now + delay, err, now, event_id))
 
-            insert_error(conn, row, error_code, err)
+            insert_error(conn, row, error_code, err, response_body)
 
             conn.commit()
             log.warning(

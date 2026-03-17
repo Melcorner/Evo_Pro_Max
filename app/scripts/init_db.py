@@ -54,6 +54,7 @@ def init_db():
         FOREIGN KEY (tenant_id) REFERENCES tenants(id)
     )
     """)
+
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS mappings (
         tenant_id TEXT NOT NULL,
@@ -76,6 +77,7 @@ def init_db():
         error_code TEXT,
         message TEXT NOT NULL,
         payload_snapshot TEXT,
+        response_body TEXT,
         created_at INTEGER NOT NULL
     )
     """)
@@ -83,7 +85,7 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_event_id ON errors(event_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_tenant_id ON errors(tenant_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_created_at ON errors(created_at)")
-    
+
     cursor.execute("""
     CREATE INDEX IF NOT EXISTS idx_mappings_evotor 
         ON mappings(tenant_id, entity_type, evotor_id)
@@ -93,6 +95,23 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_mappings_ms 
     ON mappings(tenant_id, entity_type, ms_id)
     """)
+
+    # Migrations
+    existing_errors = {row[1] for row in cursor.execute("PRAGMA table_info(errors)")}
+    if "response_body" not in existing_errors:
+        cursor.execute("ALTER TABLE errors ADD COLUMN response_body TEXT")
+
+    existing_tenants = {row[1] for row in cursor.execute("PRAGMA table_info(tenants)")}
+    if "evotor_user_id" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN evotor_user_id TEXT")
+    if "evotor_token" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN evotor_token TEXT")
+    if "ms_organization_id" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN ms_organization_id TEXT")
+    if "ms_store_id" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN ms_store_id TEXT")
+    if "ms_agent_id" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN ms_agent_id TEXT")
 
     conn.commit()
     conn.close()

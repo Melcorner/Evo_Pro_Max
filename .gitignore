@@ -2,5 +2,50 @@ venv/
 __pycache__/
 *.pyc
 .env
+.env.*
 data/*.db
+*.db
+*.sqlite
+*.sqlite3
+*.log
 .DS_Store
+
+# util / local test scripts
+cleanup.py
+checkdb.py
+fixdb.py
+reset.py
+testbd.py
+add_gp_mapping.py
+replace_tenant_id.py
+setup_cf5_tenant.py
+add_mapping_a195.py
+
+# local temp files
+tmp/
+temp/
+*.tmp
+
+# ngrok
+ngrok.exe
+ngrok.yml
+
+# Python
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# OS
+Thumbs.db
