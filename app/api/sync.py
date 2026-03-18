@@ -250,3 +250,97 @@ def sync_status(tenant_id: str):
         "evotor_store_configured": bool(tenant.get("evotor_store_id")),
         "moysklad_configured": bool(tenant.get("ms_organization_id")),
     }
+
+
+@router.post("/sync/{tenant_id}/product/{ms_product_id}")
+def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
+    """
+    Синхронизирует один товар из МойСклад → Эвотор.
+
+    Используется в рабочем режиме (sync_mode=moysklad):
+    - Получает товар из МойСклад по ms_product_id
+    - Создаёт или обновляет его в Эвотор
+    - Сохраняет маппинг ms_id → evotor_id
+
+    Вызывается вручную или автоматически через webhook МойСклад.
+    """
+    from app.clients.evotor_client import EvotorClient
+    from app.clients.moysklad_client import MoySkladClient
+
+    tenant = _load_tenant(tenant_id)
+
+    if not tenant.get("sync_completed_at"):
+        raise HTTPException(
+            status_code=409,
+            detail="Initial sync not completed. Run POST /sync/{tenant_id}/initial first."
+        )
+
+    # Получаем товар из МойСклад
+    try:
+        ms_client = MoySkladClient(tenant_id)
+        ms_product = ms_client.get_product(ms_product_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch MS product: {e}")
+
+    # Формируем payload для Эвотор
+    evotor_payload = {
+        "id": ms_product_id,  # используем ms_id как id в Эвотор
+        "name": ms_product.get("name", ""),
+        "price": ms_product.get("salePrices", [{}])[0].get("value", 0) / 100,
+        "cost_price": ms_product.get("buyPrice", {}).get("value", 0) / 100,
+        "measure_name": "шт",
+        "tax": "NO_VAT",
+        "allow_to_sell": True,
+        "description": ms_product.get("description", ""),
+        "type": "NORMAL",
+        "quantity": 0,
+        "article_number": ms_product.get("article", ""),
+    }
+
+    # Штрихкод если есть
+    barcodes = ms_product.get("barcodes", [])
+    if barcodes:
+        evotor_payload["barcodes"] = [b.get("ean13", "") for b in barcodes if b.get("ean13")]
+
+    store = MappingStore()
+
+    # Проверяем есть ли уже маппинг
+    existing_evotor_id = store.get_by_ms_id(
+        tenant_id=tenant_id,
+        entity_type="product",
+        ms_id=ms_product_id
+    )
+
+    try:
+        evotor_client = EvotorClient(tenant_id)
+
+        if existing_evotor_id:
+            # Обновляем существующий товар в Эвотор
+            evotor_client.update_product(existing_evotor_id, evotor_payload)
+            log.info(f"Updated Evotor product evotor_id={existing_evotor_id} ms_id={ms_product_id}")
+            return {
+                "status": "updated",
+                "ms_product_id": ms_product_id,
+                "evotor_product_id": existing_evotor_id
+            }
+        else:
+            # Создаём новый товар в Эвотор
+            evotor_client.create_product(evotor_payload)
+            evotor_id = ms_product_id  # Эвотор сохранит наш id
+
+            # Сохраняем маппинг
+            store.upsert_mapping(
+                tenant_id=tenant_id,
+                entity_type="product",
+                evotor_id=evotor_id,
+                ms_id=ms_product_id
+            )
+            log.info(f"Created Evotor product evotor_id={evotor_id} ms_id={ms_product_id}")
+            return {
+                "status": "created",
+                "ms_product_id": ms_product_id,
+                "evotor_product_id": evotor_id
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to sync product to Evotor: {e}")
