@@ -1,5 +1,5 @@
-import requests
 import logging
+import requests
 
 from app.db import get_connection
 
@@ -17,10 +17,13 @@ class EvotorClient:
     def _load_config(self):
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(
+            """
             SELECT evotor_token, evotor_store_id
             FROM tenants WHERE id = ?
-        """, (self.tenant_id,))
+            """,
+            (self.tenant_id,),
+        )
         row = cur.fetchone()
         conn.close()
 
@@ -42,7 +45,7 @@ class EvotorClient:
         r = requests.get(url, headers=self._headers(), timeout=30)
 
         if not r.ok:
-            log.error(f"Evotor get_products error status={r.status_code}")
+            log.error(f"Evotor get_products error status={r.status_code} body={r.text}")
             r.raise_for_status()
 
         data = r.json()
@@ -50,23 +53,20 @@ class EvotorClient:
         log.info(f"Fetched {len(products)} products from Evotor store={self.store_id}")
         return products
 
-    def create_product(self, product: dict) -> dict:
-        """
-        Создаёт товар в облаке Эвотор.
+    def get_product(self, evotor_product_id: str) -> dict:
+        """Получает один товар из облака Эвотор."""
+        url = f"{EVOTOR_BASE}/stores/{self.store_id}/products/{evotor_product_id}"
+        r = requests.get(url, headers=self._headers(), timeout=15)
 
-        product — формат Эвотор:
-        {
-            "id": "<uuid>",           # обязательно — внешний ID из МойСклад
-            "name": "Название",       # обязательно
-            "price": 100.0,           # цена продажи
-            "cost_price": 80.0,       # закупочная цена
-            "measure_name": "шт",
-            "tax": "NO_VAT",
-            "allow_to_sell": true,
-            "description": "...",
-            "barcodes": ["..."]
-        }
-        """
+        if not r.ok:
+            log.error(
+                f"Evotor get_product error status={r.status_code} product_id={evotor_product_id} body={r.text}"
+            )
+            r.raise_for_status()
+
+        return r.json() if r.text else {}
+
+    def create_product(self, product: dict) -> dict:
         url = f"{EVOTOR_BASE}/stores/{self.store_id}/products"
         r = requests.post(url, headers=self._headers(), json=product, timeout=15)
 
@@ -78,7 +78,6 @@ class EvotorClient:
         return r.json() if r.text else {}
 
     def update_product(self, evotor_product_id: str, product: dict) -> dict:
-        """Обновляет товар в облаке Эвотор."""
         url = f"{EVOTOR_BASE}/stores/{self.store_id}/products/{evotor_product_id}"
         r = requests.put(url, headers=self._headers(), json=product, timeout=15)
 
@@ -89,13 +88,27 @@ class EvotorClient:
         log.info(f"Updated Evotor product id={evotor_product_id}")
         return r.json() if r.text else {}
 
+    def update_product_stock(self, evotor_product_id: str, quantity: float) -> dict:
+        """
+        Безопасно обновляет остаток товара в Эвотор.
+        Сначала читает текущий товар, затем отправляет полный payload c новым quantity.
+        """
+        current = self.get_product(evotor_product_id)
+        if not current:
+            raise Exception(f"Evotor product not found or empty response: {evotor_product_id}")
+
+        payload = dict(current)
+        payload["id"] = evotor_product_id
+        payload["quantity"] = float(quantity)
+
+        return self.update_product(evotor_product_id, payload)
+
     def delete_product(self, evotor_product_id: str):
-        """Удаляет товар из облака Эвотор."""
         url = f"{EVOTOR_BASE}/stores/{self.store_id}/products/{evotor_product_id}"
         r = requests.delete(url, headers=self._headers(), timeout=15)
 
         if not r.ok:
-            log.error(f"Evotor delete_product error status={r.status_code}")
+            log.error(f"Evotor delete_product error status={r.status_code} body={r.text}")
             r.raise_for_status()
 
         log.info(f"Deleted Evotor product id={evotor_product_id}")

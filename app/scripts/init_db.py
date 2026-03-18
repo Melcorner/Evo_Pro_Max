@@ -1,5 +1,6 @@
 from app.db import get_connection
 
+
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
@@ -82,18 +83,32 @@ def init_db():
     )
     """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS stock_sync_status (
+        tenant_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL CHECK (status IN ('configured','in_progress','ok','error')),
+        started_at INTEGER,
+        updated_at INTEGER NOT NULL,
+        last_sync_at INTEGER,
+        last_error TEXT,
+        synced_items_count INTEGER NOT NULL DEFAULT 0,
+        total_items_count INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+    """)
+
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_event_id ON errors(event_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_tenant_id ON errors(tenant_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_created_at ON errors(created_at)")
 
     cursor.execute("""
-    CREATE INDEX IF NOT EXISTS idx_mappings_evotor 
+    CREATE INDEX IF NOT EXISTS idx_mappings_evotor
         ON mappings(tenant_id, entity_type, evotor_id)
     """)
 
     cursor.execute("""
-    CREATE INDEX IF NOT EXISTS idx_mappings_ms 
-    ON mappings(tenant_id, entity_type, ms_id)
+    CREATE INDEX IF NOT EXISTS idx_mappings_ms
+        ON mappings(tenant_id, entity_type, ms_id)
     """)
 
     # Migrations
@@ -117,9 +132,25 @@ def init_db():
     if "evotor_store_id" not in existing_tenants:
         cursor.execute("ALTER TABLE tenants ADD COLUMN evotor_store_id TEXT")
 
+    existing_stock_sync_status = {row[1] for row in cursor.execute("PRAGMA table_info(stock_sync_status)")}
+    if existing_stock_sync_status:
+        if "started_at" not in existing_stock_sync_status:
+            cursor.execute("ALTER TABLE stock_sync_status ADD COLUMN started_at INTEGER")
+        if "updated_at" not in existing_stock_sync_status:
+            cursor.execute("ALTER TABLE stock_sync_status ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0")
+        if "last_sync_at" not in existing_stock_sync_status:
+            cursor.execute("ALTER TABLE stock_sync_status ADD COLUMN last_sync_at INTEGER")
+        if "last_error" not in existing_stock_sync_status:
+            cursor.execute("ALTER TABLE stock_sync_status ADD COLUMN last_error TEXT")
+        if "synced_items_count" not in existing_stock_sync_status:
+            cursor.execute("ALTER TABLE stock_sync_status ADD COLUMN synced_items_count INTEGER NOT NULL DEFAULT 0")
+        if "total_items_count" not in existing_stock_sync_status:
+            cursor.execute("ALTER TABLE stock_sync_status ADD COLUMN total_items_count INTEGER NOT NULL DEFAULT 0")
+
     conn.commit()
     conn.close()
     print("DB initialized")
+
 
 if __name__ == "__main__":
     init_db()
