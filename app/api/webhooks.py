@@ -145,7 +145,7 @@ async def evotor_webhook(tenant_id: str, raw_body: EvotorWebhook):
 
     log.info(f"Webhook parsed tenant_id={tenant_id} event_type={event_type} event_key={event_id}")
 
-    if event_type not in ("sale", "product", "stock"):
+    if event_type not in ("sale", "product"):
         log.warning(f"Unknown event_type={event_type} raw={event_type_raw} — skipping")
         return {"status": "skipped", "reason": f"unknown event_type: {event_type_raw}"}
 
