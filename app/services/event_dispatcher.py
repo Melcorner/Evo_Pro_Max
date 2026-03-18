@@ -1,7 +1,6 @@
 import logging
 
 from app.handlers.sale_handler import handle_sale
-from app.handlers.stock_handler import handle_stock
 
 log = logging.getLogger("dispatcher")
 
@@ -11,9 +10,6 @@ def dispatch_event(row):
 
     if event_type == "sale":
         return handle_sale(row)
-
-    if event_type == "stock":
-        return handle_stock(row)
 
     if event_type == "product":
         log.warning(f"event_type=product not implemented yet — skipping")
