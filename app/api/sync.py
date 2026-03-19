@@ -161,30 +161,120 @@ def _extract_ms_prices(ms_product: dict) -> tuple[float, float]:
     return sale_price, cost_price
 
 
-def _build_evotor_product_payload(ms_product: dict, evotor_id: str | None = None) -> dict:
+def _extract_ms_measure_name(ms_product: dict) -> str:
+    uom = ms_product.get("uom")
+    if isinstance(uom, str) and uom.strip():
+        return uom.strip()
+    if isinstance(uom, dict):
+        for key in ("name", "code"):
+            value = uom.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return "шт"
+
+
+def _extract_ms_barcodes(ms_product: dict) -> list[str]:
+    result: list[str] = []
+    for barcode in ms_product.get("barcodes", []) or []:
+        if isinstance(barcode, str) and barcode.strip():
+            result.append(barcode.strip())
+            continue
+        if not isinstance(barcode, dict):
+            continue
+        value = barcode.get("ean13") or barcode.get("code128") or barcode.get("ean8") or barcode.get("value")
+        if value:
+            result.append(str(value).strip())
+
+    # preserve order, remove duplicates and empties
+    seen = set()
+    cleaned: list[str] = []
+    for value in result:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        cleaned.append(value)
+    return cleaned
+
+
+def _map_ms_tax_to_evotor(ms_product: dict, current_tax: str | None = None) -> str:
+    vat_enabled = ms_product.get("vatEnabled")
+    vat_raw = ms_product.get("vatDecimal", ms_product.get("vat"))
+
+    # No VAT in MoySklad: vat=0, vatEnabled=false means "без НДС"
+    if vat_enabled is False:
+        return "NO_VAT"
+
+    vat_value: float | None = None
+    if vat_raw is not None:
+        try:
+            vat_value = float(vat_raw)
+        except (TypeError, ValueError):
+            vat_value = None
+
+    if vat_value is None:
+        if current_tax:
+            log.warning(
+                "MS product has no VAT fields; preserving existing Evotor tax=%s product_id=%s",
+                current_tax,
+                ms_product.get("id"),
+            )
+            return current_tax
+        return "NO_VAT"
+
+    mapping = {
+        0.0: "VAT_0",
+        5.0: "VAT_5",
+        7.0: "VAT_7",
+        10.0: "VAT_10",
+        18.0: "VAT_18",
+        20.0: "VAT_20",
+        22.0: "VAT_22",
+    }
+
+    evotor_tax = mapping.get(vat_value)
+    if evotor_tax:
+        return evotor_tax
+
+    if current_tax:
+        log.warning(
+            "Unsupported MS VAT=%s; preserving existing Evotor tax=%s product_id=%s",
+            vat_value,
+            current_tax,
+            ms_product.get("id"),
+        )
+        return current_tax
+
+    log.warning(
+        "Unsupported MS VAT=%s; falling back to NO_VAT product_id=%s",
+        vat_value,
+        ms_product.get("id"),
+    )
+    return "NO_VAT"
+
+
+def _build_evotor_product_payload(ms_product: dict, evotor_id: str | None = None, current_product: dict | None = None) -> dict:
     sale_price, cost_price = _extract_ms_prices(ms_product)
+    current_product = current_product or {}
 
     payload = {
         "id": evotor_id or ms_product.get("id"),
         "name": ms_product.get("name", ""),
         "price": sale_price,
         "cost_price": cost_price,
-        "measure_name": "шт",
-        "tax": "NO_VAT",
-        "allow_to_sell": True,
+        "measure_name": _extract_ms_measure_name(ms_product),
+        "tax": _map_ms_tax_to_evotor(ms_product, current_tax=current_product.get("tax")),
+        "allow_to_sell": bool(current_product.get("allow_to_sell", True)),
         "description": ms_product.get("description", ""),
-        "type": "NORMAL",
+        "type": current_product.get("type", "NORMAL"),
         "article_number": ms_product.get("article", ""),
     }
 
-    barcodes = ms_product.get("barcodes", [])
-    cleaned_barcodes = []
-    for barcode in barcodes:
-        value = barcode.get("ean13") or barcode.get("code128") or barcode.get("ean8")
-        if value:
-            cleaned_barcodes.append(value)
-    if cleaned_barcodes:
-        payload["barcodes"] = cleaned_barcodes
+    if ms_product.get("archived") is True:
+        payload["allow_to_sell"] = False
+
+    barcodes = _extract_ms_barcodes(ms_product)
+    if barcodes:
+        payload["barcodes"] = barcodes
 
     return payload
 
@@ -425,6 +515,8 @@ def sync_status(tenant_id: str):
         "moysklad_configured": bool(tenant.get("ms_organization_id")),
     }
 
+
+# ------------------------------------------------------------------------------
 # Product sync MoySklad -> Evotor (without stock overwrite)
 # ------------------------------------------------------------------------------
 
@@ -445,7 +537,19 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
 
     store = MappingStore()
     existing_evotor_id = store.get_by_ms_id(tenant_id=tenant_id, entity_type="product", ms_id=ms_product_id)
-    evotor_payload = _build_evotor_product_payload(ms_product, evotor_id=existing_evotor_id or ms_product_id)
+
+    current_evotor_product = None
+    if existing_evotor_id:
+        try:
+            current_evotor_product = _get_evotor_product(tenant, existing_evotor_id)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch current Evotor product: {e}")
+
+    evotor_payload = _build_evotor_product_payload(
+        ms_product,
+        evotor_id=existing_evotor_id or ms_product_id,
+        current_product=current_evotor_product,
+    )
 
     try:
         if existing_evotor_id:
@@ -455,11 +559,19 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
                 log.error(f"Evotor update_product error status={r.status_code} body={r.text}")
                 r.raise_for_status()
 
-            log.info(f"Updated Evotor product evotor_id={existing_evotor_id} ms_id={ms_product_id}")
+            log.info(
+                "Updated Evotor product evotor_id=%s ms_id=%s tax=%s price=%s cost_price=%s",
+                existing_evotor_id,
+                ms_product_id,
+                evotor_payload.get("tax"),
+                evotor_payload.get("price"),
+                evotor_payload.get("cost_price"),
+            )
             return {
                 "status": "updated",
                 "ms_product_id": ms_product_id,
                 "evotor_product_id": existing_evotor_id,
+                "evotor_payload": evotor_payload,
             }
 
         url = f"{EVOTOR_BASE}/stores/{tenant['evotor_store_id']}/products"
@@ -470,11 +582,19 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
 
         evotor_id = evotor_payload["id"]
         store.upsert_mapping(tenant_id=tenant_id, entity_type="product", evotor_id=evotor_id, ms_id=ms_product_id)
-        log.info(f"Created Evotor product evotor_id={evotor_id} ms_id={ms_product_id}")
+        log.info(
+            "Created Evotor product evotor_id=%s ms_id=%s tax=%s price=%s cost_price=%s",
+            evotor_id,
+            ms_product_id,
+            evotor_payload.get("tax"),
+            evotor_payload.get("price"),
+            evotor_payload.get("cost_price"),
+        )
         return {
             "status": "created",
             "ms_product_id": ms_product_id,
             "evotor_product_id": evotor_id,
+            "evotor_payload": evotor_payload,
         }
 
     except Exception as e:
@@ -484,7 +604,6 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
 # ------------------------------------------------------------------------------
 # Stock sync MoySklad -> Evotor
 # ------------------------------------------------------------------------------
-
 
 @router.get("/sync/{tenant_id}/stock/status")
 def stock_sync_status(tenant_id: str):
@@ -501,7 +620,12 @@ def stock_sync_status(tenant_id: str):
             "total_items_count": row["total_items_count"],
         }
 
-    configured = bool(tenant.get("sync_completed_at") and tenant.get("moysklad_token") and tenant.get("evotor_token") and tenant.get("evotor_store_id"))
+    configured = bool(
+        tenant.get("sync_completed_at")
+        and tenant.get("moysklad_token")
+        and tenant.get("evotor_token")
+        and tenant.get("evotor_store_id")
+    )
     return {
         "tenant_id": tenant_id,
         "status": "configured" if configured else "error",
@@ -510,7 +634,8 @@ def stock_sync_status(tenant_id: str):
         "count_synced_items": 0,
         "total_items_count": 0,
     }
-    
+
+
 @router.post("/sync/{tenant_id}/stock/reconcile")
 def reconcile_stock_to_evotor(tenant_id: str):
     tenant = _load_tenant(tenant_id)
@@ -599,8 +724,9 @@ def reconcile_stock_to_evotor(tenant_id: str):
         "synced": synced,
         "failed": failed,
         "errors": errors,
-    }    
-    
+    }
+
+
 @router.post("/sync/{tenant_id}/stock/{ms_product_id}")
 def sync_stock_to_evotor(tenant_id: str, ms_product_id: str):
     tenant = _load_tenant(tenant_id)
@@ -663,8 +789,3 @@ def sync_stock_to_evotor(tenant_id: str, ms_product_id: str):
         "evotor_product_id": evotor_id,
         "quantity": stock_value,
     }
-
-
-
-
-
