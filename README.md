@@ -2,10 +2,11 @@
 
 Интеграционная шина между кассой **Эвотор** и учётной системой **МойСклад**.
 
-В проекте используются **два контура интеграции**:
+Проект объединяет три контура интеграции:
 
-1. **Продажи Эвотор → МойСклад** — event-driven pipeline через webhook, `event_store`, worker и обработчик продажи.
+1. **Продажи Эвотор → МойСклад** — event-driven pipeline через webhook, `event_store`, `worker`, `sale_handler`, `sale_mapper`.
 2. **Товары и остатки МойСклад → Эвотор** — API-driven синхронизация через `sync.py`.
+3. **Автоматическая синхронизация остатков** — webhook от МойСклад с обновлением остатков в Эвотор в реальном времени.
 
 ---
 
@@ -14,24 +15,50 @@
 ### Продажи Эвотор → МойСклад
 
 - Приём webhook событий от Эвотор: старый формат (`SELL`) и новый формат (`ReceiptCreated`)
-- Нормализация webhook payload во внутренний формат продажи
+- Нормализация webhook payload во внутренний sale-payload
 - Хранение событий в `event_store`
 - Идемпотентность через `processed_events`
 - Worker с optimistic locking и retry/backoff
-- Диспетчеризация событий по `event_type`
-- Маппинг `evotor_product_id → ms_product_id` через `MappingStore`
-- Создание документа **Отгрузка** (`entity/demand`) в МойСклад по каждой продаже
 - Повторная обработка `FAILED` событий через `/events/{id}/requeue`
+- Маппинг `evotor_product_id -> ms_product_id` через `MappingStore`
+- Создание документа **Отгрузка** (`entity/demand`) в МойСклад по каждой продаже
+- Передача данных покупателя из чека Эвотор в МойСклад:
+  - поиск контрагента по email;
+  - поиск по телефону;
+  - создание нового контрагента при отсутствии;
+  - fallback на `default agent`, если buyer data отсутствует
+- Поддержка скидок в позициях чека:
+  - обработка скидки из реального webhook Эвотор (`discount`, `totalDiscount`);
+  - обработка enriched/test payload (`resultPrice`, `resultSum`, `positionDiscount`);
+  - запись скидки в позиции demand МойСклад отдельным полем `discount`
+- Поддержка налогов в продаже:
+  - маппинг налога из фактического чека Эвотор в `vat / vatEnabled` в МойСклад;
+  - источник истины по НДС продажи — **чек Эвотор**, а не карточка товара
 
-### Товары и остатки
+### Товары и остатки МойСклад → Эвотор
 
-- Первичная синхронизация товаров **Эвотор → МойСклад** через `POST /sync/{tenant_id}/initial`
-- Переключение в рабочий режим **МойСклад → Эвотор** после завершения первичной синхронизации
-- Синхронизация одного товара **МойСклад → Эвотор** через `POST /sync/{tenant_id}/product/{ms_product_id}`
-- **Одиночная синхронизация остатка** через `POST /sync/{tenant_id}/stock/{ms_product_id}`
-- **Массовая синхронизация остатков** через `POST /sync/{tenant_id}/stock/reconcile`
-- **Статус синхронизации остатков** через `GET /sync/{tenant_id}/stock/status`
+- Первичная синхронизация товаров Эвотор → МойСклад через `POST /sync/{tenant_id}/initial`
+- Переключение tenant в рабочий режим МойСклад → Эвотор после initial sync (`sync_completed_at`)
+- Синхронизация одного товара МойСклад → Эвотор через `POST /sync/{tenant_id}/product/{ms_product_id}`
+- Корректная синхронизация НДС товара МойСклад → Эвотор:
+  - `vat / vatEnabled` из МойСклад маппится в `tax` Эвотор;
+  - поддержаны `NO_VAT`, `VAT_0`, `VAT_10`, `VAT_18`, `VAT_20`, `VAT_5`, `VAT_7`, `VAT_22`
+- Одиночная синхронизация остатка через `POST /sync/{tenant_id}/stock/{ms_product_id}`
+- Массовая синхронизация остатков через `POST /sync/{tenant_id}/stock/reconcile`
+- Статус синхронизации остатков через `GET /sync/{tenant_id}/stock/status`
 - Отдельное хранение статуса stock sync в таблице `stock_sync_status`
+
+### Автоматическая синхронизация остатков
+
+- Webhook от МойСклад при создании/изменении документов
+- Поддержка документов:
+  - `demand`
+  - `supply`
+  - `inventory`
+  - `loss`
+  - `enter`
+- Автоматическое извлечение затронутых товаров из позиций документа
+- Обновление остатков в Эвотор в реальном времени без ручного вмешательства
 
 ### Диагностика и обслуживание
 
@@ -69,30 +96,33 @@
 
 #### Dispatch Layer
 
-`event_dispatcher.py` маршрутизирует событие по `event_type`:
+`event_dispatcher.py` маршрутизирует событие по `event_type`.
 
 | `event_type` | Поведение |
 |---|---|
 | `sale` | Передаётся в `handle_sale` |
-| `stock` | Передаётся в `handle_stock` |
-| `product` | Пока логируется и пропускается |
-| Остальное | Ошибка, затем `RETRY/FAILED` |
+| `product` | Логируется и пропускается |
+| Остальное | Ошибка → `RETRY` / `FAILED` |
 
 #### Sale Handler / Mapper
 
-`sale_handler.py` загружает tenant-конфиг, вызывает `sale_mapper.py` и отправляет продажу в МойСклад.
+`sale_handler.py`:
+
+- загружает tenant-конфиг;
+- резолвит контрагента по данным покупателя из чека;
+- вызывает `sale_mapper.py`;
+- отправляет demand в МойСклад.
 
 `sale_mapper.py`:
 
 - валидирует payload продажи;
-- резолвит `evotor_id → ms_id`;
+- резолвит `evotor_id -> ms_id`;
 - формирует `assortment.meta.href`;
-- переводит цены в формат МойСклад;
+- маппит скидки в позиции demand;
+- маппит НДС из фактического чека в `vat / vatEnabled`;
 - выставляет `syncId`.
 
 Результат — документ **Отгрузка** (`POST /entity/demand`) в МойСклад.
-
----
 
 ### 2. Товары и остатки: API-driven sync
 
@@ -121,19 +151,30 @@ Manual/API Trigger → sync.py → MoySklad API / Evotor API → mappings / stoc
 
 Используется для создания или обновления карточки товара в Эвотор по данным из МойСклад.
 
+Поддерживается синхронизация:
+
+- названия;
+- цены;
+- себестоимости;
+- единицы измерения;
+- штрихкодов;
+- статьи;
+- описания;
+- НДС товара.
+
 Важно: обычная синхронизация товара **не должна перезаписывать остаток**.
 
 #### Синхронизация остатков
 
-**Одиночная:**
+Одиночная:
 
 `POST /sync/{tenant_id}/stock/{ms_product_id}`
 
-- по `ms_product_id` ищется `evotor_id` в `mappings`;
+- по `ms_product_id` ищется `evotor_id` в mappings;
 - остаток читается из МойСклад;
 - в Эвотор обновляется товар с новым `quantity`.
 
-**Массовая:**
+Массовая:
 
 `POST /sync/{tenant_id}/stock/reconcile`
 
@@ -148,29 +189,29 @@ Manual/API Trigger → sync.py → MoySklad API / Evotor API → mappings / stoc
 
 Возвращает:
 
-- `status`: `configured | in_progress | ok | error`
+- `status: configured | in_progress | ok | error`
 - `last_sync_time`
 - `last_error`
 - `count_synced_items`
 - `total_items_count`
 
----
+### 3. Автоматическая синхронизация остатков: webhook МойСклад
 
-## Важная договорённость по остаткам
+```text
+МойСклад создал документ → Webhook → moysklad_webhooks.py → позиции документа → Evotor API
+```
 
-В текущем проекте **основной рабочий сценарий для остатков — это МойСклад → Эвотор через reconcile/API**.
+При изменении остатков в МойСклад (через отгрузку, приёмку, инвентаризацию, списание) остатки автоматически обновляются в Эвотор.
 
-Рабочий контур остатков сейчас реализован через:
+#### Поддерживаемые типы документов
 
-- `POST /sync/{tenant_id}/stock/{ms_product_id}`
-- `POST /sync/{tenant_id}/stock/reconcile`
-- `GET /sync/{tenant_id}/stock/status`
-
-Это означает:
-
-- логи webhook/продаж идут в `worker`;
-- логи ручной синхронизации товаров и остатков идут в `uvicorn` / `api.sync`;
-- отсутствие логов в worker при вызове `/sync/...` — это нормально.
+| Тип | Описание | Эффект на остатки |
+|---|---|---|
+| `demand` | Отгрузка | Уменьшение |
+| `supply` | Приёмка | Увеличение |
+| `inventory` | Инвентаризация | Корректировка |
+| `loss` | Списание | Уменьшение |
+| `enter` | Оприходование | Увеличение |
 
 ---
 
@@ -180,57 +221,19 @@ Manual/API Trigger → sync.py → MoySklad API / Evotor API → mappings / stoc
 
 ### Новый формат — `ReceiptCreated`
 
-Актуальный формат. Нормализуется в `webhooks.py`.
+Актуальный production-формат. Внешний тип события — `ReceiptCreated`, внутренний тип документа — `data.type = SELL`.
 
-Пример:
+Поддерживаются поля:
 
-```json
-{
-  "type": "ReceiptCreated",
-  "id": "20260314-...",
-  "store_id": "00000000-0000-0000-0000-000000000001",
-  "data": {
-    "type": "SELL",
-    "id": "00000000-0000-0000-0000-000000000002",
-    "store_id": "00000000-0000-0000-0000-000000000001",
-    "totalAmount": 1.0,
-    "items": [
-      {
-        "id": "00000000-0000-0000-0000-000000000002",
-        "name": "GP Alkaline AAx4",
-        "quantity": 1,
-        "price": 1.0,
-        "sumPrice": 1.0
-      }
-    ]
-  }
-}
-```
+- buyer data (`customer`)
+- скидки (`discount`, `totalDiscount`, а также enriched/test `resultPrice`, `resultSum`, `positionDiscount`)
+- налоги (`tax`, `taxPercent`, `totalTax`)
 
 ### Старый формат — `SELL`
 
-```json
-{
-  "type": "SELL",
-  "id": "00000000-0000-0000-0000-000000000001",
-  "store_id": "00000000-0000-0000-0000-000000000001",
-  "device_id": "00000000-0000-0000-0000-000000000003",
-  "body": {
-    "positions": [
-      {
-        "product_id": "00000000-0000-0000-0000-000000000004",
-        "product_name": "GP Alkaline AAx4",
-        "quantity": 1,
-        "price": 1.0,
-        "sum": 1.0
-      }
-    ],
-    "sum": 1.0
-  }
-}
-```
+Поддерживается для обратной совместимости.
 
-Оба формата приводятся к внутреннему sale-payload и проходят одинаковый pipeline.
+Оба формата нормализуются во внутренний sale-payload и проходят одинаковый pipeline.
 
 ---
 
@@ -273,7 +276,7 @@ NEW → PROCESSING → DONE
 | `MappingNotFoundError` | FAILED |
 | Остальные неизвестные | RETRY |
 
-### Retry политика
+### Retry-политика
 
 - Exponential backoff: `1m → 2m → 4m → 8m → 16m`
 - Максимум 5 попыток, затем → `FAILED`
@@ -297,16 +300,17 @@ NEW → PROCESSING → DONE
 integration-bus/
 ├── app/
 │   ├── api/
-│   │   ├── errors.py           — журнал ошибок
-│   │   ├── events.py           — просмотр и requeue событий
-│   │   ├── evotor.py           — token callback и служебные endpoint'ы Эвотор
-│   │   ├── mappings.py         — CRUD /mappings
-│   │   ├── sync.py             — initial sync, product sync, stock sync, stock status
-│   │   ├── tenants.py          — tenants и конфигурация MoySklad/Evotor
-│   │   └── webhooks.py         — POST /webhooks/evotor/{tenant_id}
+│   │   ├── errors.py               — журнал ошибок
+│   │   ├── events.py               — просмотр и requeue событий
+│   │   ├── evotor.py               — token callback и служебные endpoint'ы Эвотор
+│   │   ├── mappings.py             — CRUD /mappings
+│   │   ├── moysklad_webhooks.py    — POST /webhooks/moysklad/{tenant_id}
+│   │   ├── sync.py                 — initial sync, product sync, stock sync, stock status
+│   │   ├── tenants.py              — tenants и конфигурация MoySklad/Evotor
+│   │   └── webhooks.py             — POST /webhooks/evotor/{tenant_id}
 │   ├── clients/
-│   │   ├── evotor_client.py
-│   │   └── moysklad_client.py
+│   │   ├── evotor_client.py        — клиент API Эвотор
+│   │   └── moysklad_client.py      — клиент API МойСклад
 │   ├── handlers/
 │   │   └── sale_handler.py
 │   ├── mappers/
@@ -314,6 +318,7 @@ integration-bus/
 │   ├── scripts/
 │   │   └── init_db.py
 │   ├── services/
+│   │   ├── counterparty_resolver.py — резолвинг контрагента
 │   │   ├── error_logic.py
 │   │   └── event_dispatcher.py
 │   ├── stores/
@@ -326,7 +331,11 @@ integration-bus/
 │   └── main.py
 ├── data/
 │   └── app.db
+├── docs/
+│   └── PAYLOAD_CONTRACTS.md
 ├── tests/
+│   ├── e2e_test.py
+│   └── test_sale2.py
 ├── README.md
 └── requirements.txt
 ```
@@ -379,7 +388,7 @@ pip install -r requirements.txt
 python -m app.scripts.init_db
 ```
 
-`init_db` идемпотентен. Если таблица `stock_sync_status` ещё не создана, она также может быть создана автоматически при первом обращении к stock sync endpoint'ам.
+`init_db` идемпотентен и безопасен для повторного запуска.
 
 ---
 
@@ -391,23 +400,11 @@ python -m app.scripts.init_db
 uvicorn app.main:app --reload
 ```
 
-Swagger:
-
-```text
-http://127.0.0.1:8000/docs
-```
+Swagger: `http://127.0.0.1:8000/docs`
 
 ### Терминал 2 — Worker
 
-macOS / Linux:
-
 ```bash
-python -m app.workers.worker
-```
-
-Windows:
-
-```powershell
 python -m app.workers.worker
 ```
 
@@ -427,9 +424,9 @@ POST /tenants
 PATCH /tenants/{tenant_id}/moysklad
 ```
 
-3. Подключить callback токена Эвотор:
+3. Подключить callback токена Эвотор (настраивается в `dev.evotor.ru`):
 
-```text
+```http
 POST /api/v1/user/token
 ```
 
@@ -439,17 +436,13 @@ POST /api/v1/user/token
 POST /sync/{tenant_id}/initial
 ```
 
-5. Проверить общий статус:
+5. Зарегистрировать webhooks в МойСклад для документов `demand`, `supply`, `inventory`, `loss`, `enter`.
+
+6. Проверить общий статус:
 
 ```http
 GET /sync/{tenant_id}/status
 ```
-
-6. При необходимости выполнить:
-
-- синхронизацию одного товара;
-- синхронизацию одного остатка;
-- массовую синхронизацию остатков.
 
 ---
 
@@ -458,22 +451,19 @@ GET /sync/{tenant_id}/status
 ### Одиночная синхронизация товара
 
 ```bash
-curl -X POST \
-  "http://127.0.0.1:8000/sync/{tenant_id}/product/{ms_product_id}"
+curl -X POST "http://127.0.0.1:8000/sync/{tenant_id}/product/{ms_product_id}"
 ```
 
 ### Одиночная синхронизация остатка
 
 ```bash
-curl -X POST \
-  "http://127.0.0.1:8000/sync/{tenant_id}/stock/{ms_product_id}"
+curl -X POST "http://127.0.0.1:8000/sync/{tenant_id}/stock/{ms_product_id}"
 ```
 
 ### Массовая синхронизация остатков
 
 ```bash
-curl -X POST \
-  "http://127.0.0.1:8000/sync/{tenant_id}/stock/reconcile"
+curl -X POST "http://127.0.0.1:8000/sync/{tenant_id}/stock/reconcile"
 ```
 
 ### Статус синхронизации остатков
@@ -502,11 +492,12 @@ curl "http://127.0.0.1:8000/sync/{tenant_id}/stock/status"
 | POST | `/tenants/{tenant_id}/complete-sync` | Отметить initial sync как завершённую |
 | DELETE | `/tenants/{tenant_id}/complete-sync` | Сбросить initial sync |
 
-### Webhooks / Evotor
+### Webhooks
 
 | Метод | URL | Описание |
 |---|---|---|
 | POST | `/webhooks/evotor/{tenant_id}` | Принять webhook от Эвотор |
+| POST | `/webhooks/moysklad/{tenant_id}` | Принять webhook от МойСклад |
 | POST | `/api/v1/user/token` | Сохранить токен Эвотор |
 
 ### Sync API
@@ -533,10 +524,10 @@ curl "http://127.0.0.1:8000/sync/{tenant_id}/stock/status"
 | Метод | URL | Описание |
 |---|---|---|
 | GET | `/events` | Последние события |
-| GET | `/events/retry` | События в статусе `RETRY` |
-| GET | `/events/failed` | События в статусе `FAILED` |
+| GET | `/events/retry` | События в статусе RETRY |
+| GET | `/events/failed` | События в статусе FAILED |
 | GET | `/events/{id}` | Детали события |
-| POST | `/events/{id}/requeue` | Повторная постановка `FAILED → NEW` |
+| POST | `/events/{id}/requeue` | Повторная постановка FAILED → NEW |
 | GET | `/errors` | Журнал ошибок |
 
 ---
@@ -553,6 +544,8 @@ timestamp | level | logger | message
 
 - `api`
 - `api.sync`
+- `api.webhooks`
+- `api.webhooks.moysklad`
 - `worker`
 - `dispatcher`
 - `sale_handler`
@@ -565,18 +558,25 @@ timestamp | level | logger | message
 ## Что важно помнить
 
 - Продажи обрабатываются через `event_store + worker`.
-- Ручные вызовы `/sync/...` обрабатываются напрямую в API-процессе. Поэтому лог ручной синхронизации товара/остатка появляется в `uvicorn`, а не в `worker`.
+- Остатки обновляются автоматически через webhook МойСклад → `moysklad_webhooks.py`.
+- Ручные вызовы `/sync/...` обрабатываются напрямую в API-процессе — лог появляется в `uvicorn`, не в `worker`.
 - Для `/sync/{tenant_id}/stock/{ms_product_id}` нужен существующий mapping товара.
 - Для `/sync/{tenant_id}/stock/reconcile` используются все product mappings tenant'а.
+- Для sale-pipeline источник истины по скидкам и НДС — **сам чек Эвотор**.
+- Для карточки товара источник истины по НДС — **МойСклад**.
+- Webhooks МойСклад настраиваются через API, не через UI.
 
 ---
 
 ## Дальнейшее развитие
 
-- Автоматическая синхронизация product-изменений из МойСклад
-- Отдельный ingest-контур для обновлений остатков из внешних источников
-- Dockerization
-- Метрики и мониторинг
-- Dead-letter queue
-- Batch jobs по расписанию
+- Аутентификация на admin API
+- Dockerization + деплой на VPS
+- Расширенный `/health` — статус воркера, БД, последнее событие
+- Алерты на `FAILED` события в Telegram / email
+- Поддержка покупателей и скидок для дополнительных форматов чеков
+- Расширение маппинга налогов для нестандартных ставок
+- Фискализация: документ из МойСклад → Эвотор
+- Маркировка товара
+- Мониторинг / dashboard
 - Валидация подписи webhook Эвотор

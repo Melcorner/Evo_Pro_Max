@@ -3,6 +3,7 @@ import logging
 
 from app.clients.moysklad_client import MoySkladClient
 from app.mappers.sale_mapper import map_sale_to_ms, SalePayloadError, MappingNotFoundError
+from app.services.counterparty_resolver import resolve_counterparty_for_sale
 from app.db import get_connection
 
 log = logging.getLogger("sale_handler")
@@ -28,6 +29,19 @@ def handle_sale(event_row):
     tenant_id = event_row["tenant_id"]
 
     ms_config = _load_ms_config(tenant_id)
+    default_ms_agent_id = ms_config.get("ms_agent_id")
+
+    resolved_ms_agent_id, resolution_source = resolve_counterparty_for_sale(
+        payload=payload,
+        tenant_id=tenant_id,
+        default_ms_agent_id=default_ms_agent_id,
+    )
+    log.info(
+        "Resolved counterparty event_id=%s source=%s agent_id=%s",
+        event_row["id"],
+        resolution_source,
+        resolved_ms_agent_id,
+    )
 
     try:
         ms_payload = map_sale_to_ms(
@@ -36,7 +50,8 @@ def handle_sale(event_row):
             tenant_id=tenant_id,
             ms_organization_id=ms_config.get("ms_organization_id"),
             ms_store_id=ms_config.get("ms_store_id"),
-            ms_agent_id=ms_config.get("ms_agent_id"),
+            ms_agent_id=resolved_ms_agent_id,
+            counterparty_resolution_source=resolution_source,
         )
     except SalePayloadError as e:
         log.error(f"Invalid sale payload event_id={event_row['id']} err={e}")
