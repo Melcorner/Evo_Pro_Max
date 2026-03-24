@@ -50,19 +50,28 @@ class MoySkladClient:
         self._handle_error(r)
         return r.json()
 
-    def get_products(self, limit: int = 1000, offset: int = 0) -> list:
+    def get_products(self, search: str | None = None, limit: int = 1000, offset: int = 0) -> dict:
+        """
+        Получает список товаров из МойСклад.
+        Возвращает полный JSON-ответ, чтобы можно было брать rows, meta и т.д.
+        """
         url = f"{self.BASE_URL}/entity/product"
+        params = {"limit": limit, "offset": offset}
+
+        if search:
+            params["search"] = search
+
         r = requests.get(
             url,
             headers=self._headers(),
-            params={"limit": limit, "offset": offset},
-            timeout=30,
+            params=params,
+            timeout=30
         )
         self._handle_error(r)
         data = r.json()
-        rows = data.get("rows", [])
-        log.info(f"Fetched {len(rows)} products from MoySklad")
-        return rows
+        rows = data.get("rows", []) if isinstance(data, dict) else []
+        log.info(f"Fetched {len(rows)} products from MoySklad search={search!r}")
+        return data
 
     def get_product(self, ms_product_id: str) -> dict:
         url = f"{self.BASE_URL}/entity/product/{ms_product_id}"
@@ -109,12 +118,16 @@ class MoySkladClient:
     # Stock helpers
     # -----------------------------
 
-    def get_product_with_stock(self, ms_product_id: str) -> dict:
+    def get_product_with_stock(self, ms_product_id: str) -> dict | None:
         """
-        Получает товар с остатком из MoySklad через assortment по filter=id=...
+        Получает строку остатка товара через /report/stock/all.
+
+        /entity/assortment при нулевом остатке может вернуть пустой rows,
+        что приводило к исключению вместо 0. /report/stock/all надёжнее —
+        всегда возвращает строку для известного товара.
         """
-        url = f"{self.BASE_URL}/entity/assortment"
-        params = {"filter": f"id={ms_product_id}"}
+        url = f"{self.BASE_URL}/report/stock/all"
+        params = {"filter": f"product={self.BASE_URL}/entity/product/{ms_product_id}"}
 
         try:
             r = requests.get(url, headers=self._headers(), params=params, timeout=20)
@@ -122,19 +135,26 @@ class MoySkladClient:
             data = r.json()
             rows = data.get("rows", []) if isinstance(data, dict) else []
             if not rows:
-                raise Exception(f"Product {ms_product_id} not found in MoySklad assortment")
+                log.warning(
+                    "Product %s not found in MoySklad stock report", ms_product_id
+                )
+                return None
             return rows[0]
         except Exception as e:
             log.warning(
-                f"Failed to fetch assortment stock url={url} ms_product_id={ms_product_id} err={e}"
+                "Failed to fetch stock report ms_product_id=%s err=%s", ms_product_id, e
             )
             raise Exception(f"Failed to fetch product stock from MoySklad: {e}")
 
     def get_product_stock(self, ms_product_id: str) -> float:
         """
         Возвращает текущий остаток товара.
+        Если товар не найден в отчёте — возвращает 0.0 (не исключение).
         """
         data = self.get_product_with_stock(ms_product_id)
+        if data is None:
+            return 0.0
+
         for key in ("stock", "quantity", "inStock"):
             value = data.get(key)
             if value is None:
@@ -144,9 +164,9 @@ class MoySkladClient:
             except (TypeError, ValueError):
                 pass
 
-        raise Exception(
-            f"Stock value is missing or invalid in MoySklad response for product {ms_product_id}"
-        )
+        # Строка есть, поле остатка отсутствует — товар есть, остаток 0
+        log.warning("Stock field not found for product %s, returning 0", ms_product_id)
+        return 0.0
 
     # -----------------------------
     # Counterparty helpers
@@ -224,7 +244,7 @@ class MoySkladClient:
                     log.info(f"Counterparty found by phone={normalized_target} id={row.get('id')}")
                     return row
         return None
-
+    
     def create_counterparty(
         self,
         name: str | None,

@@ -36,7 +36,7 @@ def process_one_event():
     event_id = row["id"]
     log.info(f"Picked event_id={event_id} status={row['status']} retries={row['retries']} event_key={row['event_key']}")
 
-    # пытаемся захватить событие
+    # пытаемся захватить событие (optimistic locking)
     cursor.execute("""
         UPDATE event_store
         SET status = 'PROCESSING', updated_at = ?
@@ -45,7 +45,7 @@ def process_one_event():
 
     if cursor.rowcount == 0:
         conn.close()
-        return True  # кто-то уже взял
+        return True  # другой воркер уже взял событие
 
     conn.commit()
     log.info(f"Locked event_id={event_id} -> PROCESSING")
@@ -72,12 +72,11 @@ def process_one_event():
             row["tenant_id"],
             row["event_key"],
             result_ref,
-            now
+            now,
         ))
 
         conn.commit()
         log.info(f"DONE event_id={event_id} event_key={row['event_key']}")
-        conn.close()
         return True
 
     except Exception as e:
@@ -91,7 +90,7 @@ def process_one_event():
             error_code = str(getattr(e.response, "status_code", ""))
         elif hasattr(e, "status_code"):
             error_code = str(getattr(e, "status_code", ""))
-        
+
         response_body = None
         if hasattr(e, "response") and e.response is not None:
             try:
@@ -110,34 +109,11 @@ def process_one_event():
             err,
         )
 
-        if decision == FAILED:
-            cursor.execute("""
-                UPDATE event_store
-                SET status = 'FAILED',
-                    retries = ?,
-                    next_retry_at = NULL,
-                    last_error_message = ?,
-                    updated_at = ?
-                WHERE id = ?
-            """, (new_retries, err, now, event_id))
-
-            insert_error(conn, row, error_code, err, response_body)
-
-            conn.commit()
-            log.error(
-                "FAILED event_id=%s event_key=%s retries=%s err=%s",
-                event_id,
-                row["event_key"],
-                new_retries,
-                err,
-            )
-            conn.close()
-            return True
-
-        # decision == RETRY
+        # decision == RETRY и исчерпаны попытки → тоже FAILED
         delay = 60 * (2 ** (new_retries - 1))  # 60,120,240,480,960
+        go_failed = decision == FAILED or new_retries >= 5
 
-        if new_retries >= 5:
+        if go_failed:
             cursor.execute("""
                 UPDATE event_store
                 SET status = 'FAILED',
@@ -147,17 +123,6 @@ def process_one_event():
                     updated_at = ?
                 WHERE id = ?
             """, (new_retries, err, now, event_id))
-
-            insert_error(conn, row, error_code, err, response_body)
-
-            conn.commit()
-            log.error(
-                "FAILED event_id=%s event_key=%s retries=%s err=%s",
-                event_id,
-                row["event_key"],
-                new_retries,
-                err,
-            )
         else:
             cursor.execute("""
                 UPDATE event_store
@@ -169,20 +134,24 @@ def process_one_event():
                 WHERE id = ?
             """, (new_retries, now + delay, err, now, event_id))
 
-            insert_error(conn, row, error_code, err, response_body)
+        insert_error(conn, row, error_code, err, response_body)
+        conn.commit()
 
-            conn.commit()
+        if go_failed:
+            log.error(
+                "FAILED event_id=%s event_key=%s retries=%s err=%s",
+                event_id, row["event_key"], new_retries, err,
+            )
+        else:
             log.warning(
                 "RETRY event_id=%s event_key=%s retries=%s next_retry_at=%s err=%s",
-                event_id,
-                row["event_key"],
-                new_retries,
-                now + delay,
-                err,
+                event_id, row["event_key"], new_retries, now + delay, err,
             )
 
-        conn.close()
         return True
+
+    finally:
+        conn.close()
 
 def main_loop():
     print("Worker started")

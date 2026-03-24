@@ -28,7 +28,7 @@ def validate_sale_payload(payload: dict):
     if not payload.get("id"):
         raise SalePayloadError("Missing required field: id")
 
-    if payload.get("type") not in ("SELL", "sell"):
+    if payload.get("type") != "SELL":
         raise SalePayloadError(f"Unexpected document type: {payload.get('type')}")
 
     body = payload.get("body")

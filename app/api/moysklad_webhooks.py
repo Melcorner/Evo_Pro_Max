@@ -84,7 +84,8 @@ def _get_document_positions(ms_client: MoySkladClient, doc_type: str, doc_id: st
     """
     import requests
 
-    url = f"{MoySkladClient.BASE_URL}/entity/{doc_type}/{doc_id}/positions"
+    # Берём BASE_URL с инстанса, а не с класса — чтобы уважать env-переменную MS_BASE_URL
+    url = f"{ms_client.BASE_URL}/entity/{doc_type}/{doc_id}/positions"
     r = requests.get(url, headers=ms_client._headers(), timeout=15)
 
     if not r.ok:

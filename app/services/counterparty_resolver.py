@@ -41,8 +41,17 @@ def resolve_counterparty_for_sale(payload: dict, tenant_id: str, default_ms_agen
             if row and row.get("id"):
                 return row["id"], "found_by_phone"
 
+        # МойСклад требует непустое имя контрагента — подбираем fallback
+        create_name = name or email or phone or "Покупатель"
+        if not name:
+            log.info(
+                "Counterparty name is empty, using fallback name=%s tenant_id=%s",
+                create_name,
+                tenant_id,
+            )
+
         created = client.create_counterparty(
-            name=name,
+            name=create_name,
             phone=phone,
             email=email,
             inn=inn,
