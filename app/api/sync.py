@@ -421,17 +421,45 @@ def _find_ms_product_by_external_code(ms_token: str, external_code: str) -> str 
     Ищет товар в МойСклад по externalCode (= evotor_id).
     Используется в initial_sync для защиты от дублей при повторном запуске
     после частичного падения: если товар уже создан, но mapping не сохранился.
+
+    При любой HTTP-ошибке бросает исключение — не возвращает None,
+    чтобы не пропустить сетевой сбой и не создать дубль.
     """
     url = f"{MS_BASE}/entity/product"
     params = {"filter": f"externalCode={external_code}"}
     r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
     if not r.ok:
-        log.warning("MoySklad search by externalCode failed status=%s", r.status_code)
-        return None
+        log.error(
+            "MoySklad search by externalCode failed status=%s external_code=%s — aborting to prevent duplicate",
+            r.status_code, external_code,
+        )
+        r.raise_for_status()
     rows = r.json().get("rows", [])
     if rows:
         return rows[0].get("id")
     return None
+
+
+def _detect_barcode_format(value: str) -> str:
+    """
+    Определяет формат штрихкода по длине и содержимому.
+    МойСклад поддерживает: ean13, ean8, code128, gtin.
+
+    EAN-13  — 13 цифр
+    EAN-8   — 8 цифр
+    GTIN    — 14 цифр (GS1)
+    Code128 — всё остальное (буквы, спецсимволы, другие длины)
+    """
+    digits_only = value.isdigit()
+    length = len(value)
+
+    if digits_only and length == 13:
+        return "ean13"
+    if digits_only and length == 8:
+        return "ean8"
+    if digits_only and length == 14:
+        return "gtin"
+    return "code128"
 
 
 def _create_ms_product(ms_token: str, product: dict) -> str:
@@ -475,7 +503,7 @@ def _create_ms_product(ms_token: str, product: dict) -> str:
     barcodes = product.get("barcodes", [])
     if barcodes:
         # Передаём все штрихкоды, а не только первый
-        payload["barcodes"] = [{"ean13": bc} for bc in barcodes]
+        payload["barcodes"] = [{_detect_barcode_format(bc): bc} for bc in barcodes]
 
     url = f"{MS_BASE}/entity/product"
     r = requests.post(url, headers=_ms_headers(ms_token), json=payload, timeout=20)
@@ -543,12 +571,13 @@ def initial_sync(tenant_id: str):
             continue
 
         try:
-            # Защита от дублей: ищем товар в МойСклад по externalCode=evotor_id
-            # На случай если товар уже создан, но mapping не сохранился (partial failure)
+            # Защита от дублей: ищем товар по externalCode=evotor_id.
+            # Если поиск вернул HTTP-ошибку — бросаем исключение и останавливаемся,
+            # чтобы не создать дубль в плохой момент (401, 429, 5xx, сеть).
             ms_id = _find_ms_product_by_external_code(tenant["moysklad_token"], evotor_id)
             if ms_id:
                 log.info(
-                    "Found existing MS product by externalCode evotor_id=%s ms_id=%s — saving mapping",
+                    "Found existing MS product by externalCode evotor_id=%s ms_id=%s — saving mapping only",
                     evotor_id, ms_id,
                 )
             else:
@@ -962,19 +991,20 @@ def sync_stock_to_evotor(tenant_id: str, ms_product_id: str):
         stock_value = ms_client.get_product_stock(ms_product_id)
         evotor_client.update_product_stock(evotor_product_id, stock_value)
 
-        # Одиночная синхронизация не затрагивает status и счётчики reconcile —
-        # обновляем только last_sync_at и сбрасываем last_error.
+        # Одиночная синхронизация не затирает статус и счётчики reconcile.
+        # Если запись уже есть — сохраняем status/счётчики, обновляем только last_sync_at.
+        # Если записи ещё нет (reconcile ни разу не запускался) — создаём с базовыми значениями,
+        # чтобы /stock/status показывал last_sync_time, а не "configured".
         existing = _get_stock_status_row(tenant_id)
-        if existing:
-            _upsert_stock_status(
-                tenant_id=tenant_id,
-                status=existing["status"],
-                started_at=existing["started_at"],
-                last_sync_at=_now(),
-                last_error=None,
-                synced_items_count=existing["synced_items_count"],
-                total_items_count=existing["total_items_count"],
-            )
+        _upsert_stock_status(
+            tenant_id=tenant_id,
+            status=existing["status"] if existing else "ok",
+            started_at=existing["started_at"] if existing else _now(),
+            last_sync_at=_now(),
+            last_error=None,
+            synced_items_count=existing["synced_items_count"] if existing else 1,
+            total_items_count=existing["total_items_count"] if existing else 1,
+        )
 
         return {
             "status": "ok",
@@ -986,15 +1016,13 @@ def sync_stock_to_evotor(tenant_id: str, ms_product_id: str):
     except Exception as e:
         err_text = str(e)
         existing = _get_stock_status_row(tenant_id)
-        if existing:
-            # Сохраняем статус reconcile, только пишем last_error
-            _upsert_stock_status(
-                tenant_id=tenant_id,
-                status=existing["status"],
-                started_at=existing["started_at"],
-                last_sync_at=_now(),
-                last_error=err_text,
-                synced_items_count=existing["synced_items_count"],
-                total_items_count=existing["total_items_count"],
-            )
+        _upsert_stock_status(
+            tenant_id=tenant_id,
+            status=existing["status"] if existing else "error",
+            started_at=existing["started_at"] if existing else _now(),
+            last_sync_at=_now(),
+            last_error=err_text,
+            synced_items_count=existing["synced_items_count"] if existing else 0,
+            total_items_count=existing["total_items_count"] if existing else 1,
+        )
         raise HTTPException(status_code=502, detail=f"Failed to sync stock to Evotor: {err_text}")
