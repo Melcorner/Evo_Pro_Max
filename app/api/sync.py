@@ -416,6 +416,24 @@ def _get_evotor_products(evotor_token: str, store_id: str) -> list:
     return products
 
 
+def _find_ms_product_by_external_code(ms_token: str, external_code: str) -> str | None:
+    """
+    Ищет товар в МойСклад по externalCode (= evotor_id).
+    Используется в initial_sync для защиты от дублей при повторном запуске
+    после частичного падения: если товар уже создан, но mapping не сохранился.
+    """
+    url = f"{MS_BASE}/entity/product"
+    params = {"filter": f"externalCode={external_code}"}
+    r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
+    if not r.ok:
+        log.warning("MoySklad search by externalCode failed status=%s", r.status_code)
+        return None
+    rows = r.json().get("rows", [])
+    if rows:
+        return rows[0].get("id")
+    return None
+
+
 def _create_ms_product(ms_token: str, product: dict) -> str:
     payload = {
         "name": product["name"],
@@ -525,8 +543,17 @@ def initial_sync(tenant_id: str):
             continue
 
         try:
-            ms_id = _create_ms_product(tenant["moysklad_token"], product)
-            log.info("Created MS product evotor_id=%s ms_id=%s name=%s", evotor_id, ms_id, product.get("name"))
+            # Защита от дублей: ищем товар в МойСклад по externalCode=evotor_id
+            # На случай если товар уже создан, но mapping не сохранился (partial failure)
+            ms_id = _find_ms_product_by_external_code(tenant["moysklad_token"], evotor_id)
+            if ms_id:
+                log.info(
+                    "Found existing MS product by externalCode evotor_id=%s ms_id=%s — saving mapping",
+                    evotor_id, ms_id,
+                )
+            else:
+                ms_id = _create_ms_product(tenant["moysklad_token"], product)
+                log.info("Created MS product evotor_id=%s ms_id=%s name=%s", evotor_id, ms_id, product.get("name"))
         except Exception as e:
             log.error("Failed to create MS product evotor_id=%s name=%s err=%s", evotor_id, product.get("name"), e)
             failed += 1
@@ -576,7 +603,7 @@ def sync_status(tenant_id: str):
         "sync_completed_at": tenant.get("sync_completed_at"),
         "product_mappings_count": mapping_count,
         "evotor_store_configured": bool(tenant.get("evotor_store_id")),
-        "moysklad_configured": bool(tenant.get("ms_organization_id")),
+        "moysklad_configured": bool(tenant.get("moysklad_token")),
     }
 
 
@@ -935,19 +962,19 @@ def sync_stock_to_evotor(tenant_id: str, ms_product_id: str):
         stock_value = ms_client.get_product_stock(ms_product_id)
         evotor_client.update_product_stock(evotor_product_id, stock_value)
 
-        # Одиночная синхронизация не перезаписывает агрегированный статус reconcile.
-        # Просто обновляем last_error=None и last_sync_at если статус уже ok/error,
-        # не трогая total_items_count из предыдущего reconcile.
+        # Одиночная синхронизация не затрагивает status и счётчики reconcile —
+        # обновляем только last_sync_at и сбрасываем last_error.
         existing = _get_stock_status_row(tenant_id)
-        _upsert_stock_status(
-            tenant_id=tenant_id,
-            status="ok",
-            started_at=existing["started_at"] if existing else _now(),
-            last_sync_at=_now(),
-            last_error=None,
-            synced_items_count=existing["synced_items_count"] if existing else 1,
-            total_items_count=existing["total_items_count"] if existing else 1,
-        )
+        if existing:
+            _upsert_stock_status(
+                tenant_id=tenant_id,
+                status=existing["status"],
+                started_at=existing["started_at"],
+                last_sync_at=_now(),
+                last_error=None,
+                synced_items_count=existing["synced_items_count"],
+                total_items_count=existing["total_items_count"],
+            )
 
         return {
             "status": "ok",
@@ -959,13 +986,15 @@ def sync_stock_to_evotor(tenant_id: str, ms_product_id: str):
     except Exception as e:
         err_text = str(e)
         existing = _get_stock_status_row(tenant_id)
-        _upsert_stock_status(
-            tenant_id=tenant_id,
-            status="error",
-            started_at=existing["started_at"] if existing else _now(),
-            last_sync_at=_now(),
-            last_error=err_text,
-            synced_items_count=existing["synced_items_count"] if existing else 0,
-            total_items_count=existing["total_items_count"] if existing else 1,
-        )
+        if existing:
+            # Сохраняем статус reconcile, только пишем last_error
+            _upsert_stock_status(
+                tenant_id=tenant_id,
+                status=existing["status"],
+                started_at=existing["started_at"],
+                last_sync_at=_now(),
+                last_error=err_text,
+                synced_items_count=existing["synced_items_count"],
+                total_items_count=existing["total_items_count"],
+            )
         raise HTTPException(status_code=502, detail=f"Failed to sync stock to Evotor: {err_text}")

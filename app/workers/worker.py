@@ -1,9 +1,7 @@
 import time
-import uuid
 import logging
 
 from app.logger import setup_logging
-from app.handlers.sale_handler import handle_sale
 from app.services.error_logic import classify_error, RETRY, FAILED
 from app.stores.error_store import insert_error
 from app.services.event_dispatcher import dispatch_event

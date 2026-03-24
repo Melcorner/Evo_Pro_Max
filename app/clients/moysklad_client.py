@@ -100,7 +100,7 @@ class MoySkladClient:
             url = f"{self.BASE_URL}/entity/demand"
 
         log.info(f"Creating sale document url={url}")
-        log.info(f"Sale payload={payload}")
+        log.debug(f"Sale payload={payload}")  # PII: debug only
 
         r = requests.post(url, headers=self._headers(), json=payload, timeout=15)
         log.info(f"MoySklad response={r.status_code}")
@@ -225,7 +225,7 @@ class MoySkladClient:
         for row in rows:
             for candidate in self._extract_email_candidates(row):
                 if candidate.strip().lower() == email_lower:
-                    log.info(f"Counterparty found by email={email_lower} id={row.get('id')}")
+                    log.debug(f"Counterparty found by email={email_lower} id={row.get('id')}")  # PII: debug only
                     return row
         return None
 
@@ -241,7 +241,7 @@ class MoySkladClient:
         for row in rows:
             for candidate in self._extract_phone_candidates(row):
                 if self._normalize_phone(candidate) == normalized_target:
-                    log.info(f"Counterparty found by phone={normalized_target} id={row.get('id')}")
+                    log.debug(f"Counterparty found by phone={normalized_target} id={row.get('id')}")  # PII: debug only
                     return row
         return None
     
