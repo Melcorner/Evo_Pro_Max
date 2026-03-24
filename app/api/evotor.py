@@ -4,7 +4,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from app.db import get_connection
 
-router = APIRouter()
+router = APIRouter(tags=["Evotor Service"])
 log = logging.getLogger("api.evotor")
 
 

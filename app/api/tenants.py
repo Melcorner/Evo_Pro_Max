@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from app.db import get_connection
 
-router = APIRouter()
+router = APIRouter(tags=["Tenants"])
 
 
 class TenantCreate(BaseModel):

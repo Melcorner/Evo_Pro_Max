@@ -7,7 +7,7 @@ from app.db import get_connection
 from app.stores.mapping_store import MappingStore
 
 log = logging.getLogger("api.sync")
-router = APIRouter()
+router = APIRouter(tags=["Sync"])
 
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 EVOTOR_BASE = "https://api.evotor.ru"

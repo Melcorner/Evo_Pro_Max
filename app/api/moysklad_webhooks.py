@@ -9,7 +9,7 @@ from app.stores.mapping_store import MappingStore
 from app.clients.moysklad_client import MoySkladClient
 from app.clients.evotor_client import EvotorClient
 
-router = APIRouter()
+router = APIRouter(tags=["MoySklad Webhooks"])
 log = logging.getLogger("api.webhooks.moysklad")
 
 

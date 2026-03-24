@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from app.db import get_connection
 
-router = APIRouter()
+router = APIRouter(tags=["Evotor Webhooks"])
 log = logging.getLogger("api.webhooks")
 
 
