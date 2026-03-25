@@ -44,10 +44,10 @@ def resolve_counterparty_for_sale(payload: dict, tenant_id: str, default_ms_agen
         # МойСклад требует непустое имя контрагента — подбираем fallback
         create_name = name or email or phone or "Покупатель"
         if not name:
-            log.info(
-                "Counterparty name is empty, using fallback name=%s tenant_id=%s",
-                create_name,
+            log.debug(
+                "Counterparty name is empty, using fallback tenant_id=%s resolution_source=created_counterparty",
                 tenant_id,
+                # fallback name намеренно не логируется — может содержать email или phone (PII)
             )
 
         created = client.create_counterparty(

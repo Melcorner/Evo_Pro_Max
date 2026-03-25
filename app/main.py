@@ -10,6 +10,7 @@ from app.api.mappings import router as mappings_router
 from app.api.errors import router as errors_router
 from app.api.evotor import router as evotor_router
 from app.api.sync import router as sync_router
+from app.api.moysklad_webhooks import router as moysklad_webhooks_router
 
 setup_logging()
 log = logging.getLogger("api")
@@ -38,7 +39,7 @@ app.include_router(events_router)
 app.include_router(mappings_router)
 app.include_router(errors_router)
 app.include_router(evotor_router)
-
+app.include_router(moysklad_webhooks_router)
 
 @app.get("/health", tags=["Infrastructure"])
 def health():

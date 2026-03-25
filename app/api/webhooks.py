@@ -5,7 +5,7 @@ import logging
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.db import get_connection
 
@@ -14,33 +14,30 @@ log = logging.getLogger("api.webhooks")
 
 
 class EvotorPosition(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     product_id: str
     product_name: Optional[str] = None
     quantity: float
     price: float
     sum: Optional[float] = None
 
-    class Config:
-        extra = "allow"
-
 
 class EvotorBody(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     positions: List[EvotorPosition]
     sum: Optional[float] = None
 
-    class Config:
-        extra = "allow"
-
 
 class EvotorWebhook(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: str
     id: str
     store_id: Optional[str] = None
     device_id: Optional[str] = None
     body: Optional[EvotorBody] = None
-
-    class Config:
-        extra = "allow"
 
 
 LIKELY_CUSTOMER_KEYS = (
@@ -217,9 +214,9 @@ def _normalize_receipt_created(body_dict: dict) -> tuple[str, str, dict] | tuple
 
 @router.post("/webhooks/evotor/{tenant_id}")
 async def evotor_webhook(tenant_id: str, raw_body: EvotorWebhook):
-    body_dict = raw_body.dict()
+    body_dict = raw_body.model_dump()
 
-    log.info(f"RAW EVOTOR BODY tenant_id={tenant_id} body={json.dumps(body_dict, ensure_ascii=False)}")
+    log.debug(f"RAW EVOTOR BODY tenant_id={tenant_id} body={json.dumps(body_dict, ensure_ascii=False)}")  # PII: debug only
 
     # Событие установки приложения — сохраняем токен клиента
     if "token" in body_dict and "userUuid" in body_dict:

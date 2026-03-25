@@ -15,34 +15,31 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch, call
 
+from app.api.sync import _detect_barcode_format
+
 
 # ===========================================================================
 # 1. Распознавание формата штрихкода
 # ===========================================================================
 
 class TestDetectBarcodeFormat:
-    def _fn(self):
-        from app.api.sync import _detect_barcode_format
-        return _detect_barcode_format
-
     def test_ean13(self):
-        assert self._fn()("2000000000053") == "ean13"
+        assert _detect_barcode_format("2000000000053") == "ean13"
 
     def test_ean8(self):
-        assert self._fn()("12345678") == "ean8"
+        assert _detect_barcode_format("12345678") == "ean8"
 
     def test_gtin(self):
-        assert self._fn()("04607038235002") == "gtin"
+        assert _detect_barcode_format("04607038235002") == "gtin"
 
     def test_code128_letters(self):
-        assert self._fn()("ABC-12345") == "code128"
+        assert _detect_barcode_format("ABC-12345") == "code128"
 
     def test_code128_short_digits(self):
-        assert self._fn()("123") == "code128"
+        assert _detect_barcode_format("123") == "code128"
 
     def test_code128_long_digits(self):
-        # 15 цифр — не EAN и не GTIN
-        assert self._fn()("123456789012345") == "code128"
+        assert _detect_barcode_format("123456789012345") == "code128"
 
 
 # ===========================================================================
@@ -265,6 +262,26 @@ class TestWorkerPolicy:
             "retries": retries,
         }
 
+    def _get_status_from_calls(self, cursor) -> list:
+        """
+        Извлекает статусы из UPDATE event_store по тексту SQL.
+        Статус в worker захардкожен в SQL (SET status = 'RETRY'),
+        а не передаётся параметром, поэтому читаем из текста запроса.
+        """
+        import re
+        statuses = []
+        for c in cursor.execute.call_args_list:
+            args = c.args
+            if not args:
+                continue
+            sql = args[0]
+            if "UPDATE event_store" not in sql:
+                continue
+            match = re.search(r"SET status = '([^']+)'", sql)
+            if match:
+                statuses.append(match.group(1))
+        return statuses
+
     @patch("app.workers.worker.insert_error")
     @patch("app.workers.worker.dispatch_event")
     @patch("app.workers.worker.get_connection")
@@ -283,12 +300,9 @@ class TestWorkerPolicy:
             from app.workers.worker import process_one_event
             process_one_event()
 
-        # Должен записать RETRY, не FAILED
-        updates = [str(c) for c in cursor.execute.call_args_list]
-        retry_calls = [u for u in updates if "RETRY" in u]
-        failed_calls = [u for u in updates if "FAILED" in u]
-        assert len(retry_calls) > 0
-        assert len(failed_calls) == 0
+        statuses = self._get_status_from_calls(cursor)
+        assert "RETRY" in statuses
+        assert "FAILED" not in statuses
 
     @patch("app.workers.worker.insert_error")
     @patch("app.workers.worker.dispatch_event")
@@ -308,9 +322,9 @@ class TestWorkerPolicy:
             from app.workers.worker import process_one_event
             process_one_event()
 
-        updates = [str(c) for c in cursor.execute.call_args_list]
-        failed_calls = [u for u in updates if "FAILED" in u]
-        assert len(failed_calls) > 0
+        statuses = self._get_status_from_calls(cursor)
+        assert "FAILED" in statuses
+        assert "RETRY" not in statuses
 
     @patch("app.workers.worker.insert_error")
     @patch("app.workers.worker.dispatch_event")

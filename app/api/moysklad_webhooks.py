@@ -2,7 +2,7 @@ import logging
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.db import get_connection
 from app.stores.mapping_store import MappingStore
@@ -18,19 +18,17 @@ log = logging.getLogger("api.webhooks.moysklad")
 # ---------------------------------------------------------------------------
 
 class MoySkladMeta(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     href: str
     type: Optional[str] = None
 
-    class Config:
-        extra = "allow"
-
 
 class MoySkladWebhookEvent(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     meta: MoySkladMeta
     updatedFields: Optional[List[str]] = None
-
-    class Config:
-        extra = "allow"
 
 
 class MoySkladWebhook(BaseModel):
@@ -48,10 +46,9 @@ class MoySkladWebhook(BaseModel):
         ]
     }
     """
-    events: List[MoySkladWebhookEvent]
+    model_config = ConfigDict(extra="allow")
 
-    class Config:
-        extra = "allow"
+    events: List[MoySkladWebhookEvent]
 
 
 # ---------------------------------------------------------------------------

@@ -167,6 +167,7 @@ def _extract_ms_barcodes(ms_product: dict) -> list[str]:
             barcode.get("ean13")
             or barcode.get("code128")
             or barcode.get("ean8")
+            or barcode.get("gtin")
             or barcode.get("value")
         )
         if value:
@@ -287,19 +288,19 @@ def _build_evotor_product_payload(
     payload = dict(current_product) if isinstance(current_product, dict) else {}
 
     base_fields = {
-            "name": ms_product.get("name", ""),
-            "price": sale_price,
-            "cost_price": cost_price,
-            "measure_name": _extract_ms_measure_name(ms_product),
-            "tax": _map_ms_tax_to_evotor(ms_product, current_tax=current_product.get("tax")),
-            "allow_to_sell": bool(current_product.get("allow_to_sell", True)),
-            "description": ms_product.get("description", "") or "",
-            "type": _map_ms_tracking_type_to_evotor_type(
-                ms_product,
-                current_type=current_product.get("type"),
-            ),
-            "article_number": ms_product.get("article", "") or "",
-        }
+        "name": ms_product.get("name", ""),
+        "price": sale_price,
+        "cost_price": cost_price,
+        "measure_name": _extract_ms_measure_name(ms_product),
+        "tax": _map_ms_tax_to_evotor(ms_product, current_tax=current_product.get("tax")),
+        "allow_to_sell": bool(current_product.get("allow_to_sell", True)),
+        "description": ms_product.get("description", "") or "",
+        "type": _map_ms_tracking_type_to_evotor_type(
+            ms_product,
+            current_type=current_product.get("type"),
+        ),
+        "article_number": ms_product.get("article", "") or "",
+    }
 
     if not for_create and evotor_id:
         base_fields["id"] = evotor_id
@@ -341,7 +342,6 @@ def _get_evotor_product(tenant: dict, evotor_product_id: str) -> dict:
         log.error("Evotor get_product error status=%s body=%s", r.status_code, r.text)
         r.raise_for_status()
     return r.json() if r.text else {}
-
 
 
 def _get_ms_product(ms_token: str, ms_product_id: str) -> dict:
@@ -431,7 +431,8 @@ def _find_ms_product_by_external_code(ms_token: str, external_code: str) -> str 
     if not r.ok:
         log.error(
             "MoySklad search by externalCode failed status=%s external_code=%s — aborting to prevent duplicate",
-            r.status_code, external_code,
+            r.status_code,
+            external_code,
         )
         r.raise_for_status()
     rows = r.json().get("rows", [])
@@ -441,15 +442,7 @@ def _find_ms_product_by_external_code(ms_token: str, external_code: str) -> str 
 
 
 def _detect_barcode_format(value: str) -> str:
-    """
-    Определяет формат штрихкода по длине и содержимому.
-    МойСклад поддерживает: ean13, ean8, code128, gtin.
-
-    EAN-13  — 13 цифр
-    EAN-8   — 8 цифр
-    GTIN    — 14 цифр (GS1)
-    Code128 — всё остальное (буквы, спецсимволы, другие длины)
-    """
+    value = str(value).strip()
     digits_only = value.isdigit()
     length = len(value)
 
@@ -502,8 +495,8 @@ def _create_ms_product(ms_token: str, product: dict) -> str:
 
     barcodes = product.get("barcodes", [])
     if barcodes:
-        # Передаём все штрихкоды, а не только первый
-        payload["barcodes"] = [{_detect_barcode_format(bc): bc} for bc in barcodes]
+        # Передаём все штрихкоды и определяем их формат
+        payload["barcodes"] = [{_detect_barcode_format(bc): str(bc).strip()} for bc in barcodes if str(bc).strip()]
 
     url = f"{MS_BASE}/entity/product"
     r = requests.post(url, headers=_ms_headers(ms_token), json=payload, timeout=20)
@@ -572,13 +565,16 @@ def initial_sync(tenant_id: str):
 
         try:
             # Защита от дублей: ищем товар по externalCode=evotor_id.
-            # Если поиск вернул HTTP-ошибку — бросаем исключение и останавливаемся,
-            # чтобы не создать дубль в плохой момент (401, 429, 5xx, сеть).
+            # Если товар уже есть в МойСклад — сохраняем только mapping, не создаём.
+            # Если поиск вернул HTTP-ошибку (401, 429, 5xx, сеть) — бросаем исключение.
+            # Это останавливает обработку текущего товара (записывается в errors/failed)
+            # и переходит к следующему, не создавая дубль при неопределённом состоянии.
             ms_id = _find_ms_product_by_external_code(tenant["moysklad_token"], evotor_id)
             if ms_id:
                 log.info(
                     "Found existing MS product by externalCode evotor_id=%s ms_id=%s — saving mapping only",
-                    evotor_id, ms_id,
+                    evotor_id,
+                    ms_id,
                 )
             else:
                 ms_id = _create_ms_product(tenant["moysklad_token"], product)
