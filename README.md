@@ -409,7 +409,6 @@ integration-bus/
 
 ```bash
 git clone <repo-url>
-cd integration-bus
 ```
 
 ### 2. Создать виртуальное окружение

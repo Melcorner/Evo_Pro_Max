@@ -11,7 +11,9 @@ from app.api.errors import router as errors_router
 from app.api.evotor import router as evotor_router
 from app.api.sync import router as sync_router
 from app.api.moysklad_webhooks import router as moysklad_webhooks_router
+from dotenv import load_dotenv
 
+load_dotenv()
 setup_logging()
 log = logging.getLogger("api")
 

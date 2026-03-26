@@ -1,13 +1,37 @@
 import json
+import os
 import time
 import uuid
 import logging
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 from app.db import get_connection
+
+# Секрет для верификации входящих webhook от Эвотор.
+# Должен совпадать с "Ваш токен" в настройках приложения на dev.evotor.ru.
+# Задаётся через переменную окружения EVOTOR_WEBHOOK_SECRET.
+EVOTOR_WEBHOOK_SECRET = os.getenv("EVOTOR_WEBHOOK_SECRET", "")
+
+
+def _verify_evotor_signature(request_headers: dict) -> bool:
+    """
+    Эвотор передаёт токен в заголовке Authorization: Bearer <token>.
+    Проверяем что токен совпадает с EVOTOR_WEBHOOK_SECRET.
+    Если секрет не настроен — пропускаем проверку (для локальной разработки).
+    """
+    if not EVOTOR_WEBHOOK_SECRET:
+        log.warning("EVOTOR_WEBHOOK_SECRET not set — skipping signature verification")
+        return True
+
+    auth_header = request_headers.get("authorization") or request_headers.get("Authorization") or ""
+    if not auth_header.startswith("Bearer "):
+        return False
+
+    token = auth_header.removeprefix("Bearer ").strip()
+    return token == EVOTOR_WEBHOOK_SECRET
 
 router = APIRouter(tags=["Evotor Webhooks"])
 log = logging.getLogger("api.webhooks")
@@ -213,7 +237,18 @@ def _normalize_receipt_created(body_dict: dict) -> tuple[str, str, dict] | tuple
 
 
 @router.post("/webhooks/evotor/{tenant_id}")
-async def evotor_webhook(tenant_id: str, raw_body: EvotorWebhook):
+async def evotor_webhook(tenant_id: str, raw_body: EvotorWebhook, request: Request):
+    # Верификация подписи — отклоняем запросы с неверным токеном
+    if not _verify_evotor_signature(dict(request.headers)):
+        log.warning(
+            "Evotor webhook signature verification failed tenant_id=%s "
+            "ip=%s user_agent=%s",
+            tenant_id,
+            request.client.host if request.client else "unknown",
+            request.headers.get("user-agent", ""),
+        )
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
     body_dict = raw_body.model_dump()
 
     log.debug(f"RAW EVOTOR BODY tenant_id={tenant_id} body={json.dumps(body_dict, ensure_ascii=False)}")  # PII: debug only
