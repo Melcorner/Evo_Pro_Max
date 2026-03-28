@@ -12,6 +12,7 @@
 
 import json
 import time
+import importlib
 import pytest
 from unittest.mock import MagicMock, patch, call
 
@@ -461,3 +462,25 @@ class TestInitialSyncDedup:
         # Должен упасть в errors, не создать товар
         assert result["failed"] == 1
         assert result["synced"] == 0
+
+# ===========================================================================
+# 7. Верификация webhook Эвотор
+# ===========================================================================
+
+class TestEvotorWebhookSignature:
+    def test_verify_returns_true_when_secret_missing(self, monkeypatch):
+        webhooks_module = importlib.import_module("app.api.webhooks")
+        monkeypatch.setattr(webhooks_module, "_get_evotor_webhook_secret", lambda: "")
+        assert webhooks_module._verify_evotor_signature({}) is True
+
+    def test_verify_returns_false_for_invalid_bearer(self, monkeypatch):
+        webhooks_module = importlib.import_module("app.api.webhooks")
+        monkeypatch.setattr(webhooks_module, "_get_evotor_webhook_secret", lambda: "secret-123")
+        headers = {"Authorization": "Bearer wrong-token"}
+        assert webhooks_module._verify_evotor_signature(headers) is False
+
+    def test_verify_returns_true_for_valid_bearer(self, monkeypatch):
+        webhooks_module = importlib.import_module("app.api.webhooks")
+        monkeypatch.setattr(webhooks_module, "_get_evotor_webhook_secret", lambda: "secret-123")
+        headers = {"Authorization": "Bearer secret-123"}
+        assert webhooks_module._verify_evotor_signature(headers) is True

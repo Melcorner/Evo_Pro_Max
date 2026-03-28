@@ -39,6 +39,7 @@ def _load_app():
 def client(temp_db_path: Path, db_getter, monkeypatch):
     sync_module = importlib.import_module("app.api.sync")
     webhooks_module = importlib.import_module("app.api.moysklad_webhooks")
+    evotor_webhooks_module = importlib.import_module("app.api.webhooks")
     db_module = importlib.import_module("app.db")
 
     FakeMappingStore = _make_fake_mapping_store(temp_db_path)
@@ -46,6 +47,7 @@ def client(temp_db_path: Path, db_getter, monkeypatch):
     monkeypatch.setattr(db_module, "get_connection", db_getter, raising=False)
     monkeypatch.setattr(sync_module, "get_connection", db_getter, raising=False)
     monkeypatch.setattr(webhooks_module, "get_connection", db_getter, raising=False)
+    monkeypatch.setattr(evotor_webhooks_module, "get_connection", db_getter, raising=False)
 
     monkeypatch.setattr(sync_module, "MappingStore", FakeMappingStore, raising=False)
     monkeypatch.setattr(webhooks_module, "MappingStore", FakeMappingStore, raising=False)
@@ -114,6 +116,35 @@ def _create_schema(db_path: Path) -> None:
             last_error TEXT,
             synced_items_count INTEGER DEFAULT 0,
             total_items_count INTEGER DEFAULT 0
+        )
+        """
+    )
+
+
+    cur.execute(
+        """
+        CREATE TABLE event_store (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_key TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            retries INTEGER DEFAULT 0,
+            next_retry_at INTEGER,
+            created_at INTEGER,
+            updated_at INTEGER
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE processed_events (
+            tenant_id TEXT NOT NULL,
+            event_key TEXT NOT NULL,
+            processed_at INTEGER,
+            UNIQUE(tenant_id, event_key)
         )
         """
     )
@@ -204,6 +235,7 @@ def db_getter(temp_db_path: Path) -> Callable[[], sqlite3.Connection]:
 def client(temp_db_path: Path, db_getter, monkeypatch):
     sync_module = importlib.import_module("app.api.sync")
     webhooks_module = importlib.import_module("app.api.moysklad_webhooks")
+    evotor_webhooks_module = importlib.import_module("app.api.webhooks")
     db_module = importlib.import_module("app.db")
 
     FakeMappingStore = _make_fake_mapping_store(temp_db_path)
@@ -212,6 +244,7 @@ def client(temp_db_path: Path, db_getter, monkeypatch):
     monkeypatch.setattr(db_module, "get_connection", db_getter, raising=False)
     monkeypatch.setattr(sync_module, "get_connection", db_getter, raising=False)
     monkeypatch.setattr(webhooks_module, "get_connection", db_getter, raising=False)
+    monkeypatch.setattr(evotor_webhooks_module, "get_connection", db_getter, raising=False)
 
     # MappingStore тоже переводим на SQLite из фикстуры.
     monkeypatch.setattr(sync_module, "MappingStore", FakeMappingStore, raising=False)
@@ -657,3 +690,87 @@ class TestSalePipelineE2E:
         event = self._get_event(temp_db_path, "evt-sale-3")
         assert event["status"] == "FAILED", f"Expected FAILED, got {event['status']}"
         assert event["next_retry_at"] is None
+
+# ============================================================================
+# E2E для верификации webhook Эвотор
+# ============================================================================
+
+class TestEvotorWebhookVerificationE2E:
+    def test_evotor_webhook_rejects_invalid_bearer(self, client: TestClient, temp_db_path: Path, monkeypatch):
+        seed_tenant(temp_db_path, tenant_id="tenant-verify")
+        evotor_webhooks_module = importlib.import_module("app.api.webhooks")
+        monkeypatch.setattr(evotor_webhooks_module, "_get_evotor_webhook_secret", lambda: "secret-123")
+
+        response = client.post(
+            "/webhooks/evotor/tenant-verify",
+            headers={"Authorization": "Bearer wrong-token"},
+            json={
+                "type": "SELL",
+                "id": "evt-verify-1",
+                "body": {
+                    "positions": [
+                        {
+                            "product_id": "p1",
+                            "quantity": 1,
+                            "price": 100.0
+                        }
+                    ]
+                }
+            },
+        )
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid webhook signature"
+
+    def test_evotor_webhook_accepts_valid_bearer(self, client: TestClient, temp_db_path: Path, monkeypatch):
+        seed_tenant(temp_db_path, tenant_id="tenant-verify-ok")
+        evotor_webhooks_module = importlib.import_module("app.api.webhooks")
+        monkeypatch.setattr(evotor_webhooks_module, "_get_evotor_webhook_secret", lambda: "secret-123")
+
+        response = client.post(
+            "/webhooks/evotor/tenant-verify-ok",
+            headers={"Authorization": "Bearer secret-123"},
+            json={
+                "type": "SELL",
+                "id": "evt-verify-2",
+                "body": {
+                    "positions": [
+                        {
+                            "product_id": "p1",
+                            "quantity": 1,
+                            "price": 100.0
+                        }
+                    ]
+                }
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "accepted"
+        assert "event_id" in data
+
+    def test_evotor_webhook_allows_requests_when_secret_missing(self, client: TestClient, temp_db_path: Path, monkeypatch):
+        seed_tenant(temp_db_path, tenant_id="tenant-verify-open")
+        evotor_webhooks_module = importlib.import_module("app.api.webhooks")
+        monkeypatch.setattr(evotor_webhooks_module, "_get_evotor_webhook_secret", lambda: "")
+
+        response = client.post(
+            "/webhooks/evotor/tenant-verify-open",
+            json={
+                "type": "SELL",
+                "id": "evt-verify-3",
+                "body": {
+                    "positions": [
+                        {
+                            "product_id": "p1",
+                            "quantity": 1,
+                            "price": 100.0
+                        }
+                    ]
+                }
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "accepted"

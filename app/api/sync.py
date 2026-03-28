@@ -1022,3 +1022,416 @@ def sync_stock_to_evotor(tenant_id: str, ms_product_id: str):
             total_items_count=existing["total_items_count"] if existing else 1,
         )
         raise HTTPException(status_code=502, detail=f"Failed to sync stock to Evotor: {err_text}")
+
+# ------------------------------------------------------------------------------
+# Fiscalization: MoySklad demand -> Evotor receipt
+# ------------------------------------------------------------------------------
+# Fiscalization: MoySklad demand -> fiscalization24.ru
+# ------------------------------------------------------------------------------
+
+# Маппинг НДС МойСклад → fiscalization24 (целые числа)
+# fiscalization24 допускает: -1 (без НДС), 0, 5, 7, 10, 18, 20
+VAT_MS_TO_FISCAL = {
+    (0, False): -1,   # без НДС
+    (0, True):   0,   # НДС 0%
+    (5, True):   5,
+    (7, True):   7,
+    (10, True):  10,
+    (18, True):  18,
+    (20, True):  20,
+}
+
+# Маппинг типов товаров Эвотор → fiscalization24
+EVOTOR_TYPE_TO_FISCAL = {
+    "NORMAL":        0,   # обычный
+    "DAIRY_MARKED":  12,  # молочная продукция
+    "ALCOHOL_MARKED": 1,  # маркированный алкоголь
+    "TOBACCO_MARKED": 4,  # маркированный табак
+    "SHOES_MARKED":  5,   # маркированная обувь
+    "MEDICINE_MARKED": 6, # маркированные лекарства
+    "WATER":         13,  # вода
+}
+
+
+def _fetch_demand_positions(ms_token: str, positions_raw) -> list:
+    """Читает позиции demand — inline список или meta-ссылка."""
+    if isinstance(positions_raw, dict) and "meta" in positions_raw:
+        pos_url = positions_raw["meta"]["href"]
+        r = requests.get(pos_url, headers=_ms_headers(ms_token), timeout=20)
+        if not r.ok:
+            log.error("Failed to fetch demand positions status=%s", r.status_code)
+            r.raise_for_status()
+        return r.json().get("rows", [])
+    return positions_raw if isinstance(positions_raw, list) else []
+
+
+def _map_demand_to_fiscal_check(
+    demand: dict,
+    tenant_id: str,
+    ms_token: str,
+    fiscal_client_uid: str,
+    fiscal_device_uid: str,
+    check_uid: str,
+) -> dict:
+    """
+    Маппит документ Отгрузка МойСклад → payload для fiscalization24.ru.
+
+    Формат fiscalization24 POST /check:
+    {
+        "UID": "<uid>",
+        "ClientUid": "<fiscal_client_uid>",
+        "DeviceUid": "<fiscal_device_uid>",
+        "Data": {
+            "products": [...],
+            "payCashSumma": <сумма>,
+            "type": 0,          # 0=продажа
+            "paymentType": 1,   # 1=наличные
+            ...
+        }
+    }
+    """
+    from app.stores.mapping_store import MappingStore
+
+    mapping_store = MappingStore()
+    positions_list = _fetch_demand_positions(ms_token, demand.get("positions", {}))
+
+    fiscal_products = []
+    for item in positions_list:
+        assortment = item.get("assortment", {})
+        meta = assortment.get("meta", {})
+        ms_product_id = meta.get("href", "").rstrip("/").split("/")[-1]
+
+        quantity = round(float(item.get("quantity", 1)), 2)
+        # МойСклад хранит цену в копейках → переводим в рубли
+        price_rubles = round(float(item.get("price", 0)) / 100, 2)
+
+        vat = item.get("vat", 0) or 0
+        vat_enabled = item.get("vatEnabled", False) or False
+        tax = VAT_MS_TO_FISCAL.get((vat, vat_enabled), -1)
+
+        # Тип товара — пытаемся взять из assortment.trackingType
+        tracking_type = assortment.get("trackingType") or "NORMAL"
+        product_type = EVOTOR_TYPE_TO_FISCAL.get(str(tracking_type).upper(), 0)
+
+        # Скидка на позицию
+        discount = round(float(item.get("discount", 0) or 0), 2)
+
+        fiscal_products.append({
+            "type": product_type,
+            "tax": tax,
+            "name": assortment.get("name", ""),
+            "price": price_rubles,
+            "discount": discount,
+            "quantity": quantity,
+        })
+
+    # Сумма в рублях
+    total_sum_rubles = round(float(demand.get("sum", 0)) / 100, 2)
+
+    return {
+        "UID": check_uid,
+        "ClientUid": fiscal_client_uid,
+        "DeviceUid": fiscal_device_uid,
+        "Data": {
+            "uid": check_uid,
+            "products": fiscal_products,
+            "payCashSumma": total_sum_rubles,
+            "payCardSumma": 0,
+            "discount": 0,
+            "type": 0,          # 0 = продажа
+            "paymentType": 1,   # 1 = наличные (можно расширить)
+        },
+    }
+
+
+def _save_fiscal_check(
+    tenant_id: str,
+    uid: str,
+    ms_demand_id: str,
+    fiscal_client_uid: str,
+    fiscal_device_uid: str,
+    status: int,
+    request_json: str,
+    response_json: str,
+) -> None:
+    now = _now()
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO fiscalization_checks (
+            uid, tenant_id, ms_demand_id,
+            fiscal_client_uid, fiscal_device_uid,
+            status, request_json, response_json,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(uid) DO UPDATE SET
+            status=excluded.status,
+            response_json=excluded.response_json,
+            updated_at=excluded.updated_at
+        """,
+        (uid, tenant_id, ms_demand_id,
+         fiscal_client_uid, fiscal_device_uid,
+         status, request_json, response_json,
+         now, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _update_fiscal_check_state(uid: str, state: dict) -> None:
+    now = _now()
+    import json as _json
+    conn = get_connection()
+    conn.execute(
+        """
+        UPDATE fiscalization_checks
+        SET status=?, description=?, error_code=?, error_message=?,
+            response_json=?, updated_at=?
+        WHERE uid=?
+        """,
+        (
+            state.get("State", 1),
+            state.get("Description"),
+            state.get("Error"),
+            state.get("ErrorMessage"),
+            _json.dumps(state),
+            now,
+            uid,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+@router.post("/sync/{tenant_id}/fiscalize/{ms_demand_id}")
+def fiscalize_demand(tenant_id: str, ms_demand_id: str):
+    """
+    Отправляет документ Отгрузка из МойСклад на фискализацию
+    через Универсальный фискализатор (fiscalization24.ru).
+
+    Алгоритм:
+    1. Читает demand из МойСклад
+    2. Маппит позиции → формат fiscalization24
+    3. Отправляет POST /api/fiscal/check
+    4. Сохраняет uid чека в fiscalization_checks
+    5. Возвращает uid и статус "queued"
+
+    Требования:
+    - Initial sync завершён
+    - Настроен fiscal_token, fiscal_client_uid, fiscal_device_uid
+      через PATCH /tenants/{tenant_id}/fiscal
+    """
+    import json as _json
+    import uuid as _uuid
+    from app.clients.fiscalization_client import FiscalizationClient
+
+    tenant = _load_tenant(tenant_id)
+
+    if not tenant.get("sync_completed_at"):
+        raise HTTPException(
+            status_code=409,
+            detail="Initial sync not completed.",
+        )
+    if not tenant.get("moysklad_token"):
+        raise HTTPException(status_code=400, detail="moysklad_token not configured")
+    if not tenant.get("fiscal_token"):
+        raise HTTPException(
+            status_code=400,
+            detail="fiscal_token not configured. Use PATCH /tenants/{tenant_id}/fiscal",
+        )
+
+    ms_token = tenant["moysklad_token"]
+    fiscal_client_uid = tenant["fiscal_client_uid"]
+    fiscal_device_uid = tenant["fiscal_device_uid"]
+    check_uid = str(_uuid.uuid4())
+
+    # 1. Читаем demand из МойСклад
+    try:
+        url = f"{MS_BASE}/entity/demand/{ms_demand_id}"
+        r = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
+        if not r.ok:
+            r.raise_for_status()
+        demand = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch demand: {e}")
+
+    # 2. Маппим в формат fiscalization24
+    try:
+        payload = _map_demand_to_fiscal_check(
+            demand=demand,
+            tenant_id=tenant_id,
+            ms_token=ms_token,
+            fiscal_client_uid=fiscal_client_uid,
+            fiscal_device_uid=fiscal_device_uid,
+            check_uid=check_uid,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Failed to map demand: {e}")
+
+    log.info(
+        "Fiscalizing demand tenant_id=%s ms_demand_id=%s uid=%s positions=%s",
+        tenant_id, ms_demand_id, check_uid, len(payload["Data"]["products"]),
+    )
+
+    # 3. Отправляем в fiscalization24
+    request_json = _json.dumps(payload)
+    try:
+        fiscal_client = FiscalizationClient(tenant["fiscal_token"])
+        result = fiscal_client.create_check(payload)
+        response_json = _json.dumps(result)
+        status = 1  # новый
+    except Exception as e:
+        response_json = str(e)
+        _save_fiscal_check(
+            tenant_id, check_uid, ms_demand_id,
+            fiscal_client_uid, fiscal_device_uid,
+            status=9, request_json=request_json, response_json=response_json,
+        )
+        raise HTTPException(status_code=502, detail=f"Failed to send check: {e}")
+
+    # 4. Сохраняем запись
+    _save_fiscal_check(
+        tenant_id, check_uid, ms_demand_id,
+        fiscal_client_uid, fiscal_device_uid,
+        status=1, request_json=request_json, response_json=response_json,
+    )
+
+    return {
+        "status": "queued",
+        "uid": check_uid,
+        "tenant_id": tenant_id,
+        "ms_demand_id": ms_demand_id,
+        "positions": len(payload["Data"]["products"]),
+        "sum": payload["Data"]["payCashSumma"],
+    }
+
+
+@router.get("/sync/{tenant_id}/fiscalization/{uid}")
+def get_fiscal_check_status(tenant_id: str, uid: str):
+    """
+    Получает актуальный статус чека из fiscalization24.ru
+    и обновляет запись в БД.
+
+    Статусы:
+    1  — новый
+    2  — отправлен на кассу
+    5  — принят кассой
+    9  — ошибка фискализации
+    10 — успешно фискализирован
+    """
+    from app.clients.fiscalization_client import FiscalizationClient
+
+    tenant = _load_tenant(tenant_id)
+
+    if not tenant.get("fiscal_token"):
+        raise HTTPException(status_code=400, detail="fiscal_token not configured")
+
+    # Проверяем что uid принадлежит этому tenant
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM fiscalization_checks WHERE uid=? AND tenant_id=?",
+        (uid, tenant_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Fiscal check not found")
+
+    try:
+        fiscal_client = FiscalizationClient(tenant["fiscal_token"])
+        state = fiscal_client.get_check_state(uid)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to get check state: {e}")
+
+    _update_fiscal_check_state(uid, state)
+
+    STATE_LABELS = {
+        1: "new", 2: "sent_to_device", 5: "accepted_by_device",
+        9: "error", 10: "fiscalized",
+    }
+    state_code = state.get("State", 1)
+
+    return {
+        "uid": uid,
+        "tenant_id": tenant_id,
+        "ms_demand_id": dict(row)["ms_demand_id"],
+        "state": state_code,
+        "state_label": STATE_LABELS.get(state_code, "unknown"),
+        "description": state.get("Description"),
+        "error_code": state.get("Error"),
+        "error_message": state.get("ErrorMessage"),
+    }
+
+
+@router.get("/sync/{tenant_id}/demands")
+def list_demands(tenant_id: str, limit: int = 20):
+    """
+    Возвращает последние отгрузки из МойСклад.
+    Удобно для получения ms_demand_id перед вызовом /fiscalize.
+    """
+    tenant = _load_tenant(tenant_id)
+
+    if not tenant.get("moysklad_token"):
+        raise HTTPException(status_code=400, detail="moysklad_token not configured")
+
+    ms_token = tenant["moysklad_token"]
+    url = f"{MS_BASE}/entity/demand"
+    params = {
+        "limit": min(limit, 100),
+        "order": "moment,desc",
+    }
+
+    try:
+        r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
+        if not r.ok:
+            log.error("Failed to fetch demands status=%s body=%s", r.status_code, r.text)
+            r.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch demands from MoySklad: {e}")
+
+    rows = r.json().get("rows", [])
+    items = []
+    for row in rows:
+        meta = row.get("meta", {})
+        agent = row.get("agent", {})
+        agent_name = agent.get("name") if isinstance(agent, dict) else None
+
+        items.append({
+            "ms_demand_id": row.get("id"),
+            "name": row.get("name"),
+            "moment": row.get("moment"),
+            "sum": row.get("sum"),
+            "agent": agent_name,
+            "url": meta.get("uuidHref"),
+        })
+
+    return {"count": len(items), "items": items}
+
+
+@router.get("/sync/{tenant_id}/fiscal/clients")
+def get_fiscal_clients(tenant_id: str):
+    """
+    Возвращает список клиентов (магазинов и касс) из fiscalization24.ru.
+    Используется для получения fiscal_client_uid и fiscal_device_uid.
+    """
+    from app.clients.fiscalization_client import FiscalizationClient
+
+    tenant = _load_tenant(tenant_id)
+
+    if not tenant.get("fiscal_token"):
+        raise HTTPException(
+            status_code=400,
+            detail="fiscal_token not configured. Use PATCH /tenants/{tenant_id}/fiscal",
+        )
+
+    try:
+        client = FiscalizationClient(tenant["fiscal_token"])
+        clients = client.get_clients()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to get clients: {e}")
+
+    return {"count": len(clients), "clients": clients}

@@ -3,6 +3,7 @@ import os
 import time
 import uuid
 import logging
+import hmac
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Request
@@ -10,31 +11,36 @@ from pydantic import BaseModel, ConfigDict
 
 from app.db import get_connection
 
-# Секрет для верификации входящих webhook от Эвотор.
-# Должен совпадать с "Ваш токен" в настройках приложения на dev.evotor.ru.
-# Задаётся через переменную окружения EVOTOR_WEBHOOK_SECRET.
-EVOTOR_WEBHOOK_SECRET = os.getenv("EVOTOR_WEBHOOK_SECRET", "")
+router = APIRouter(tags=["Evotor Webhooks"])
+log = logging.getLogger("api.webhooks")
+
+
+def _get_evotor_webhook_secret() -> str:
+    return os.getenv("EVOTOR_WEBHOOK_SECRET", "").strip()
 
 
 def _verify_evotor_signature(request_headers: dict) -> bool:
     """
     Эвотор передаёт токен в заголовке Authorization: Bearer <token>.
-    Проверяем что токен совпадает с EVOTOR_WEBHOOK_SECRET.
+    Проверяем, что токен совпадает с EVOTOR_WEBHOOK_SECRET.
     Если секрет не настроен — пропускаем проверку (для локальной разработки).
     """
-    if not EVOTOR_WEBHOOK_SECRET:
+    secret = _get_evotor_webhook_secret()
+    if not secret:
         log.warning("EVOTOR_WEBHOOK_SECRET not set — skipping signature verification")
         return True
 
-    auth_header = request_headers.get("authorization") or request_headers.get("Authorization") or ""
+    auth_header = (
+        request_headers.get("authorization")
+        or request_headers.get("Authorization")
+        or ""
+    ).strip()
+
     if not auth_header.startswith("Bearer "):
         return False
 
     token = auth_header.removeprefix("Bearer ").strip()
-    return token == EVOTOR_WEBHOOK_SECRET
-
-router = APIRouter(tags=["Evotor Webhooks"])
-log = logging.getLogger("api.webhooks")
+    return hmac.compare_digest(token, secret)
 
 
 class EvotorPosition(BaseModel):
