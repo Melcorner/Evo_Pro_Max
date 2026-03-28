@@ -244,7 +244,7 @@ EVOTOR_WEBHOOK_SECRET=your_secret
 Переменная окружения:
 
 ```env
-ADMIN_API_TOKEN=my_admin_token_123
+ADMIN_API_TOKEN=token
 ```
 
 Логика:
@@ -291,7 +291,7 @@ ADMIN_API_TOKEN=my_admin_token_123
 
 ```bash
 curl -X GET "http://127.0.0.1:8000/events" \
-  -H "Authorization: Bearer my_admin_token_123"
+  -H "Authorization: Bearer token"
 ```
 
 Если токен не передан:
@@ -524,7 +524,7 @@ pip install -r requirements.txt
 
 ```env
 EVOTOR_WEBHOOK_SECRET=your_secret
-ADMIN_API_TOKEN=my_admin_token_123
+ADMIN_API_TOKEN=token
 ```
 
 ### 4. Инициализировать БД
@@ -570,14 +570,14 @@ python -m app.workers.worker
 ### Получить demand
 
 ```bash
-curl -H "Authorization: Bearer my_admin_token_123" \
+curl -H "Authorization: Bearer token" \
   "http://127.0.0.1:8000/sync/{tenant_id}/demands"
 ```
 
 ### Получить клиентов и кассы fiscalization24
 
 ```bash
-curl -H "Authorization: Bearer my_admin_token_123" \
+curl -H "Authorization: Bearer token" \
   "http://127.0.0.1:8000/sync/{tenant_id}/fiscal/clients"
 ```
 
@@ -585,21 +585,21 @@ curl -H "Authorization: Bearer my_admin_token_123" \
 
 ```bash
 curl -X POST \
-  -H "Authorization: Bearer my_admin_token_123" \
+  -H "Authorization: Bearer token" \
   "http://127.0.0.1:8000/sync/{tenant_id}/fiscalize/{ms_demand_id}"
 ```
 
 ### Получить статус чека
 
 ```bash
-curl -H "Authorization: Bearer my_admin_token_123" \
+curl -H "Authorization: Bearer token" \
   "http://127.0.0.1:8000/sync/{tenant_id}/fiscalization/{uid}"
 ```
 
 ### Получить события
 
 ```bash
-curl -H "Authorization: Bearer my_admin_token_123" \
+curl -H "Authorization: Bearer token" \
   "http://127.0.0.1:8000/events"
 ```
 
