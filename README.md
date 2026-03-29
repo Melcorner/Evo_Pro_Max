@@ -216,6 +216,201 @@ GET /sync/{tenant_id}/fiscalization/{uid}
 
 ---
 
+### 5. Мониторинг integration bus
+
+Реализован базовый backend-дашборд мониторинга для контроля состояния integration bus.
+
+#### JSON snapshot
+
+`GET /monitoring/dashboard`
+
+Возвращает snapshot текущего состояния системы:
+
+- статус сервиса
+- состояние worker
+- количество событий по статусам:
+  - `NEW`
+  - `PROCESSING`
+  - `DONE`
+  - `RETRY`
+  - `FAILED`
+- последние проблемные события
+- последние ошибки
+- latency обработки успешных событий
+
+#### HTML dashboard
+
+`GET /dashboard`
+
+Простая server-rendered HTML-страница для мониторинга без отдельного frontend-приложения.
+
+На странице отображаются:
+
+- общий статус integration bus
+- время последнего обновления
+- время последнего heartbeat worker
+- карточки со статусами событий
+- статус worker
+- `avg / max / last latency`
+- таблица проблемных событий
+- таблица последних ошибок
+
+#### Problem Events
+
+В блоке **Problem Events** показываются проблемные события из `event_store` со статусами:
+
+- `RETRY`
+- `FAILED`
+
+Для каждого события отображаются:
+
+- `Event ID`
+- `tenant_id`
+- `event_type`
+- `event_key`
+- `status`
+- `retries`
+- `last_error_message`
+- `updated_at`
+
+#### Recent Errors
+
+В блоке **Recent Errors** показываются последние записи из таблицы `errors`.
+
+Для каждой ошибки отображаются:
+
+- `event_id`
+- `tenant_id`
+- `error_code`
+- `message`
+- `created_at`
+
+#### Latency
+
+Latency рассчитывается для успешных событий (`status = DONE`) по формуле:
+
+```text
+updated_at - created_at
+```
+
+То есть latency — это время прохождения события через integration bus от момента записи в очередь до завершения обработки.
+
+Для dashboard используются:
+
+- `avg_latency_sec` — средняя latency по последним успешным событиям
+- `max_latency_sec` — максимальная latency
+- `last_latency_sec` — latency последнего успешного события
+
+#### Проверенные сценарии
+
+Dashboard был проверен на следующих сценариях:
+
+- `worker stale`
+- восстановление worker (`stale → ok`)
+- появление `DONE`
+- появление `FAILED`
+- появление `RETRY`
+- отображение ошибок в `errors`
+
+---
+
+### 6. Alerts: Telegram + email
+
+Реализован отдельный контур автоматических уведомлений для критичных состояний integration bus.
+
+Поддерживаются два канала доставки:
+
+- Telegram
+- email
+
+#### Alert worker
+
+`python -m app.workers.alert_worker`
+
+Alert worker работает отдельно от основного `worker` и не вмешивается в обработку событий.
+
+Он периодически читает состояние системы напрямую из БД и отправляет уведомления в Telegram и/или на email в зависимости от конфигурации.
+
+#### Что проверяется
+
+Реализованы четыре типа сигналов:
+
+- `worker stale` или отсутствие heartbeat
+- наличие событий со статусом `FAILED`
+- наличие событий со статусом `RETRY`
+- наличие ошибок синхронизации остатков в `stock_sync_status`
+
+#### Alert flow
+
+Alert worker:
+
+1. читает heartbeat основного worker из `service_heartbeats`
+2. считает количество событий `FAILED` в `event_store`
+3. считает количество событий `RETRY` в `event_store`
+4. считает количество ошибок синхронизации остатков в `stock_sync_status`
+5. строит текущее состояние alert snapshot
+6. сравнивает его с предыдущим состоянием
+7. отправляет alert или recovery сообщение по доступным каналам доставки только при смене состояния
+
+#### Anti-spam
+
+Чтобы не отправлять одинаковые уведомления на каждой итерации цикла, используется простая защита от спама по состоянию.
+
+Alert отправляется только при переходе:
+
+- `ok → stale`
+- `FAILED = 0 → FAILED > 0`
+- `RETRY = 0 → RETRY > 0`
+- `stock sync errors = 0 → stock sync errors > 0`
+
+Recovery отправляется только при переходе:
+
+- `stale → ok`
+- `FAILED > 0 → FAILED = 0`
+- `RETRY > 0 → RETRY = 0`
+- `stock sync errors > 0 → stock sync errors = 0`
+
+На первом цикле alert worker только фиксирует baseline без отправки сообщений.
+
+#### Каналы доставки
+
+Поддерживаются два канала доставки уведомлений:
+
+- Telegram через Bot API
+- email через SMTP
+
+Оба канала могут работать одновременно. Если настроен только один канал, alert worker продолжает работать через него.
+
+#### Alert messages
+
+Поддерживаются следующие типы уведомлений:
+
+- alert по проблеме с heartbeat worker
+- recovery по восстановлению worker
+- alert по появлению `FAILED` событий
+- recovery по очистке `FAILED` событий
+- alert по появлению `RETRY` событий
+- recovery по очистке `RETRY` событий
+- alert по появлению ошибок синхронизации остатков
+- recovery по очистке ошибок синхронизации остатков
+
+#### Проверенные сценарии
+
+Alerts были проверены на следующих сценариях:
+
+- остановка основного worker и переход в `stale`
+- восстановление worker и возврат в `ok`
+- появление `FAILED` события
+- очистка `FAILED` событий и recovery
+- появление `RETRY` события
+- очистка `RETRY` событий и recovery
+- появление ошибки синхронизации остатков
+- очистка ошибки синхронизации остатков и recovery
+- доставка уведомлений одновременно в Telegram и на email
+- успешная отправка alert и recovery писем через SMTP
+
+---
+
 ## Безопасность
 
 ### Верификация webhook Эвотор
@@ -266,6 +461,8 @@ ADMIN_API_TOKEN=token
 - `/events`
 - `/errors`
 - `/mappings`
+- `/monitoring`
+- `/dashboard`
 
 #### Какие ручки публичные
 
@@ -333,6 +530,38 @@ Manual/API Trigger → sync.py → MoySklad API / Evotor API → mappings / stoc
 ```text
 Manual/API Trigger → sync.py → MoySklad demand → mapper → FiscalizationClient → fiscalization24
 ```
+
+### Мониторинг
+
+```text
+event_store / errors / service_heartbeats → monitoring.py → JSON snapshot / HTML dashboard
+```
+
+Контур мониторинга не вмешивается в обработку событий и не меняет pipeline integration bus.
+
+Он использует уже существующие данные:
+
+- `event_store`
+- `errors`
+- `service_heartbeats`
+
+Тем самым monitoring является лёгким слоем наблюдаемости поверх существующей архитектуры.
+
+### Alerts: Telegram + email
+
+```text
+service_heartbeats / event_store / stock_sync_status → alert_worker.py → alert_logic.py → telegram_client.py / email_client.py → Telegram Bot API / SMTP
+```
+
+Контур alerting работает отдельно от основного `worker` и не влияет на обработку продаж, товаров и остатков.
+
+Он использует уже существующие данные:
+
+- `service_heartbeats`
+- `event_store`
+- `stock_sync_status`
+
+Тем самым alerting является отдельным контуром наблюдаемости и оповещений поверх integration bus.
 
 ---
 
@@ -485,6 +714,13 @@ Manual/API Trigger → sync.py → MoySklad demand → mapper → FiscalizationC
 | POST | `/events/{id}/requeue` | Повторная постановка FAILED → NEW |
 | GET | `/errors` | Журнал ошибок |
 
+### Monitoring
+
+| Метод | URL | Описание |
+|---|---|---|
+| GET | `/monitoring/dashboard` | JSON snapshot состояния integration bus |
+| GET | `/dashboard` | HTML dashboard мониторинга |
+
 ---
 
 ## Требования
@@ -525,6 +761,21 @@ pip install -r requirements.txt
 ```env
 EVOTOR_WEBHOOK_SECRET=your_secret
 ADMIN_API_TOKEN=token
+
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+
+SMTP_HOST=smtp.mail.ru
+SMTP_PORT=465
+SMTP_USERNAME=your_mail_login@mail.ru
+SMTP_PASSWORD=your_external_app_password
+SMTP_FROM=your_mail_login@mail.ru
+ALERT_EMAIL_TO=recipient@example.com
+SMTP_USE_SSL=true
+SMTP_USE_TLS=false
+
+ALERT_POLL_INTERVAL_SEC=30
+WORKER_STALE_AFTER_SEC=30
 ```
 
 ### 4. Инициализировать БД
@@ -551,6 +802,64 @@ Swagger:
 ```bash
 python -m app.workers.worker
 ```
+
+### Alert worker
+
+```bash
+python -m app.workers.alert_worker
+```
+
+Alert worker использует настроенные каналы доставки:
+
+- Telegram, если заданы `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`
+- email, если заданы SMTP-параметры
+
+Если настроены оба канала, уведомления отправляются и в Telegram, и на email.
+
+### Dashboard
+
+JSON snapshot:
+
+```bash
+GET /monitoring/dashboard
+```
+
+HTML dashboard:
+
+```bash
+GET /dashboard
+```
+
+Оба endpoint'а защищены `ADMIN_API_TOKEN`.
+
+---
+
+## Demo scripts for dashboard
+
+Для локальной проверки dashboard и демонстрации monitoring-сценариев могут использоваться вспомогательные demo-скрипты, которые вставляют тестовые записи в `event_store` и `errors`.
+
+С их помощью можно проверить отображение:
+
+- `DONE`
+- `FAILED`
+- `RETRY`
+- `latency`
+- `Problem Events`
+- `Recent Errors`
+
+Эти скрипты не являются unit-тестами и используются только для ручной демонстрации dashboard.
+
+---
+
+## Demo scripts for alerts
+
+Для локальной проверки alerts могут использоваться вспомогательные demo-скрипты, которые создают и удаляют тестовые записи в `event_store` и `stock_sync_status`.
+
+С их помощью можно проверить:
+
+- alert и recovery по `FAILED` событиям
+- alert и recovery по `RETRY` событиям
+- alert и recovery по ошибкам синхронизации остатков
 
 ---
 
@@ -603,13 +912,19 @@ curl -H "Authorization: Bearer token" \
   "http://127.0.0.1:8000/events"
 ```
 
+### Получить dashboard snapshot
+
+```bash
+curl -H "Authorization: Bearer token" \
+  "http://127.0.0.1:8000/monitoring/dashboard"
+```
+
 ---
 
 ## Дальнейшее развитие
 
 - поддержка card/mixed payment в фискализации
 - Dockerization и деплой
-- дашборд мониторинга
+- расширение dashboard: фильтры, цветовая индикация, дополнительные метрики
 - дополнительные E2E-тесты
-- алерты по `FAILED` событиям и stale worker
 - верификация webhook МойСклад (эндпоинт сейчас публичный)

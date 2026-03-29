@@ -20,6 +20,7 @@ from app.api.errors import router as errors_router
 from app.api.evotor import router as evotor_router
 from app.api.sync import router as sync_router
 from app.api.moysklad_webhooks import router as moysklad_webhooks_router
+from app.api.monitoring import router as monitoring_router
 
 setup_logging()
 log = logging.getLogger("api")
@@ -36,6 +37,7 @@ openapi_tags = [
     {"name": "MoySklad Webhooks", "description": "Webhook'и от МойСклад"},
     {"name": "Events", "description": "Просмотр и повторная обработка событий"},
     {"name": "Errors", "description": "Журнал ошибок"},
+    {"name": "Monitoring", "description": "Дашборд и snapshot мониторинга integration bus"},
     {"name": "Evotor Service", "description": "Служебные callback'и и endpoint'ы Эвотор"},
     {"name": "Mappings", "description": "Маппинги Evotor ↔ MoySklad"},
 ]
@@ -53,6 +55,7 @@ app.include_router(tenants_router, dependencies=admin_dependencies)
 app.include_router(events_router, dependencies=admin_dependencies)
 app.include_router(mappings_router, dependencies=admin_dependencies)
 app.include_router(errors_router, dependencies=admin_dependencies)
+app.include_router(monitoring_router, dependencies=admin_dependencies)
 
 # Public / external callbacks
 app.include_router(webhooks_router)
