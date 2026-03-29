@@ -1,475 +1,661 @@
-# Интеграционная шина Эвотор ↔ МойСклад
+# Evotor ↔ MoySklad Integration Bus
 
-Интеграционная шина между кассой **Эвотор** и учётной системой **МойСклад**.
+Интеграционная шина между **Эвотор** и **МойСклад**.
 
-Проект объединяет три контура интеграции:
+Проект решает четыре основные задачи:
 
-1. **Продажи Эвотор → МойСклад** — event-driven pipeline через webhook, `event_store`, `worker`, `sale_handler`, `sale_mapper`.
-2. **Товары и остатки МойСклад → Эвотор** — API-driven синхронизация через `sync.py`.
-3. **Автоматическая синхронизация остатков** — webhook от МойСклад с обновлением остатков в Эвотор в реальном времени.
+1. Приём продаж из Эвотор и формирование документов в МойСклад
+2. Синхронизация товаров и остатков между МойСклад и Эвотор
+3. Автоматическое обновление остатков по webhook от МойСклад
+4. Фискализация документа **Отгрузка** из МойСклад через **Универсальный фискализатор**
 
 ---
 
 ## Что реализовано
 
-### Продажи Эвотор → МойСклад
+### 1. Продажи Эвотор → МойСклад
 
-- Приём webhook событий от Эвотор: старый формат (`SELL`) и новый формат (`ReceiptCreated`)
-- Нормализация webhook payload во внутренний sale-payload
-- Хранение событий в `event_store`
-- Идемпотентность через `processed_events`
-- Worker с optimistic locking и retry/backoff
-- Повторная обработка `FAILED` событий через `/events/{id}/requeue`
-- Маппинг `evotor_product_id -> ms_product_id` через `MappingStore`
-- Создание документа **Отгрузка** (`entity/demand`) в МойСклад по каждой продаже
-- Передача данных покупателя из чека Эвотор в МойСклад:
-  - поиск контрагента по email;
-  - поиск по телефону;
-  - создание нового контрагента при отсутствии;
-  - fallback на `default agent`, если buyer data отсутствует
-- Поддержка скидок в позициях чека:
-  - обработка скидки из реального webhook Эвотор (`discount`, `totalDiscount`);
-  - обработка enriched/test payload (`resultPrice`, `resultSum`, `positionDiscount`);
-  - запись скидки в позиции demand МойСклад отдельным полем `discount`
-- Поддержка налогов в продаже:
-  - маппинг налога из фактического чека Эвотор в `vat / vatEnabled` в МойСклад;
-  - источник истины по НДС продажи — **чек Эвотор**, а не карточка товара
+- приём webhook событий от Эвотор
+- поддержка форматов:
+  - `SELL`
+  - `ReceiptCreated`
+- нормализация payload продажи
+- сохранение события в `event_store`
+- обработка через `worker`
+- маппинг товаров `evotor_id -> ms_id`
+- создание документа **Отгрузка** в МойСклад
 
-### Товары и остатки МойСклад → Эвотор
+#### Покупатель
 
-- Первичная синхронизация товаров Эвотор → МойСклад через `POST /sync/{tenant_id}/initial`
-- Переключение tenant в рабочий режим МойСклад → Эвотор после initial sync (`sync_completed_at`)
-- Синхронизация одного товара МойСклад → Эвотор через `POST /sync/{tenant_id}/product/{ms_product_id}`
-- Корректная синхронизация НДС товара МойСклад → Эвотор:
-  - `vat / vatEnabled` из МойСклад маппится в `tax` Эвотор;
-  - поддержаны `NO_VAT`, `VAT_0`, `VAT_10`, `VAT_18`, `VAT_20`, `VAT_5`, `VAT_7`, `VAT_22`
-- Одиночная синхронизация остатка через `POST /sync/{tenant_id}/stock/{ms_product_id}`
-- Массовая синхронизация остатков через `POST /sync/{tenant_id}/stock/reconcile`
-- Статус синхронизации остатков через `GET /sync/{tenant_id}/stock/status`
-- Отдельное хранение статуса stock sync в таблице `stock_sync_status`
+Поддерживается перенос данных покупателя из webhook Эвотор:
 
-### Автоматическая синхронизация остатков
+- поиск контрагента по `email`
+- поиск по `phone`
+- создание нового контрагента
+- fallback имени: `email → phone → "Покупатель"`
+- fallback на `default agent`, если buyer data отсутствует или резолв завершился ошибкой
 
-- Webhook от МойСклад при создании/изменении документов
-- Поддержка документов:
-  - `demand`
-  - `supply`
-  - `inventory`
-  - `loss`
-  - `enter`
-- Автоматическое извлечение затронутых товаров из позиций документа
-- Обновление остатков в Эвотор в реальном времени без ручного вмешательства
+#### Скидки
 
-### Диагностика и обслуживание
+Поддерживаются:
 
-- REST API для просмотра событий, ошибок и mappings
-- Сохранение токена Эвотор при установке приложения
-- Логирование API-потока и worker-потока
-- Ручные и batch-операции по синхронизации
+- production-поля `discount`, `totalDiscount`
+- enriched/test-поля `resultPrice`, `resultSum`, `positionDiscount.discountPercent`
+
+Скидка передаётся в МойСклад отдельным процентным полем `discount`, а базовая цена позиции не искажается.
+
+#### НДС продажи
+
+НДС переносится из фактического чека Эвотор:
+
+- `taxPercent = 0` → `vat = 0`, `vatEnabled = false`
+- `taxPercent = 10` → `vat = 10`, `vatEnabled = true`
+- `taxPercent = 20` → `vat = 20`, `vatEnabled = true`
 
 ---
 
-## Архитектура
+### 2. Товары и остатки МойСклад ↔ Эвотор
 
-### 1. Продажи: event-driven pipeline
-
-```text
-Эвотор Webhook → Event Store → Worker → Dispatch → Sale Handler → Sale Mapper → МойСклад API
-```
-
-#### Ingest Layer
-
-`POST /webhooks/evotor/{tenant_id}` принимает события от Эвотор и сохраняет их в `event_store` со статусом `NEW`.
-
-Дополнительно endpoint принимает событие установки приложения и сохраняет токен облака Эвотор в `tenants`.
-
-#### Worker
-
-Фоновый процесс:
-
-1. Выбирает события `NEW` или `RETRY`
-2. Переводит событие в `PROCESSING`
-3. Вызывает `dispatch_event(row)`
-4. Переводит событие в `DONE`, `RETRY` или `FAILED`
-5. Записывает `processed_events`
-6. Записывает ошибку в `errors`, если обработка не удалась
-
-#### Dispatch Layer
-
-`event_dispatcher.py` маршрутизирует событие по `event_type`.
-
-| `event_type` | Поведение |
-|---|---|
-| `sale` | Передаётся в `handle_sale` |
-| `product` | Логируется и пропускается |
-| Остальное | Ошибка → `RETRY` / `FAILED` |
-
-#### Sale Handler / Mapper
-
-`sale_handler.py`:
-
-- загружает tenant-конфиг;
-- резолвит контрагента по данным покупателя из чека;
-- вызывает `sale_mapper.py`;
-- отправляет demand в МойСклад.
-
-`sale_mapper.py`:
-
-- валидирует payload продажи;
-- резолвит `evotor_id -> ms_id`;
-- формирует `assortment.meta.href`;
-- маппит скидки в позиции demand;
-- маппит НДС из фактического чека в `vat / vatEnabled`;
-- выставляет `syncId`.
-
-Результат — документ **Отгрузка** (`POST /entity/demand`) в МойСклад.
-
-### 2. Товары и остатки: API-driven sync
-
-```text
-Manual/API Trigger → sync.py → MoySklad API / Evotor API → mappings / stock_sync_status
-```
-
-Этот контур используется для справочников и остатков.
-
-#### Первичная синхронизация
+#### Initial sync
 
 `POST /sync/{tenant_id}/initial`
 
-Алгоритм:
+Первичная синхронизация:
 
-1. Получить все товары из Эвотор
-2. Создать товары в МойСклад
-3. Сохранить mappings `evotor_id ↔ ms_id`
-4. Проставить `sync_completed_at`
+- получает товары из Эвотор
+- создаёт товары в МойСклад
+- сохраняет `mappings`
+- переводит tenant в режим `МойСклад → Эвотор`
 
-После этого tenant переходит в рабочий режим **МойСклад → Эвотор**.
-
-#### Синхронизация товара
+#### Синхронизация одного товара
 
 `POST /sync/{tenant_id}/product/{ms_product_id}`
 
-Используется для создания или обновления карточки товара в Эвотор по данным из МойСклад.
+Если mapping уже есть:
 
-Поддерживается синхронизация:
+- обновляется карточка товара в Эвотор
 
-- названия;
-- цены;
-- себестоимости;
-- единицы измерения;
-- штрихкодов;
-- статьи;
-- описания;
-- НДС товара.
+Если mapping отсутствует:
 
-Важно: обычная синхронизация товара **не должна перезаписывать остаток**.
+- товар создаётся в Эвотор
+- затем сохраняется mapping
+
+Синхронизируются:
+
+- название
+- цена
+- себестоимость
+- единица измерения
+- штрихкоды
+- описание
+- артикул
+- НДС
+- тип маркируемого товара
 
 #### Синхронизация остатков
 
-Одиночная:
+- одиночная:
+  - `POST /sync/{tenant_id}/stock/{ms_product_id}`
+- массовая:
+  - `POST /sync/{tenant_id}/stock/reconcile`
+- статус:
+  - `GET /sync/{tenant_id}/stock/status`
 
-`POST /sync/{tenant_id}/stock/{ms_product_id}`
+Остатки читаются из МойСклад через `/report/stock/all`.
 
-- по `ms_product_id` ищется `evotor_id` в mappings;
-- остаток читается из МойСклад;
-- в Эвотор обновляется товар с новым `quantity`.
+Для статуса используется таблица `stock_sync_status`.
 
-Массовая:
+---
 
-`POST /sync/{tenant_id}/stock/reconcile`
+### 3. Автоматическая синхронизация остатков
 
-- берутся все product mappings tenant'а;
-- по каждому товару читается остаток из МойСклад;
-- остаток обновляется в Эвотор;
-- обновляется агрегированный статус в `stock_sync_status`.
+Webhook от МойСклад обновляет остатки в Эвотор при изменении документов:
 
-#### Статус синхронизации остатков
+- `demand`
+- `supply`
+- `inventory`
+- `loss`
+- `enter`
 
-`GET /sync/{tenant_id}/stock/status`
+Сценарий:
 
-Возвращает:
+1. МойСклад отправляет webhook
+2. система определяет затронутые товары
+3. получает актуальные остатки через `/report/stock/all`
+4. обновляет остатки в Эвотор
 
-- `status: configured | in_progress | ok | error`
-- `last_sync_time`
-- `last_error`
-- `count_synced_items`
-- `total_items_count`
+---
 
-### 3. Автоматическая синхронизация остатков: webhook МойСклад
+### 4. Фискализация документа МойСклад
 
-```text
-МойСклад создал документ → Webhook → moysklad_webhooks.py → позиции документа → Evotor API
+Реализован отдельный контур:
+
+**МойСклад demand → fiscalization24 → касса Эвотор**
+
+#### Новый клиент `fiscalization_client.py`
+
+Поддерживает:
+
+- `get_clients()` — список клиентов, магазинов и касс интегратора
+- `create_check(payload)` — отправка чека на фискализацию
+- `get_check_state(uid)` — получение статуса чека
+
+Авторизация:
+
+- `X-Datetime: <unix timestamp UTC>`
+- `Authorization: SHA1(X-Datetime + token)`
+
+#### Контур фискализации
+
+Сценарий:
+
+1. `GET /sync/{tenant_id}/demands`
+2. `POST /sync/{tenant_id}/fiscalize/{ms_demand_id}`
+3. `_map_demand_to_fiscal_check()`
+4. `FiscalizationClient.create_check()`
+5. сохранение в `fiscalization_checks`
+6. `GET /sync/{tenant_id}/fiscalization/{uid}`
+
+#### Конфигурация tenant
+
+Для фискализации нужны:
+
+- `fiscal_token`
+- `fiscal_client_uid`
+- `fiscal_device_uid`
+
+Настройка:
+
+```http
+PATCH /tenants/{tenant_id}/fiscal
 ```
 
-При изменении остатков в МойСклад (через отгрузку, приёмку, инвентаризацию, списание) остатки автоматически обновляются в Эвотор.
+#### Работа с demand
 
-#### Поддерживаемые типы документов
+Получить последние отгрузки:
 
-| Тип | Описание | Эффект на остатки |
-|---|---|---|
-| `demand` | Отгрузка | Уменьшение |
-| `supply` | Приёмка | Увеличение |
-| `inventory` | Инвентаризация | Корректировка |
-| `loss` | Списание | Уменьшение |
-| `enter` | Оприходование | Увеличение |
-
----
-
-## Форматы событий Эвотор
-
-Система поддерживает два формата webhook продаж от Эвотор.
-
-### Новый формат — `ReceiptCreated`
-
-Актуальный production-формат. Внешний тип события — `ReceiptCreated`, внутренний тип документа — `data.type = SELL`.
-
-Поддерживаются поля:
-
-- buyer data (`customer`)
-- скидки (`discount`, `totalDiscount`, а также enriched/test `resultPrice`, `resultSum`, `positionDiscount`)
-- налоги (`tax`, `taxPercent`, `totalTax`)
-
-### Старый формат — `SELL`
-
-Поддерживается для обратной совместимости.
-
-Оба формата нормализуются во внутренний sale-payload и проходят одинаковый pipeline.
-
----
-
-## Хранилища и таблицы
-
-Основные таблицы БД:
-
-- `tenants` — tenant'ы и конфигурация интеграции
-- `event_store` — очередь событий
-- `processed_events` — идемпотентность
-- `errors` — журнал ошибок
-- `mappings` — связи `evotor_id ↔ ms_id`
-- `stock_sync_status` — агрегированный статус последней синхронизации остатков
-
----
-
-## Жизненный цикл sale-события
-
-```text
-NEW → PROCESSING → DONE
-               ↘
-               RETRY (до 5 раз) → FAILED
-                                       ↓
-                                  requeue → NEW
+```http
+GET /sync/{tenant_id}/demands
 ```
 
+Получить клиентов и кассы fiscalization24:
+
+```http
+GET /sync/{tenant_id}/fiscal/clients
+```
+
+Отправить demand на фискализацию:
+
+```http
+POST /sync/{tenant_id}/fiscalize/{ms_demand_id}
+```
+
+Проверить статус чека:
+
+```http
+GET /sync/{tenant_id}/fiscalization/{uid}
+```
+
+#### Статусы чека
+
+- `1` — новый
+- `2` — отправлен на кассу
+- `5` — принят кассой
+- `9` — ошибка
+- `10` — успешно фискализирован
+
+#### Текущее ограничение MVP
+
+Текущая версия фискализации работает в упрощённом сценарии:
+
+- `paymentType = 1`
+- `payCashSumma = сумма чека`
+- `payCardSumma = 0`
+
+То есть чек сейчас уходит как сценарий **наличной оплаты**.
+
 ---
 
-## Обработка ошибок
+### 5. Мониторинг integration bus
 
-### Классификация
+Реализован базовый backend-дашборд мониторинга для контроля состояния integration bus.
 
-| Тип ошибки | Решение |
-|---|---|
-| Timeout / ConnectionError | RETRY |
-| HTTP 429 | RETRY |
-| HTTP 5xx | RETRY |
-| HTTP 400 / 401 / 403 / 422 | FAILED |
-| `SalePayloadError` | FAILED |
-| `MappingNotFoundError` | FAILED |
-| Остальные неизвестные | RETRY |
+#### JSON snapshot
 
-### Retry-политика
+`GET /monitoring/dashboard`
 
-- Exponential backoff: `1m → 2m → 4m → 8m → 16m`
-- Максимум 5 попыток, затем → `FAILED`
+Возвращает snapshot текущего состояния системы:
 
-### Таблица `errors`
+- статус сервиса
+- состояние worker
+- количество событий по статусам:
+  - `NEW`
+  - `PROCESSING`
+  - `DONE`
+  - `RETRY`
+  - `FAILED`
+- последние проблемные события
+- последние ошибки
+- latency обработки успешных событий
 
-При неуспешной обработке sale-события сохраняются:
+#### HTML dashboard
+
+`GET /dashboard`
+
+Простая server-rendered HTML-страница для мониторинга без отдельного frontend-приложения.
+
+На странице отображаются:
+
+- общий статус integration bus
+- время последнего обновления
+- время последнего heartbeat worker
+- карточки со статусами событий
+- статус worker
+- `avg / max / last latency`
+- таблица проблемных событий
+- таблица последних ошибок
+
+#### Problem Events
+
+В блоке **Problem Events** показываются проблемные события из `event_store` со статусами:
+
+- `RETRY`
+- `FAILED`
+
+Для каждого события отображаются:
+
+- `Event ID`
+- `tenant_id`
+- `event_type`
+- `event_key`
+- `status`
+- `retries`
+- `last_error_message`
+- `updated_at`
+
+#### Recent Errors
+
+В блоке **Recent Errors** показываются последние записи из таблицы `errors`.
+
+Для каждой ошибки отображаются:
 
 - `event_id`
 - `tenant_id`
 - `error_code`
 - `message`
-- `payload_snapshot`
-- диагностическая информация об ошибке
+- `created_at`
 
----
+#### Latency
 
-## Структура проекта
+Latency рассчитывается для успешных событий (`status = DONE`) по формуле:
 
 ```text
-integration-bus/
-├── app/
-│   ├── api/
-│   │   ├── errors.py               — журнал ошибок
-│   │   ├── events.py               — просмотр и requeue событий
-│   │   ├── evotor.py               — token callback и служебные endpoint'ы Эвотор
-│   │   ├── mappings.py             — CRUD /mappings
-│   │   ├── moysklad_webhooks.py    — POST /webhooks/moysklad/{tenant_id}
-│   │   ├── sync.py                 — initial sync, product sync, stock sync, stock status
-│   │   ├── tenants.py              — tenants и конфигурация MoySklad/Evotor
-│   │   └── webhooks.py             — POST /webhooks/evotor/{tenant_id}
-│   ├── clients/
-│   │   ├── evotor_client.py        — клиент API Эвотор
-│   │   └── moysklad_client.py      — клиент API МойСклад
-│   ├── handlers/
-│   │   └── sale_handler.py
-│   ├── mappers/
-│   │   └── sale_mapper.py
-│   ├── scripts/
-│   │   └── init_db.py
-│   ├── services/
-│   │   ├── counterparty_resolver.py — резолвинг контрагента
-│   │   ├── error_logic.py
-│   │   └── event_dispatcher.py
-│   ├── stores/
-│   │   ├── error_store.py
-│   │   └── mapping_store.py
-│   ├── workers/
-│   │   └── worker.py
-│   ├── db.py
-│   ├── logger.py
-│   └── main.py
-├── data/
-│   └── app.db
-├── docs/
-│   └── PAYLOAD_CONTRACTS.md
-├── tests/
-│   ├── e2e_test.py
-│   └── test_sale2.py
-├── README.md
-└── requirements.txt
+updated_at - created_at
 ```
+
+То есть latency — это время прохождения события через integration bus от момента записи в очередь до завершения обработки.
+
+Для dashboard используются:
+
+- `avg_latency_sec` — средняя latency по последним успешным событиям
+- `max_latency_sec` — максимальная latency
+- `last_latency_sec` — latency последнего успешного события
+
+#### Проверенные сценарии
+
+Dashboard был проверен на следующих сценариях:
+
+- `worker stale`
+- восстановление worker (`stale → ok`)
+- появление `DONE`
+- появление `FAILED`
+- появление `RETRY`
+- отображение ошибок в `errors`
 
 ---
 
-## Требования
+### 6. Alerts: Telegram + email
 
-- Python 3.11+
-- macOS / Linux / Windows
-- Доступ к API Эвотор
-- Доступ к API МойСклад
+Реализован отдельный контур автоматических уведомлений для критичных состояний integration bus.
 
----
+Поддерживаются два канала доставки:
 
-## Установка и запуск
+- Telegram
+- email
 
-### 1. Клонировать проект
+#### Alert worker
 
-```bash
-git clone <repo-url>
-cd integration-bus
-```
+`python -m app.workers.alert_worker`
 
-### 2. Создать виртуальное окружение
+Alert worker работает отдельно от основного `worker` и не вмешивается в обработку событий.
 
-macOS / Linux:
+Он периодически читает состояние системы напрямую из БД и отправляет уведомления в Telegram и/или на email в зависимости от конфигурации.
 
-```bash
-python3.11 -m venv venv
-source venv/bin/activate
-```
+#### Что проверяется
 
-Windows:
+Реализованы четыре типа сигналов:
 
-```powershell
-py -3.11 -m venv venv
-venv\Scripts\activate
-```
+- `worker stale` или отсутствие heartbeat
+- наличие событий со статусом `FAILED`
+- наличие событий со статусом `RETRY`
+- наличие ошибок синхронизации остатков в `stock_sync_status`
 
-### 3. Установить зависимости
+#### Alert flow
 
-```bash
-pip install -r requirements.txt
-```
+Alert worker:
 
-### 4. Инициализировать базу данных
+1. читает heartbeat основного worker из `service_heartbeats`
+2. считает количество событий `FAILED` в `event_store`
+3. считает количество событий `RETRY` в `event_store`
+4. считает количество ошибок синхронизации остатков в `stock_sync_status`
+5. строит текущее состояние alert snapshot
+6. сравнивает его с предыдущим состоянием
+7. отправляет alert или recovery сообщение по доступным каналам доставки только при смене состояния
 
-```bash
-python -m app.scripts.init_db
-```
+#### Anti-spam
 
-`init_db` идемпотентен и безопасен для повторного запуска.
+Чтобы не отправлять одинаковые уведомления на каждой итерации цикла, используется простая защита от спама по состоянию.
 
----
+Alert отправляется только при переходе:
 
-## Запуск
+- `ok → stale`
+- `FAILED = 0 → FAILED > 0`
+- `RETRY = 0 → RETRY > 0`
+- `stock sync errors = 0 → stock sync errors > 0`
 
-### Терминал 1 — API сервер
+Recovery отправляется только при переходе:
 
-```bash
-uvicorn app.main:app --reload
-```
+- `stale → ok`
+- `FAILED > 0 → FAILED = 0`
+- `RETRY > 0 → RETRY = 0`
+- `stock sync errors > 0 → stock sync errors = 0`
 
-Swagger: `http://127.0.0.1:8000/docs`
+На первом цикле alert worker только фиксирует baseline без отправки сообщений.
 
-### Терминал 2 — Worker
+#### Каналы доставки
 
-```bash
-python -m app.workers.worker
-```
+Поддерживаются два канала доставки уведомлений:
 
----
+- Telegram через Bot API
+- email через SMTP
 
-## Базовый сценарий настройки
+Оба канала могут работать одновременно. Если настроен только один канал, alert worker продолжает работать через него.
 
-1. Создать tenant:
+#### Alert messages
 
-```http
-POST /tenants
-```
+Поддерживаются следующие типы уведомлений:
 
-2. Настроить реквизиты МойСклад и store Эвотор:
+- alert по проблеме с heartbeat worker
+- recovery по восстановлению worker
+- alert по появлению `FAILED` событий
+- recovery по очистке `FAILED` событий
+- alert по появлению `RETRY` событий
+- recovery по очистке `RETRY` событий
+- alert по появлению ошибок синхронизации остатков
+- recovery по очистке ошибок синхронизации остатков
 
-```http
-PATCH /tenants/{tenant_id}/moysklad
-```
+#### Проверенные сценарии
 
-3. Подключить callback токена Эвотор (настраивается в `dev.evotor.ru`):
+Alerts были проверены на следующих сценариях:
 
-```http
-POST /api/v1/user/token
-```
-
-4. Выполнить первичную синхронизацию:
-
-```http
-POST /sync/{tenant_id}/initial
-```
-
-5. Зарегистрировать webhooks в МойСклад для документов `demand`, `supply`, `inventory`, `loss`, `enter`.
-
-6. Проверить общий статус:
-
-```http
-GET /sync/{tenant_id}/status
-```
+- остановка основного worker и переход в `stale`
+- восстановление worker и возврат в `ok`
+- появление `FAILED` события
+- очистка `FAILED` событий и recovery
+- появление `RETRY` события
+- очистка `RETRY` событий и recovery
+- появление ошибки синхронизации остатков
+- очистка ошибки синхронизации остатков и recovery
+- доставка уведомлений одновременно в Telegram и на email
+- успешная отправка alert и recovery писем через SMTP
 
 ---
 
-## Примеры запросов
+## Безопасность
 
-### Одиночная синхронизация товара
+### Верификация webhook Эвотор
 
-```bash
-curl -X POST "http://127.0.0.1:8000/sync/{tenant_id}/product/{ms_product_id}"
+Для webhook от Эвотор реализована проверка заголовка:
+
+```http
+Authorization: Bearer <token>
 ```
 
-### Одиночная синхронизация остатка
+Секрет берётся из переменной окружения:
 
-```bash
-curl -X POST "http://127.0.0.1:8000/sync/{tenant_id}/stock/{ms_product_id}"
+```env
+EVOTOR_WEBHOOK_SECRET=your_secret
 ```
 
-### Массовая синхронизация остатков
+Логика:
 
-```bash
-curl -X POST "http://127.0.0.1:8000/sync/{tenant_id}/stock/reconcile"
+- если `EVOTOR_WEBHOOK_SECRET` задан, webhook без корректного Bearer-токена получает `401`
+- если `EVOTOR_WEBHOOK_SECRET` не задан, проверка пропускается для локальной разработки
+
+### Admin API auth
+
+Для внутренних и административных endpoint'ов реализована **Bearer-auth защита** через `ADMIN_API_TOKEN`.
+
+Переменная окружения:
+
+```env
+ADMIN_API_TOKEN=token
 ```
 
-### Статус синхронизации остатков
+Логика:
+
+- если `ADMIN_API_TOKEN` задан, защищённые ручки требуют заголовок:
+
+  ```http
+  Authorization: Bearer <ADMIN_API_TOKEN>
+  ```
+
+- если токен не задан, защита отключается — это удобно для локальной разработки
+
+#### Какие ручки защищены
+
+Под Bearer-auth находятся:
+
+- `/tenants`
+- `/sync`
+- `/events`
+- `/errors`
+- `/mappings`
+- `/monitoring`
+- `/dashboard`
+
+#### Какие ручки публичные
+
+Без admin auth остаются:
+
+- `/health`
+- `/webhooks/evotor/{tenant_id}`
+- `/webhooks/moysklad/{tenant_id}`
+- `/api/v1/user/token`
+
+#### Использование в Swagger
+
+После включения admin auth:
+
+1. открой `/docs`
+2. нажми кнопку **Authorize**
+3. введи токен
+4. Swagger начнёт автоматически подставлять `Authorization` в защищённые запросы
+
+#### Использование через curl
+
+Пример:
 
 ```bash
-curl "http://127.0.0.1:8000/sync/{tenant_id}/stock/status"
+curl -X GET "http://127.0.0.1:8000/events" \
+  -H "Authorization: Bearer token"
+```
+
+Если токен не передан:
+
+- `401 Missing Authorization header`
+
+Если схема неверная:
+
+- `401 Invalid Authorization scheme`
+
+Если токен неверный:
+
+- `401 Invalid admin token`
+
+---
+
+## Архитектура
+
+### Продажи: event-driven pipeline
+
+```text
+Эвотор Webhook → Event Store → Worker → Dispatch → Sale Handler → Sale Mapper → МойСклад API
+```
+
+### Товары и остатки: API-driven sync
+
+```text
+Manual/API Trigger → sync.py → MoySklad API / Evotor API → mappings / stock_sync_status
+```
+
+### Автоматическая синхронизация остатков
+
+```text
+МойСклад документ → Webhook → moysklad_webhooks.py → позиции документа → /report/stock/all → Evotor API
+```
+
+### Фискализация документа
+
+```text
+Manual/API Trigger → sync.py → MoySklad demand → mapper → FiscalizationClient → fiscalization24
+```
+
+### Мониторинг
+
+```text
+event_store / errors / service_heartbeats → monitoring.py → JSON snapshot / HTML dashboard
+```
+
+Контур мониторинга не вмешивается в обработку событий и не меняет pipeline integration bus.
+
+Он использует уже существующие данные:
+
+- `event_store`
+- `errors`
+- `service_heartbeats`
+
+Тем самым monitoring является лёгким слоем наблюдаемости поверх существующей архитектуры.
+
+### Alerts: Telegram + email
+
+```text
+service_heartbeats / event_store / stock_sync_status → alert_worker.py → alert_logic.py → telegram_client.py / email_client.py → Telegram Bot API / SMTP
+```
+
+Контур alerting работает отдельно от основного `worker` и не влияет на обработку продаж, товаров и остатков.
+
+Он использует уже существующие данные:
+
+- `service_heartbeats`
+- `event_store`
+- `stock_sync_status`
+
+Тем самым alerting является отдельным контуром наблюдаемости и оповещений поверх integration bus.
+
+---
+
+## Основные таблицы
+
+| Таблица | Назначение |
+|---|---|
+| `tenants` | Tenant'ы и конфигурация интеграции |
+| `event_store` | Очередь входящих событий |
+| `processed_events` | Идемпотентность обработки |
+| `errors` | Журнал ошибок |
+| `mappings` | Связи `evotor_id ↔ ms_id` |
+| `stock_sync_status` | Статус последней синхронизации остатков |
+| `fiscalization_checks` | Отправленные чеки и их статусы |
+| `service_heartbeats` | Heartbeat фоновых сервисов |
+
+---
+
+## Health-check
+
+`GET /health` — публичный endpoint, не требует авторизации.
+
+Показывает общее состояние сервиса:
+
+- статус API и БД
+- heartbeat worker (stale если не отвечал более `WORKER_STALE_AFTER_SEC` секунд)
+- количество событий по статусам: `NEW / RETRY / FAILED / PROCESSING`
+- время последней успешной обработки события
+- количество тенантов с ошибкой синхронизации остатков
+
+Верхний статус:
+
+- `ok` — всё в норме
+- `degraded` — worker stale, есть FAILED события или ошибки stock sync
+- `error` — не удалось подключиться к БД
+
+Пример ответа (`status: ok`):
+
+```json
+{
+  "status": "ok",
+  "service": "integration-bus",
+  "timestamp": 1712000000,
+  "checks": {
+    "api": { "status": "ok" },
+    "db": { "status": "ok" },
+    "worker": {
+      "status": "ok",
+      "last_seen_at": 1712000000,
+      "stale_after_sec": 30
+    }
+  },
+  "events": {
+    "new": 0,
+    "retry": 0,
+    "failed": 0,
+    "processing": 0,
+    "last_processed_at": 1711999990
+  },
+  "stock_sync": {
+    "tenants_with_error": 0,
+    "last_sync_at": 1711999800
+  }
+}
+```
+
+Пример ответа (`status: degraded`):
+
+```json
+{
+  "status": "degraded",
+  "service": "integration-bus",
+  "timestamp": 1712000000,
+  "checks": {
+    "api": { "status": "ok" },
+    "db": { "status": "ok" },
+    "worker": {
+      "status": "stale",
+      "last_seen_at": 1711999900,
+      "stale_after_sec": 30
+    }
+  },
+  "events": {
+    "new": 2,
+    "retry": 1,
+    "failed": 3,
+    "processing": 0,
+    "last_processed_at": 1711999850
+  },
+  "stock_sync": {
+    "tenants_with_error": 1,
+    "last_sync_at": 1711999800
+  }
+}
 ```
 
 ---
@@ -480,7 +666,7 @@ curl "http://127.0.0.1:8000/sync/{tenant_id}/stock/status"
 
 | Метод | URL | Описание |
 |---|---|---|
-| GET | `/health` | Проверка сервера |
+| GET | `/health` | Проверка сервера и фоновых сервисов |
 
 ### Tenants
 
@@ -489,6 +675,7 @@ curl "http://127.0.0.1:8000/sync/{tenant_id}/stock/status"
 | POST | `/tenants` | Создать tenant |
 | GET | `/tenants` | Список tenants |
 | PATCH | `/tenants/{tenant_id}/moysklad` | Сохранить конфигурацию tenant |
+| PATCH | `/tenants/{tenant_id}/fiscal` | Сохранить конфигурацию фискализации |
 | POST | `/tenants/{tenant_id}/complete-sync` | Отметить initial sync как завершённую |
 | DELETE | `/tenants/{tenant_id}/complete-sync` | Сбросить initial sync |
 
@@ -506,18 +693,15 @@ curl "http://127.0.0.1:8000/sync/{tenant_id}/stock/status"
 |---|---|---|
 | POST | `/sync/{tenant_id}/initial` | Первичная синхронизация товаров Эвотор → МойСклад |
 | GET | `/sync/{tenant_id}/status` | Общий статус синхронизации tenant |
+| GET | `/sync/{tenant_id}/demands` | Последние документы demand из МойСклад |
+| GET | `/sync/{tenant_id}/fiscal/clients` | Список клиентов и касс фискализатора |
+| POST | `/sync/{tenant_id}/fiscalize/{ms_demand_id}` | Отправить demand на фискализацию |
+| GET | `/sync/{tenant_id}/fiscalization/{uid}` | Статус чека фискализации |
 | POST | `/sync/{tenant_id}/product/{ms_product_id}` | Синхронизация одного товара МойСклад → Эвотор |
+| GET | `/sync/{tenant_id}/moysklad/products` | Поиск товаров МойСклад |
 | POST | `/sync/{tenant_id}/stock/{ms_product_id}` | Синхронизация остатка одного товара |
 | POST | `/sync/{tenant_id}/stock/reconcile` | Batch-синхронизация остатков |
 | GET | `/sync/{tenant_id}/stock/status` | Статус последней синхронизации остатков |
-
-### Mappings
-
-| Метод | URL | Описание |
-|---|---|---|
-| GET | `/mappings` | Список mappings |
-| POST | `/mappings/` | Создать или обновить mapping |
-| DELETE | `/mappings/` | Удалить mapping |
 
 ### Диагностика
 
@@ -530,53 +714,217 @@ curl "http://127.0.0.1:8000/sync/{tenant_id}/stock/status"
 | POST | `/events/{id}/requeue` | Повторная постановка FAILED → NEW |
 | GET | `/errors` | Журнал ошибок |
 
+### Monitoring
+
+| Метод | URL | Описание |
+|---|---|---|
+| GET | `/monitoring/dashboard` | JSON snapshot состояния integration bus |
+| GET | `/dashboard` | HTML dashboard мониторинга |
+
 ---
 
-## Логирование
+## Требования
 
-Формат:
+- Python 3.11+
+- Доступ к API Эвотор
+- Доступ к API МойСклад
+- Доступ к API Универсального фискализатора
 
-```text
-timestamp | level | logger | message
+---
+
+## Установка
+
+### 1. Создать виртуальное окружение
+
+macOS / Linux:
+
+```bash
+python3.11 -m venv venv
+source venv/bin/activate
 ```
 
-Основные логгеры:
+Windows:
 
-- `api`
-- `api.sync`
-- `api.webhooks`
-- `api.webhooks.moysklad`
-- `worker`
-- `dispatcher`
-- `sale_handler`
-- `sale_mapper`
-- `moysklad`
-- `evotor_client`
+```powershell
+py -3.11 -m venv venv
+venv\Scripts\activate
+```
+
+### 2. Установить зависимости
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Настроить `.env`
+
+```env
+EVOTOR_WEBHOOK_SECRET=your_secret
+ADMIN_API_TOKEN=token
+
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+
+SMTP_HOST=smtp.mail.ru
+SMTP_PORT=465
+SMTP_USERNAME=your_mail_login@mail.ru
+SMTP_PASSWORD=your_external_app_password
+SMTP_FROM=your_mail_login@mail.ru
+ALERT_EMAIL_TO=recipient@example.com
+SMTP_USE_SSL=true
+SMTP_USE_TLS=false
+
+ALERT_POLL_INTERVAL_SEC=30
+WORKER_STALE_AFTER_SEC=30
+```
+
+### 4. Инициализировать БД
+
+```bash
+python -m app.scripts.init_db
+```
 
 ---
 
-## Что важно помнить
+## Запуск
 
-- Продажи обрабатываются через `event_store + worker`.
-- Остатки обновляются автоматически через webhook МойСклад → `moysklad_webhooks.py`.
-- Ручные вызовы `/sync/...` обрабатываются напрямую в API-процессе — лог появляется в `uvicorn`, не в `worker`.
-- Для `/sync/{tenant_id}/stock/{ms_product_id}` нужен существующий mapping товара.
-- Для `/sync/{tenant_id}/stock/reconcile` используются все product mappings tenant'а.
-- Для sale-pipeline источник истины по скидкам и НДС — **сам чек Эвотор**.
-- Для карточки товара источник истины по НДС — **МойСклад**.
-- Webhooks МойСклад настраиваются через API, не через UI.
+### API сервер
+
+```bash
+uvicorn app.main:app --reload
+```
+
+Swagger:
+`http://127.0.0.1:8000/docs`
+
+### Worker
+
+```bash
+python -m app.workers.worker
+```
+
+### Alert worker
+
+```bash
+python -m app.workers.alert_worker
+```
+
+Alert worker использует настроенные каналы доставки:
+
+- Telegram, если заданы `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`
+- email, если заданы SMTP-параметры
+
+Если настроены оба канала, уведомления отправляются и в Telegram, и на email.
+
+### Dashboard
+
+JSON snapshot:
+
+```bash
+GET /monitoring/dashboard
+```
+
+HTML dashboard:
+
+```bash
+GET /dashboard
+```
+
+Оба endpoint'а защищены `ADMIN_API_TOKEN`.
+
+---
+
+## Demo scripts for dashboard
+
+Для локальной проверки dashboard и демонстрации monitoring-сценариев могут использоваться вспомогательные demo-скрипты, которые вставляют тестовые записи в `event_store` и `errors`.
+
+С их помощью можно проверить отображение:
+
+- `DONE`
+- `FAILED`
+- `RETRY`
+- `latency`
+- `Problem Events`
+- `Recent Errors`
+
+Эти скрипты не являются unit-тестами и используются только для ручной демонстрации dashboard.
+
+---
+
+## Demo scripts for alerts
+
+Для локальной проверки alerts могут использоваться вспомогательные demo-скрипты, которые создают и удаляют тестовые записи в `event_store` и `stock_sync_status`.
+
+С их помощью можно проверить:
+
+- alert и recovery по `FAILED` событиям
+- alert и recovery по `RETRY` событиям
+- alert и recovery по ошибкам синхронизации остатков
+
+---
+
+## Базовый сценарий настройки
+
+1. Создать tenant
+2. Настроить МойСклад и Эвотор
+3. Сохранить токен Эвотор через `/api/v1/user/token`
+4. Выполнить `POST /sync/{tenant_id}/initial`
+5. Настроить реквизиты фискализации через `PATCH /tenants/{tenant_id}/fiscal`
+6. Проверить статус через `GET /sync/{tenant_id}/status`
+
+---
+
+## Примеры curl
+
+### Получить demand
+
+```bash
+curl -H "Authorization: Bearer token" \
+  "http://127.0.0.1:8000/sync/{tenant_id}/demands"
+```
+
+### Получить клиентов и кассы fiscalization24
+
+```bash
+curl -H "Authorization: Bearer token" \
+  "http://127.0.0.1:8000/sync/{tenant_id}/fiscal/clients"
+```
+
+### Отправить demand на фискализацию
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer token" \
+  "http://127.0.0.1:8000/sync/{tenant_id}/fiscalize/{ms_demand_id}"
+```
+
+### Получить статус чека
+
+```bash
+curl -H "Authorization: Bearer token" \
+  "http://127.0.0.1:8000/sync/{tenant_id}/fiscalization/{uid}"
+```
+
+### Получить события
+
+```bash
+curl -H "Authorization: Bearer token" \
+  "http://127.0.0.1:8000/events"
+```
+
+### Получить dashboard snapshot
+
+```bash
+curl -H "Authorization: Bearer token" \
+  "http://127.0.0.1:8000/monitoring/dashboard"
+```
 
 ---
 
 ## Дальнейшее развитие
 
-- Аутентификация на admin API
-- Dockerization + деплой на VPS
-- Расширенный `/health` — статус воркера, БД, последнее событие
-- Алерты на `FAILED` события в Telegram / email
-- Поддержка покупателей и скидок для дополнительных форматов чеков
-- Расширение маппинга налогов для нестандартных ставок
-- Фискализация: документ из МойСклад → Эвотор
-- Маркировка товара
-- Мониторинг / dashboard
-- Валидация подписи webhook Эвотор
+- поддержка card/mixed payment в фискализации
+- Dockerization и деплой
+- расширение dashboard: фильтры, цветовая индикация, дополнительные метрики
+- дополнительные E2E-тесты
+- верификация webhook МойСклад (эндпоинт сейчас публичный)

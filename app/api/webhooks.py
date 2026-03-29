@@ -1,46 +1,73 @@
 import json
+import os
 import time
 import uuid
 import logging
+import hmac
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, ConfigDict
 
 from app.db import get_connection
 
-router = APIRouter()
+router = APIRouter(tags=["Evotor Webhooks"])
 log = logging.getLogger("api.webhooks")
 
 
+def _get_evotor_webhook_secret() -> str:
+    return os.getenv("EVOTOR_WEBHOOK_SECRET", "").strip()
+
+
+def _verify_evotor_signature(request_headers: dict) -> bool:
+    """
+    Эвотор передаёт токен в заголовке Authorization: Bearer <token>.
+    Проверяем, что токен совпадает с EVOTOR_WEBHOOK_SECRET.
+    Если секрет не настроен — пропускаем проверку (для локальной разработки).
+    """
+    secret = _get_evotor_webhook_secret()
+    if not secret:
+        log.warning("EVOTOR_WEBHOOK_SECRET not set — skipping signature verification")
+        return True
+
+    auth_header = (
+        request_headers.get("authorization")
+        or request_headers.get("Authorization")
+        or ""
+    ).strip()
+
+    if not auth_header.startswith("Bearer "):
+        return False
+
+    token = auth_header.removeprefix("Bearer ").strip()
+    return hmac.compare_digest(token, secret)
+
+
 class EvotorPosition(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     product_id: str
     product_name: Optional[str] = None
     quantity: float
     price: float
     sum: Optional[float] = None
 
-    class Config:
-        extra = "allow"
-
 
 class EvotorBody(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     positions: List[EvotorPosition]
     sum: Optional[float] = None
 
-    class Config:
-        extra = "allow"
-
 
 class EvotorWebhook(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: str
     id: str
     store_id: Optional[str] = None
     device_id: Optional[str] = None
     body: Optional[EvotorBody] = None
-
-    class Config:
-        extra = "allow"
 
 
 LIKELY_CUSTOMER_KEYS = (
@@ -216,10 +243,21 @@ def _normalize_receipt_created(body_dict: dict) -> tuple[str, str, dict] | tuple
 
 
 @router.post("/webhooks/evotor/{tenant_id}")
-async def evotor_webhook(tenant_id: str, raw_body: EvotorWebhook):
-    body_dict = raw_body.dict()
+async def evotor_webhook(tenant_id: str, raw_body: EvotorWebhook, request: Request):
+    # Верификация подписи — отклоняем запросы с неверным токеном
+    if not _verify_evotor_signature(dict(request.headers)):
+        log.warning(
+            "Evotor webhook signature verification failed tenant_id=%s "
+            "ip=%s user_agent=%s",
+            tenant_id,
+            request.client.host if request.client else "unknown",
+            request.headers.get("user-agent", ""),
+        )
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
-    log.info(f"RAW EVOTOR BODY tenant_id={tenant_id} body={json.dumps(body_dict, ensure_ascii=False)}")
+    body_dict = raw_body.model_dump()
+
+    log.debug(f"RAW EVOTOR BODY tenant_id={tenant_id} body={json.dumps(body_dict, ensure_ascii=False)}")  # PII: debug only
 
     # Событие установки приложения — сохраняем токен клиента
     if "token" in body_dict and "userUuid" in body_dict:

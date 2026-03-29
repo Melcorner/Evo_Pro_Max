@@ -2,14 +2,14 @@ import logging
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.db import get_connection
 from app.stores.mapping_store import MappingStore
 from app.clients.moysklad_client import MoySkladClient
 from app.clients.evotor_client import EvotorClient
 
-router = APIRouter()
+router = APIRouter(tags=["MoySklad Webhooks"])
 log = logging.getLogger("api.webhooks.moysklad")
 
 
@@ -18,19 +18,17 @@ log = logging.getLogger("api.webhooks.moysklad")
 # ---------------------------------------------------------------------------
 
 class MoySkladMeta(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     href: str
     type: Optional[str] = None
 
-    class Config:
-        extra = "allow"
-
 
 class MoySkladWebhookEvent(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     meta: MoySkladMeta
     updatedFields: Optional[List[str]] = None
-
-    class Config:
-        extra = "allow"
 
 
 class MoySkladWebhook(BaseModel):
@@ -48,10 +46,9 @@ class MoySkladWebhook(BaseModel):
         ]
     }
     """
-    events: List[MoySkladWebhookEvent]
+    model_config = ConfigDict(extra="allow")
 
-    class Config:
-        extra = "allow"
+    events: List[MoySkladWebhookEvent]
 
 
 # ---------------------------------------------------------------------------
@@ -80,16 +77,21 @@ def _extract_ms_id_from_href(href: str) -> Optional[str]:
 def _get_document_positions(ms_client: MoySkladClient, doc_type: str, doc_id: str) -> List[str]:
     """
     Получает список ms_product_id из позиций документа МойСклад.
-    Поддерживает: demand, supply, inventory.
+    Поддерживает: demand, supply, inventory, loss, enter.
+    При неуспешном HTTP-запросе бросает исключение — не маскирует ошибку под пустой список.
     """
     import requests
 
-    url = f"{MoySkladClient.BASE_URL}/entity/{doc_type}/{doc_id}/positions"
+    # Берём BASE_URL с инстанса, а не с класса — чтобы уважать env-переменную MS_BASE_URL
+    url = f"{ms_client.BASE_URL}/entity/{doc_type}/{doc_id}/positions"
     r = requests.get(url, headers=ms_client._headers(), timeout=15)
 
     if not r.ok:
-        log.error(f"Failed to fetch positions doc_type={doc_type} doc_id={doc_id} status={r.status_code}")
-        return []
+        log.error(
+            "Failed to fetch positions doc_type=%s doc_id=%s status=%s body=%s",
+            doc_type, doc_id, r.status_code, r.text,
+        )
+        r.raise_for_status()
 
     rows = r.json().get("rows", [])
     product_ids = []
@@ -108,7 +110,6 @@ def _get_document_positions(ms_client: MoySkladClient, doc_type: str, doc_id: st
 
 def _sync_stock_for_products(
     tenant_id: str,
-    tenant: dict,
     ms_product_ids: List[str]
 ) -> dict:
     """
@@ -183,14 +184,17 @@ async def moysklad_webhook(tenant_id: str, body: MoySkladWebhook):
     """
     Принимает webhook от МойСклад при изменении документов.
 
-    При создании/изменении отгрузки, приёмки или инвентаризации —
+    При создании/изменении отгрузки, приёмки, инвентаризации, списания или оприходования —
     автоматически синхронизирует остатки затронутых товаров в Эвотор.
 
-    Настройка в МойСклад:
-    Настройки → Вебхуки → Создать
-    URL: https://{your-domain}/webhooks/moysklad/{tenant_id}
-    Сущность: Отгрузка / Приёмка / Инвентаризация
-    Событие: Создание, Изменение
+    Настройка webhook в МойСклад через API:
+    POST https://api.moysklad.ru/api/remap/1.2/entity/webhook
+    {
+        "url": "https://{your-domain}/webhooks/moysklad/{tenant_id}",
+        "action": "CREATE,UPDATE",
+        "entityType": "demand"
+    }
+    Повторить для: supply, inventory, loss, enter.
     """
     tenant = _load_tenant(tenant_id)
 
@@ -221,14 +225,29 @@ async def moysklad_webhook(tenant_id: str, body: MoySkladWebhook):
         log.info(f"Processing MoySklad webhook doc_type={doc_type} doc_id={doc_id} tenant_id={tenant_id}")
 
         # Получаем товары из позиций документа
-        ms_product_ids = _get_document_positions(ms_client, doc_type, doc_id)
+        try:
+            ms_product_ids = _get_document_positions(ms_client, doc_type, doc_id)
+        except Exception as e:
+            log.error(
+                "Cannot fetch positions doc_type=%s doc_id=%s tenant_id=%s err=%s",
+                doc_type, doc_id, tenant_id, e,
+            )
+            total_failed += 1
+            processed_docs.append({
+                "doc_type": doc_type,
+                "doc_id": doc_id,
+                "error": str(e),
+                "synced": 0,
+                "failed": 0,
+            })
+            continue
 
         if not ms_product_ids:
             log.info(f"No products found in doc_type={doc_type} doc_id={doc_id}")
             continue
 
         # Синхронизируем остатки
-        result = _sync_stock_for_products(tenant_id, tenant, ms_product_ids)
+        result = _sync_stock_for_products(tenant_id, ms_product_ids)
 
         total_synced += result["synced"]
         total_skipped += result["skipped"]
@@ -246,8 +265,9 @@ async def moysklad_webhook(tenant_id: str, body: MoySkladWebhook):
         f"docs={len(processed_docs)} synced={total_synced} failed={total_failed}"
     )
 
+    final_status = "ok" if total_failed == 0 else "partial"
     return {
-        "status": "ok",
+        "status": final_status,
         "docs_processed": len(processed_docs),
         "synced": total_synced,
         "skipped": total_skipped,

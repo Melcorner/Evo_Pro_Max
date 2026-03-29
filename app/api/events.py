@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from app.db import get_connection
 
 log = logging.getLogger("api")
-router = APIRouter()
+router = APIRouter(tags=["Events"])
 
 
 @router.get("/events")

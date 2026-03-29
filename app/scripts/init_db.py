@@ -97,6 +97,41 @@ def init_db():
     )
     """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS fiscalization_checks (
+        uid TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        ms_demand_id TEXT NOT NULL,
+        fiscal_client_uid TEXT,
+        fiscal_device_uid TEXT,
+        status INTEGER NOT NULL DEFAULT 1,
+        description TEXT,
+        error_code INTEGER,
+        error_message TEXT,
+        request_json TEXT,
+        response_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+    """)
+
+    cursor.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_fisc_tenant_demand
+    ON fiscalization_checks(tenant_id, ms_demand_id)
+    """)
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_fisc_tenant ON fiscalization_checks(tenant_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_fisc_demand ON fiscalization_checks(ms_demand_id)")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS service_heartbeats (
+        service_name TEXT PRIMARY KEY,
+        last_seen_at INTEGER NOT NULL,
+        meta_json TEXT
+    )
+    """)
+
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_event_id ON errors(event_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_tenant_id ON errors(tenant_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_errors_created_at ON errors(created_at)")
@@ -131,6 +166,14 @@ def init_db():
         cursor.execute("ALTER TABLE tenants ADD COLUMN sync_completed_at INTEGER")
     if "evotor_store_id" not in existing_tenants:
         cursor.execute("ALTER TABLE tenants ADD COLUMN evotor_store_id TEXT")
+
+    # Fiscal fields
+    if "fiscal_token" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN fiscal_token TEXT")
+    if "fiscal_client_uid" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN fiscal_client_uid TEXT")
+    if "fiscal_device_uid" not in existing_tenants:
+        cursor.execute("ALTER TABLE tenants ADD COLUMN fiscal_device_uid TEXT")
 
     existing_stock_sync_status = {row[1] for row in cursor.execute("PRAGMA table_info(stock_sync_status)")}
     if existing_stock_sync_status:

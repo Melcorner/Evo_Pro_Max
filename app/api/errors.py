@@ -5,7 +5,7 @@ from app.db import get_connection
 from app.stores.error_store import list_errors
 
 log = logging.getLogger("api")
-router = APIRouter()
+router = APIRouter(tags=["Errors"])
 
 
 @router.get("/errors")
