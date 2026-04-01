@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 import requests
@@ -9,7 +10,7 @@ from app.stores.mapping_store import MappingStore
 log = logging.getLogger("api.sync")
 router = APIRouter(tags=["Sync"])
 
-MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
+MS_BASE = os.getenv("MS_BASE_URL", "https://api.moysklad.ru/api/remap/1.2").rstrip("/")
 EVOTOR_BASE = "https://api.evotor.ru"
 
 
@@ -455,7 +456,55 @@ def _detect_barcode_format(value: str) -> str:
     return "code128"
 
 
+# Fix 7 (Major): кэш для мета дефолтного priceType — href без UUID вызывает 400
+_price_type_meta_cache: dict[str, dict] = {}
+_currency_meta_cache: dict[str, dict] = {}
+
+
+def _get_default_price_type_meta(ms_token: str) -> dict:
+    """Получает meta дефолтного priceType из МойСклад и кэширует на lifetime процесса."""
+    cached = _price_type_meta_cache.get(ms_token)
+    if cached:
+        return cached
+    url = f"{MS_BASE}/context/companysettings/pricetype"
+    r = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
+    if not r.ok:
+        log.error("Failed to fetch priceType list status=%s body=%s", r.status_code, r.text)
+        r.raise_for_status()
+    rows = r.json().get("rows", [])
+    if not rows:
+        raise ValueError("No price types found in MoySklad companysettings")
+    meta = rows[0]["meta"]
+    _price_type_meta_cache[ms_token] = meta
+    return meta
+
+
+def _get_default_currency_meta(ms_token: str) -> dict:
+    """Получает meta дефолтной (национальной) валюты и кэширует на lifetime процесса."""
+    cached = _currency_meta_cache.get(ms_token)
+    if cached:
+        return cached
+    url = f"{MS_BASE}/entity/currency"
+    r = requests.get(url, headers=_ms_headers(ms_token), params={"filter": "default=true"}, timeout=20)
+    if not r.ok:
+        log.error("Failed to fetch currency list status=%s body=%s", r.status_code, r.text)
+        r.raise_for_status()
+    rows = r.json().get("rows", [])
+    if not rows:
+        # fallback: берём первую валюту без фильтра
+        r2 = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
+        r2.raise_for_status()
+        rows = r2.json().get("rows", [])
+    if not rows:
+        raise ValueError("No currencies found in MoySklad")
+    meta = rows[0]["meta"]
+    _currency_meta_cache[ms_token] = meta
+    return meta
+
+
 def _create_ms_product(ms_token: str, product: dict) -> str:
+    price_type_meta = _get_default_price_type_meta(ms_token)
+    currency_meta = _get_default_currency_meta(ms_token)
     payload = {
         "name": product["name"],
         "externalCode": product["id"],
@@ -463,20 +512,8 @@ def _create_ms_product(ms_token: str, product: dict) -> str:
         "salePrices": [
             {
                 "value": round(float(product.get("price", 0)) * 100),
-                "currency": {
-                    "meta": {
-                        "href": f"{MS_BASE}/entity/currency",
-                        "type": "currency",
-                        "mediaType": "application/json",
-                    }
-                },
-                "priceType": {
-                    "meta": {
-                        "href": f"{MS_BASE}/context/companysettings/pricetype/",
-                        "type": "pricetype",
-                        "mediaType": "application/json",
-                    }
-                },
+                "currency": {"meta": currency_meta},
+                "priceType": {"meta": price_type_meta},
             }
         ],
     }
@@ -484,13 +521,7 @@ def _create_ms_product(ms_token: str, product: dict) -> str:
     if product.get("cost_price") is not None:
         payload["buyPrice"] = {
             "value": round(float(product.get("cost_price", 0)) * 100),
-            "currency": {
-                "meta": {
-                    "href": f"{MS_BASE}/entity/currency",
-                    "type": "currency",
-                    "mediaType": "application/json",
-                }
-            },
+            "currency": {"meta": currency_meta},
         }
 
     barcodes = product.get("barcodes", [])
@@ -1053,11 +1084,27 @@ EVOTOR_TYPE_TO_FISCAL = {
 }
 
 
+def _money_from_ms(value) -> float:
+    """
+    МойСклад хранит денежные значения в копейках.
+    fiscalization24 по документации ожидает число с точкой до второго знака.
+    """
+    try:
+        return round(float(value or 0) / 100.0, 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _fetch_demand_positions(ms_token: str, positions_raw) -> list:
     """Читает позиции demand — inline список или meta-ссылка."""
     if isinstance(positions_raw, dict) and "meta" in positions_raw:
         pos_url = positions_raw["meta"]["href"]
-        r = requests.get(pos_url, headers=_ms_headers(ms_token), timeout=20)
+        r = requests.get(
+            pos_url,
+            headers=_ms_headers(ms_token),
+            params={"expand": "assortment"},  # нужно для name и trackingType
+            timeout=20,
+        )
         if not r.ok:
             log.error("Failed to fetch demand positions status=%s", r.status_code)
             r.raise_for_status()
@@ -1073,60 +1120,80 @@ def _map_demand_to_fiscal_check(
     fiscal_device_uid: str,
     check_uid: str,
 ) -> dict:
-    """
-    Маппит документ Отгрузка МойСклад → payload для fiscalization24.ru.
-
-    Формат fiscalization24 POST /check:
-    {
-        "UID": "<uid>",
-        "ClientUid": "<fiscal_client_uid>",
-        "DeviceUid": "<fiscal_device_uid>",
-        "Data": {
-            "products": [...],
-            "payCashSumma": <сумма>,
-            "type": 0,          # 0=продажа
-            "paymentType": 1,   # 1=наличные
-            ...
-        }
-    }
-    """
-    from app.stores.mapping_store import MappingStore
-
-    mapping_store = MappingStore()
     positions_list = _fetch_demand_positions(ms_token, demand.get("positions", {}))
 
     fiscal_products = []
+
     for item in positions_list:
-        assortment = item.get("assortment", {})
-        meta = assortment.get("meta", {})
-        ms_product_id = meta.get("href", "").rstrip("/").split("/")[-1]
+        assortment = item.get("assortment", {}) or {}
+        meta = assortment.get("meta", {}) or {}
 
-        quantity = round(float(item.get("quantity", 1)), 2)
-        # МойСклад хранит цену в копейках → переводим в рубли
-        price_rubles = round(float(item.get("price", 0)) / 100, 2)
+        quantity = round(float(item.get("quantity", 1) or 1), 3)
 
+        # МойСклад отдаёт цены в копейках — переводим в рубли с копейками
+        price_value = _money_from_ms(item.get("price"))
+
+        # Fix: корректная логика vatEnabled — None != False
         vat = item.get("vat", 0) or 0
-        vat_enabled = item.get("vatEnabled", False) or False
-        tax = VAT_MS_TO_FISCAL.get((vat, vat_enabled), -1)
+        vat_enabled = item.get("vatEnabled")
+        if vat_enabled is False:
+            tax = -1
+        else:
+            vat_value = int(vat or 0)
+            tax = VAT_MS_TO_FISCAL.get((vat_value, True), -1)
 
-        # Тип товара — пытаемся взять из assortment.trackingType
         tracking_type = assortment.get("trackingType") or "NORMAL"
         product_type = EVOTOR_TYPE_TO_FISCAL.get(str(tracking_type).upper(), 0)
 
-        # Скидка на позицию
-        discount = round(float(item.get("discount", 0) or 0), 2)
+        # Fix 2: discount в позициях demand — процент (0..100)
+        discount_percent = float(item.get("discount", 0) or 0)
+        if discount_percent < 0 or discount_percent > 100:
+            raise ValueError(
+                f"Fiscalization discount must be 0..100, got {discount_percent}"
+            )
+
+        # fallback имени
+        product_name = (
+            assortment.get("name")
+            or item.get("name")
+            or meta.get("name")
+            or f"Product {meta.get('href', '').rstrip('/').split('/')[-1]}"
+        )
+
+        if not product_name.strip():
+            raise ValueError("Fiscalization product name is empty")
+
+        if price_value <= 0:
+            raise ValueError(f"Fiscalization product price must be > 0, got {price_value}")
+
+        if quantity <= 0:
+            raise ValueError(f"Fiscalization product quantity must be > 0, got {quantity}")
 
         fiscal_products.append({
             "type": product_type,
             "tax": tax,
-            "name": assortment.get("name", ""),
-            "price": price_rubles,
-            "discount": discount,
+            "name": product_name,
+            "price": price_value,
+            "discount": round(discount_percent, 2),
             "quantity": quantity,
         })
 
-    # Сумма в рублях
-    total_sum_rubles = round(float(demand.get("sum", 0)) / 100, 2)
+    # Fix 2 (Critical): делим на 100
+    total_sum_value = _money_from_ms(demand.get("sum"))
+
+    if total_sum_value <= 0:
+        raise ValueError(f"Fiscalization total sum must be > 0, got {total_sum_value}")
+
+    # Самопроверка: сравниваем итог по позициям с суммой документа
+    calc_sum = round(sum(
+        p["price"] * p["quantity"] * (1 - p["discount"] / 100.0)
+        for p in fiscal_products
+    ), 2)
+    if abs(calc_sum - total_sum_value) > 0.05:
+        log.warning(
+            "Fiscal sum mismatch: demand.sum=%.2f calc=%.2f tenant_id=%s",
+            total_sum_value, calc_sum, tenant_id,
+        )
 
     return {
         "UID": check_uid,
@@ -1135,13 +1202,29 @@ def _map_demand_to_fiscal_check(
         "Data": {
             "uid": check_uid,
             "products": fiscal_products,
-            "payCashSumma": total_sum_rubles,
-            "payCardSumma": 0,
+            "payCashSumma": total_sum_value,
+            "payCardSumma": 0.0,
             "discount": 0,
-            "type": 0,          # 0 = продажа
-            "paymentType": 1,   # 1 = наличные (можно расширить)
+            "type": 0,
+            "paymentType": 1,
         },
     }
+
+
+def _get_existing_fiscal_check(tenant_id: str, ms_demand_id: str) -> dict | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT *
+        FROM fiscalization_checks
+        WHERE tenant_id = ? AND ms_demand_id = ?
+        """,
+        (tenant_id, ms_demand_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def _save_fiscal_check(
@@ -1153,29 +1236,64 @@ def _save_fiscal_check(
     status: int,
     request_json: str,
     response_json: str,
+    description: str | None = None,
+    error_code: int | None = None,
+    error_message: str | None = None,
 ) -> None:
+    import sqlite3
+
     now = _now()
-    conn = get_connection()
-    conn.execute(
-        """
-        INSERT INTO fiscalization_checks (
-            uid, tenant_id, ms_demand_id,
-            fiscal_client_uid, fiscal_device_uid,
-            status, request_json, response_json,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(uid) DO UPDATE SET
-            status=excluded.status,
-            response_json=excluded.response_json,
-            updated_at=excluded.updated_at
-        """,
-        (uid, tenant_id, ms_demand_id,
-         fiscal_client_uid, fiscal_device_uid,
-         status, request_json, response_json,
-         now, now),
-    )
-    conn.commit()
-    conn.close()
+    last_error = None
+
+    for attempt in range(5):
+        conn = get_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO fiscalization_checks (
+                    uid, tenant_id, ms_demand_id,
+                    fiscal_client_uid, fiscal_device_uid,
+                    status, description, error_code, error_message,
+                    request_json, response_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(uid) DO UPDATE SET
+                    status=excluded.status,
+                    description=excluded.description,
+                    error_code=excluded.error_code,
+                    error_message=excluded.error_message,
+                    response_json=excluded.response_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    uid,
+                    tenant_id,
+                    ms_demand_id,
+                    fiscal_client_uid,
+                    fiscal_device_uid,
+                    status,
+                    description,
+                    error_code,
+                    error_message,
+                    request_json,
+                    response_json,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            conn.rollback()
+            if "database is locked" not in str(e).lower():
+                raise
+            last_error = e
+            time.sleep(0.3 * (attempt + 1))
+        finally:
+            conn.close()
+
+    if last_error is not None:
+        raise last_error
 
 
 def _update_fiscal_check_state(uid: str, state: dict) -> None:
@@ -1194,7 +1312,7 @@ def _update_fiscal_check_state(uid: str, state: dict) -> None:
             state.get("Description"),
             state.get("Error"),
             state.get("ErrorMessage"),
-            _json.dumps(state),
+            _json.dumps(state, ensure_ascii=False),
             now,
             uid,
         ),
@@ -1209,19 +1327,12 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
     Отправляет документ Отгрузка из МойСклад на фискализацию
     через Универсальный фискализатор (fiscalization24.ru).
 
-    Алгоритм:
-    1. Читает demand из МойСклад
-    2. Маппит позиции → формат fiscalization24
-    3. Отправляет POST /api/fiscal/check
-    4. Сохраняет uid чека в fiscalization_checks
-    5. Возвращает uid и статус "queued"
-
-    Требования:
-    - Initial sync завершён
-    - Настроен fiscal_token, fiscal_client_uid, fiscal_device_uid
-      через PATCH /tenants/{tenant_id}/fiscal
+    Поведение идемпотентное:
+    - если для tenant_id + ms_demand_id запись уже есть,
+      повторный POST не создаёт второй чек, а возвращает existing uid.
     """
     import json as _json
+    import sqlite3
     import uuid as _uuid
     from app.clients.fiscalization_client import FiscalizationClient
 
@@ -1239,13 +1350,30 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
             status_code=400,
             detail="fiscal_token not configured. Use PATCH /tenants/{tenant_id}/fiscal",
         )
+    if not tenant.get("fiscal_client_uid"):
+        raise HTTPException(status_code=400, detail="fiscal_client_uid not configured")
+    if not tenant.get("fiscal_device_uid"):
+        raise HTTPException(status_code=400, detail="fiscal_device_uid not configured")
 
     ms_token = tenant["moysklad_token"]
     fiscal_client_uid = tenant["fiscal_client_uid"]
     fiscal_device_uid = tenant["fiscal_device_uid"]
+
+    existing = _get_existing_fiscal_check(tenant_id, ms_demand_id)
+    if existing:
+        return {
+            "status": "already_exists",
+            "uid": existing["uid"],
+            "tenant_id": existing["tenant_id"],
+            "ms_demand_id": existing["ms_demand_id"],
+            "state": existing["status"],
+            "description": existing.get("description"),
+            "error_code": existing.get("error_code"),
+            "error_message": existing.get("error_message"),
+        }
+
     check_uid = str(_uuid.uuid4())
 
-    # 1. Читаем demand из МойСклад
     try:
         url = f"{MS_BASE}/entity/demand/{ms_demand_id}"
         r = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
@@ -1255,7 +1383,6 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch demand: {e}")
 
-    # 2. Маппим в формат fiscalization24
     try:
         payload = _map_demand_to_fiscal_check(
             demand=demand,
@@ -1275,28 +1402,65 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
         tenant_id, ms_demand_id, check_uid, len(payload["Data"]["products"]),
     )
 
-    # 3. Отправляем в fiscalization24
-    request_json = _json.dumps(payload)
+    request_json = _json.dumps(payload, ensure_ascii=False)
     try:
         fiscal_client = FiscalizationClient(tenant["fiscal_token"])
         result = fiscal_client.create_check(payload)
-        response_json = _json.dumps(result)
-        status = 1  # новый
+        response_json = _json.dumps(result, ensure_ascii=False)
+        description = result.get("Info") if isinstance(result.get("Info"), str) else None
+        error_code = None
+        error_message = None
+        # Fix 4 (Major): читаем реальный статус из ответа API вместо хардкода 1
+        state = None
+        if isinstance(result, dict):
+            state = (result.get("CheckState") or result.get("checkState") or {}).get("State")
+        status = int(state) if state is not None else 2  # 2 = sent_to_device как минимум
     except Exception as e:
         response_json = str(e)
+        # Fix 5 (Major): transport error — оставляем status=1 (new) для возможности retry,
+        # не ставим status=9 (fiscal error), это разные классы инцидентов
+        try:
+            _save_fiscal_check(
+                tenant_id, check_uid, ms_demand_id,
+                fiscal_client_uid, fiscal_device_uid,
+                status=1,
+                request_json=request_json,
+                response_json=response_json,
+                description="Send failed (will retry)",
+                error_code=None,
+                error_message=str(e),
+            )
+        except Exception:
+            log.exception("Failed to save fiscalization error record tenant_id=%s ms_demand_id=%s", tenant_id, ms_demand_id)
+        raise HTTPException(status_code=502, detail=f"Failed to send check: {e}")
+
+    try:
         _save_fiscal_check(
             tenant_id, check_uid, ms_demand_id,
             fiscal_client_uid, fiscal_device_uid,
-            status=9, request_json=request_json, response_json=response_json,
+            status=status,
+            request_json=request_json,
+            response_json=response_json,
+            description=description,
+            error_code=error_code,
+            error_message=error_message,
         )
-        raise HTTPException(status_code=502, detail=f"Failed to send check: {e}")
-
-    # 4. Сохраняем запись
-    _save_fiscal_check(
-        tenant_id, check_uid, ms_demand_id,
-        fiscal_client_uid, fiscal_device_uid,
-        status=1, request_json=request_json, response_json=response_json,
-    )
+    except sqlite3.IntegrityError as e:
+        if "fiscalization_checks.tenant_id, fiscalization_checks.ms_demand_id" not in str(e):
+            raise
+        existing = _get_existing_fiscal_check(tenant_id, ms_demand_id)
+        if not existing:
+            raise
+        return {
+            "status": "already_exists",
+            "uid": existing["uid"],
+            "tenant_id": existing["tenant_id"],
+            "ms_demand_id": existing["ms_demand_id"],
+            "state": existing["status"],
+            "description": existing.get("description"),
+            "error_code": existing.get("error_code"),
+            "error_message": existing.get("error_message"),
+        }
 
     return {
         "status": "queued",

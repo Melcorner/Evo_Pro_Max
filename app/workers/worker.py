@@ -18,10 +18,6 @@ WORKER_HEARTBEAT_INTERVAL_SEC = int(os.getenv("WORKER_HEARTBEAT_INTERVAL_SEC", "
 STALE_PROCESSING_TIMEOUT_SEC = int(os.getenv("STALE_PROCESSING_TIMEOUT_SEC", "300"))
 STALE_PROCESSING_CHECK_INTERVAL_SEC = int(os.getenv("STALE_PROCESSING_CHECK_INTERVAL_SEC", "60"))
 
-# ---------------------------------------------------------------------------
-# Graceful shutdown
-# ---------------------------------------------------------------------------
-
 _shutdown = False
 
 
@@ -34,10 +30,6 @@ def _handle_signal(signum, frame):
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
 
-
-# ---------------------------------------------------------------------------
-# Heartbeat
-# ---------------------------------------------------------------------------
 
 def heartbeat_worker() -> None:
     now = int(time.time())
@@ -59,36 +51,79 @@ def heartbeat_worker() -> None:
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Stale PROCESSING recovery
-# ---------------------------------------------------------------------------
-
 def recover_stale_processing() -> None:
     """
-    Сбрасывает события, зависшие в статусе PROCESSING, обратно в RETRY.
-    Вызывается периодически из main_loop.
-    Защита от случая, когда воркер упал после блокировки события,
-    но до записи DONE / RETRY / FAILED.
+    Сбрасывает события, зависшие в статусе PROCESSING, обратно в RETRY/FAILED.
+
+    Важно:
+    - recovery использует CAS по старому updated_at,
+      чтобы не перетереть событие, которое уже успело завершиться в DONE;
+    - insert_error пишем только если recovery-UPDATE реально сработал.
     """
     conn = get_connection()
     try:
         now = int(time.time())
         stale_before = now - STALE_PROCESSING_TIMEOUT_SEC
         cur = conn.cursor()
+
         cur.execute(
             """
-            UPDATE event_store
-            SET status      = 'RETRY',
-                next_retry_at = ?,
-                last_error_message = 'stale PROCESSING: recovered by worker',
-                updated_at  = ?
+            SELECT *
+            FROM event_store
             WHERE status = 'PROCESSING'
               AND updated_at < ?
             """,
-            (now + 60, now, stale_before),
+            (stale_before,),
         )
-        if cur.rowcount:
-            log.warning("Recovered %s stale PROCESSING event(s) -> RETRY", cur.rowcount)
+        rows = cur.fetchall()
+
+        recovered = 0
+
+        for row in rows:
+            locked_at = row["updated_at"]
+
+            cur.execute(
+                """
+                UPDATE event_store
+                SET status = CASE WHEN retries + 1 >= 5 THEN 'FAILED' ELSE 'RETRY' END,
+                    retries = retries + 1,
+                    next_retry_at = CASE WHEN retries + 1 >= 5 THEN NULL ELSE ? END,
+                    last_error_code = ?,
+                    last_error_message = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'PROCESSING'
+                  AND updated_at = ?
+                """,
+                (
+                    now + 60,
+                    "STALE_PROCESSING",
+                    "stale PROCESSING: recovered by worker",
+                    now,
+                    row["id"],
+                    locked_at,
+                ),
+            )
+
+            if cur.rowcount == 0:
+                log.info(
+                    "Skip stale recovery CAS miss event_id=%s — event already changed state",
+                    row["id"],
+                )
+                continue
+
+            insert_error(
+                conn,
+                row,
+                error_code="STALE_PROCESSING",
+                message="stale PROCESSING: recovered by worker",
+                response_body=None,
+            )
+            recovered += 1
+
+        if recovered:
+            log.warning("Recovered %s stale PROCESSING event(s) -> RETRY/FAILED", recovered)
+
         conn.commit()
     except Exception:
         log.exception("recover_stale_processing failed")
@@ -96,23 +131,22 @@ def recover_stale_processing() -> None:
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Main event processing
-# ---------------------------------------------------------------------------
-
 def process_one_event():
     conn = get_connection()
     cursor = conn.cursor()
 
     now = int(time.time())
 
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT * FROM event_store
         WHERE (status = 'NEW')
            OR (status = 'RETRY' AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND retries < 5)
         ORDER BY created_at
         LIMIT 1
-    """, (now,))
+        """,
+        (now,),
+    )
     row = cursor.fetchone()
 
     if not row:
@@ -128,41 +162,53 @@ def process_one_event():
         row["event_key"],
     )
 
-    cursor.execute("""
+    locked_at = int(time.time())
+    cursor.execute(
+        """
         UPDATE event_store
         SET status = 'PROCESSING', updated_at = ?
         WHERE id = ? AND status IN ('NEW','RETRY')
-    """, (int(time.time()), event_id))
+        """,
+        (locked_at, event_id),
+    )
 
     if cursor.rowcount == 0:
         conn.close()
-        return True  # другой воркер уже взял событие
+        return True
 
     conn.commit()
-    log.info("Locked event_id=%s -> PROCESSING", event_id)
+    log.info("Locked event_id=%s -> PROCESSING locked_at=%s", event_id, locked_at)
 
     try:
         log.info("Processing event_id=%s event_type=%s", event_id, row["event_type"])
 
         result_ref = dispatch_event(row)
-
         now = int(time.time())
 
-        cursor.execute("""
+        cursor.execute(
+            """
             UPDATE event_store
             SET status = 'DONE', updated_at = ?
-            WHERE id = ?
-        """, (now, event_id))
+            WHERE id = ? AND status = 'PROCESSING' AND updated_at = ?
+            """,
+            (now, event_id, locked_at),
+        )
 
-        cursor.execute("""
+        if cursor.rowcount == 0:
+            log.warning(
+                "CAS miss on DONE: event_id=%s was already recovered by stale-recovery — skipping DONE",
+                event_id,
+            )
+            conn.commit()
+            return True
+
+        cursor.execute(
+            """
             INSERT OR IGNORE INTO processed_events (tenant_id, event_key, result_ref, processed_at)
             VALUES (?, ?, ?, ?)
-        """, (
-            row["tenant_id"],
-            row["event_key"],
-            result_ref,
-            now,
-        ))
+            """,
+            (row["tenant_id"], row["event_key"], result_ref, now),
+        )
 
         conn.commit()
         log.info("DONE event_id=%s event_key=%s", event_id, row["event_key"])
@@ -198,29 +244,45 @@ def process_one_event():
             err,
         )
 
-        delay = 60 * (2 ** (new_retries - 1))  # 60,120,240,480,960
+        delay = 60 * (2 ** (new_retries - 1))
         go_failed = decision == FAILED or new_retries >= 5
 
         if go_failed:
-            cursor.execute("""
+            cursor.execute(
+                """
                 UPDATE event_store
                 SET status = 'FAILED',
                     retries = ?,
                     next_retry_at = NULL,
+                    last_error_code = ?,
                     last_error_message = ?,
                     updated_at = ?
-                WHERE id = ?
-            """, (new_retries, err, now, event_id))
+                WHERE id = ? AND status = 'PROCESSING' AND updated_at = ?
+                """,
+                (new_retries, error_code, err, now, event_id, locked_at),
+            )
         else:
-            cursor.execute("""
+            cursor.execute(
+                """
                 UPDATE event_store
                 SET status = 'RETRY',
                     retries = ?,
                     next_retry_at = ?,
+                    last_error_code = ?,
                     last_error_message = ?,
                     updated_at = ?
-                WHERE id = ?
-            """, (new_retries, now + delay, err, now, event_id))
+                WHERE id = ? AND status = 'PROCESSING' AND updated_at = ?
+                """,
+                (new_retries, now + delay, error_code, err, now, event_id, locked_at),
+            )
+
+        if cursor.rowcount == 0:
+            log.warning(
+                "CAS miss on error path: event_id=%s was already recovered by stale-recovery — skipping retry/failed overwrite",
+                event_id,
+            )
+            conn.commit()
+            return True
 
         insert_error(conn, row, error_code, err, response_body)
         conn.commit()
@@ -228,12 +290,19 @@ def process_one_event():
         if go_failed:
             log.error(
                 "FAILED event_id=%s event_key=%s retries=%s err=%s",
-                event_id, row["event_key"], new_retries, err,
+                event_id,
+                row["event_key"],
+                new_retries,
+                err,
             )
         else:
             log.warning(
                 "RETRY event_id=%s event_key=%s retries=%s next_retry_at=%s err=%s",
-                event_id, row["event_key"], new_retries, now + delay, err,
+                event_id,
+                row["event_key"],
+                new_retries,
+                now + delay,
+                err,
             )
 
         return True
@@ -241,10 +310,6 @@ def process_one_event():
     finally:
         conn.close()
 
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
 
 def main_loop():
     log.info("Worker started")
@@ -254,12 +319,10 @@ def main_loop():
     while not _shutdown:
         now = time.time()
 
-        # Heartbeat
         if now - last_heartbeat_at >= WORKER_HEARTBEAT_INTERVAL_SEC:
             heartbeat_worker()
             last_heartbeat_at = now
 
-        # Периодическая проверка зависших PROCESSING
         if now - last_stale_check_at >= STALE_PROCESSING_CHECK_INTERVAL_SEC:
             recover_stale_processing()
             last_stale_check_at = time.time()

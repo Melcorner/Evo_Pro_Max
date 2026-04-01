@@ -1,51 +1,85 @@
-import sqlite3
 import time
+import uuid
 
-conn = sqlite3.connect("data/app.db")
-cur = conn.cursor()
-now = int(time.time())
+from app.db import get_connection
 
-event_id = "evt-failed-test-1"
+TENANT_ID = "test-tenant"
+EVENT_ID = "evt-failed-test-1"
+EVENT_KEY = "failed-test-1"
+ERROR_ID = "err-failed-test-1"
 
-cur.execute(
-    """
-    INSERT INTO event_store (
-        id, tenant_id, event_type, event_key, payload_json,
-        status, retries, next_retry_at, last_error_code, last_error_message,
-        created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-    (
-        event_id,
-        "test-tenant",
-        "sale",
-        "failed-test-1",
-        '{"test": true}',
-        "FAILED",
-        5,
-        None,
-        "MAPPING_NOT_FOUND",
-        "Product mapping not found",
-        now - 20,
-        now,
+
+def ensure_test_tenant(conn, tenant_id: str) -> None:
+    now = int(time.time())
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO tenants (
+            id, name, evotor_api_key, moysklad_token, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (tenant_id, "Dashboard Test Tenant", "test-key", "test-token", now),
     )
-)
 
-cur.execute(
-    """
-    INSERT INTO errors (event_id, tenant_id, error_code, message, created_at)
-    VALUES (?, ?, ?, ?, ?)
-    """,
-    (
-        event_id,
-        "test-tenant",
-        "MAPPING_NOT_FOUND",
-        "Product mapping not found",
-        now,
-    )
-)
 
-conn.commit()
-conn.close()
+def main():
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        now = int(time.time())
 
-print("FAILED test event inserted with error log")
+        ensure_test_tenant(conn, TENANT_ID)
+
+        cur.execute("DELETE FROM errors WHERE id = ?", (ERROR_ID,))
+        cur.execute("DELETE FROM event_store WHERE id = ?", (EVENT_ID,))
+
+        cur.execute(
+            """
+            INSERT INTO event_store (
+                id, tenant_id, event_type, event_key, payload_json,
+                status, retries, next_retry_at, last_error_code, last_error_message,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                EVENT_ID,
+                TENANT_ID,
+                "sale",
+                EVENT_KEY,
+                '{"test": true}',
+                "FAILED",
+                5,
+                None,
+                "MAPPING_NOT_FOUND",
+                "Product mapping not found",
+                now - 20,
+                now,
+            ),
+        )
+
+        cur.execute(
+            """
+            INSERT INTO errors (
+                id, event_id, tenant_id, error_code, message,
+                payload_snapshot, response_body, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ERROR_ID,
+                EVENT_ID,
+                TENANT_ID,
+                "MAPPING_NOT_FOUND",
+                "Product mapping not found",
+                '{"test": true}',
+                None,
+                now,
+            ),
+        )
+
+        conn.commit()
+        print("FAILED test event inserted with error log")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -29,7 +29,7 @@ def require_admin_api_token(
     expected = _get_admin_api_token()
 
     if not expected:
-        log.warning("ADMIN_API_TOKEN not set — admin API auth is disabled")
+        log.debug("ADMIN_API_TOKEN not set — admin API auth is disabled")
         return
 
     if credentials is None:

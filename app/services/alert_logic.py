@@ -32,7 +32,7 @@ def build_alert_snapshot(
     stock_sync_errors_count: int,
 ) -> AlertSnapshot:
     if worker_last_seen_at is None:
-        worker_status = "missing_heartbeat"
+        worker_status = "stale"
         worker_problem = True
     elif (now_ts - int(worker_last_seen_at)) > stale_after_sec:
         worker_status = "stale"

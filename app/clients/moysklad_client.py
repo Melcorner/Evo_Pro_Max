@@ -93,7 +93,50 @@ class MoySkladClient:
         self._handle_error(r)
         return r.json()
 
-    def create_sale_document(self, payload):
+    def find_demand_by_external_code(self, external_code: str) -> dict | None:
+        """
+        Ищет demand в МойСклад по externalCode.
+        Используется для идемпотентного создания — защита от дублей при retry.
+        """
+        external_code = (external_code or "").strip()
+        if not external_code:
+            return None
+        url = f"{self.BASE_URL}/entity/demand"
+        r = requests.get(
+            url,
+            headers=self._headers(),
+            params={"filter": f"externalCode={external_code}"},
+            timeout=20,
+        )
+        self._handle_error(r)
+        rows = r.json().get("rows", [])
+        return rows[0] if rows else None
+
+    def create_sale_document(self, payload: dict, external_code: str | None = None):
+        """
+        Создаёт demand в МойСклад.
+        Если external_code передан — сначала ищет существующий demand по externalCode,
+        и возвращает его без повторного создания (идемпотентность при retry).
+        """
+        external_code = (external_code or payload.get("syncId") or "").strip()
+
+        if external_code:
+            existing = self.find_demand_by_external_code(external_code)
+            if existing:
+                log.info(
+                    "Demand already exists externalCode=%s id=%s — skipping create (idempotent)",
+                    external_code,
+                    existing.get("id"),
+                )
+                return {
+                    "success": True,
+                    "result_ref": existing.get("id"),
+                    "raw_response": existing,
+                    "idempotent": True,
+                }
+            payload = dict(payload)
+            payload["externalCode"] = external_code
+
         if "httpbin.org" in self.BASE_URL:
             url = f"{self.BASE_URL}/post"
         else:
@@ -112,6 +155,7 @@ class MoySkladClient:
             "success": True,
             "result_ref": result_ref,
             "raw_response": response_json,
+            "idempotent": False,
         }
 
     # -----------------------------

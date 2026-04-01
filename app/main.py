@@ -160,7 +160,12 @@ def health():
                 pass
 
     overall_status = "ok"
-    if worker_is_stale or event_counts["FAILED"] > 0 or stock_error_count > 0:
+    if (
+        worker_is_stale
+        or event_counts["FAILED"] > 0
+        or event_counts["RETRY"] > 0
+        or stock_error_count > 0
+    ):
         overall_status = "degraded"
 
     return {

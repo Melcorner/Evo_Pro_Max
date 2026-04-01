@@ -26,7 +26,7 @@ def _format_ts(ts: int | None) -> str:
 
 def _worker_status(last_seen_at: int | None, now_ts: int) -> str:
     if last_seen_at is None:
-        return "unknown"
+        return "stale"
     if (now_ts - int(last_seen_at)) > WORKER_STALE_AFTER_SEC:
         return "stale"
     return "ok"
@@ -110,6 +110,20 @@ def _load_dashboard_snapshot() -> dict:
 
         cur.execute(
             """
+            SELECT COUNT(*) AS cnt
+            FROM stock_sync_status
+            WHERE status = 'error'
+            """
+        )
+        stock_error_row = cur.fetchone()
+        stock_error_count = stock_error_row["cnt"] if stock_error_row else 0
+
+        cur.execute("SELECT MAX(last_sync_at) AS last_sync_at FROM stock_sync_status")
+        stock_last_sync_row = cur.fetchone()
+        stock_last_sync_at = stock_last_sync_row["last_sync_at"] if stock_last_sync_row else None
+
+        cur.execute(
+            """
             SELECT
                 id,
                 tenant_id,
@@ -151,7 +165,12 @@ def _load_dashboard_snapshot() -> dict:
         latency["last_done_event"] = last_done
 
     overall_status = "ok"
-    if worker_status != "ok" or event_counts["FAILED"] > 0 or event_counts["RETRY"] > 0:
+    if (
+        worker_status != "ok"
+        or event_counts["FAILED"] > 0
+        or event_counts["RETRY"] > 0
+        or stock_error_count > 0
+    ):
         overall_status = "degraded"
 
     return {
@@ -169,6 +188,10 @@ def _load_dashboard_snapshot() -> dict:
         },
         "errors": errors,
         "latency": latency,
+        "stock_sync": {
+            "tenants_with_error": stock_error_count,
+            "last_sync_at": stock_last_sync_at,
+        },
     }
 
 
@@ -216,6 +239,7 @@ def dashboard():
         ("RETRY", counts["RETRY"]),
         ("FAILED", counts["FAILED"]),
         ("Worker", worker["status"]),
+        ("Stock sync errors", snapshot["stock_sync"]["tenants_with_error"]),
         (
             "Avg latency, sec",
             latency["avg_latency_sec"] if latency["avg_latency_sec"] is not None else "-",

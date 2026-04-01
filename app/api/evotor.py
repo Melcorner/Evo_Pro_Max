@@ -12,19 +12,30 @@ log = logging.getLogger("api.evotor")
 async def user_token(request: Request):
     """
     Эвотор передаёт токен облака для авторизации запросов к REST API Эвотор.
-    Сохраняем токен по userId или по evotor_api_key.
+
+    Корректный путь резолва:
+    1) по userId/userUuid, если tenant уже связан с пользователем Эвотор,
+    2) иначе по единственному tenant без evotor_user_id.
+
+    Не используем fallback по evotor_api_key == token: это разные сущности.
     """
     try:
         body = await request.json()
     except Exception as e:
-        log.error(f"Failed to parse /user/token body: {e}")
+        log.error("Failed to parse /user/token body: %s", e)
         raise HTTPException(status_code=400, detail="invalid json body")
-
-    log.info(f"POST /user/token userId={body.get('userId') or body.get('userUuid')} token_exists={bool(body.get('token'))}")
 
     user_id = body.get("userId") or body.get("userUuid")
     token = body.get("token")
 
+    log.info(
+        "POST /user/token userId=%s token_exists=%s",
+        user_id,
+        bool(token),
+    )
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="userId or userUuid is required")
     if not token:
         raise HTTPException(status_code=400, detail="token is required")
 
@@ -32,33 +43,66 @@ async def user_token(request: Request):
     try:
         cursor = conn.cursor()
 
-        updated = 0
+        # 1. Сначала ищем уже привязанный tenant по evotor_user_id.
+        cursor.execute(
+            """
+            SELECT id
+            FROM tenants
+            WHERE evotor_user_id = ?
+            ORDER BY created_at DESC
+            """,
+            (user_id,),
+        )
+        rows = cursor.fetchall()
 
-        # 1. Сначала пытаемся найти tenant по user_id
-        if user_id:
-            cursor.execute("""
-                UPDATE tenants
-                SET evotor_token = ?, evotor_user_id = ?
-                WHERE evotor_user_id = ?
-            """, (token, user_id, user_id))
-            updated = cursor.rowcount
+        if len(rows) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Ambiguous tenant mapping for userId. Resolve duplicate evotor_user_id first.",
+            )
 
-        # 2. Если не нашли — пробуем привязать по evotor_api_key
-        if updated == 0:
-            cursor.execute("""
-                UPDATE tenants
-                SET evotor_token = ?, evotor_user_id = ?
-                WHERE evotor_api_key = ?
-            """, (token, user_id, token))
-            updated = cursor.rowcount
+        target_tenant_id = None
+        if len(rows) == 1:
+            target_tenant_id = rows[0]["id"]
+        else:
+            # 2. Иначе допускаем привязку только к одному "свободному" tenant.
+            cursor.execute(
+                """
+                SELECT id
+                FROM tenants
+                WHERE evotor_user_id IS NULL OR TRIM(evotor_user_id) = ''
+                ORDER BY created_at DESC
+                """
+            )
+            free_rows = cursor.fetchall()
 
+            if len(free_rows) == 1:
+                target_tenant_id = free_rows[0]["id"]
+            elif len(free_rows) == 0:
+                raise HTTPException(status_code=404, detail="tenant not found")
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Multiple tenants without evotor_user_id. Cannot safely bind token automatically.",
+                )
+
+        cursor.execute(
+            """
+            UPDATE tenants
+            SET evotor_token = ?, evotor_user_id = ?
+            WHERE id = ?
+            """,
+            (token, user_id, target_tenant_id),
+        )
         conn.commit()
 
-        if updated == 0:
-            raise HTTPException(status_code=404, detail="tenant not found")
-
-        log.info(f"Evotor cloud token saved userId={user_id} token_exists={bool(token)}")
-        return {"status": "ok"}
+        log.info(
+            "Evotor cloud token saved tenant_id=%s userId=%s token_exists=%s",
+            target_tenant_id,
+            user_id,
+            bool(token),
+        )
+        return {"status": "ok", "tenant_id": target_tenant_id}
 
     finally:
         conn.close()
@@ -72,16 +116,16 @@ async def user_create(request: Request):
     try:
         body = await request.json()
     except Exception as e:
-        log.error(f"Failed to parse /user/create body: {e}")
+        log.error("Failed to parse /user/create body: %s", e)
         raise HTTPException(status_code=400, detail="invalid json body")
 
-    log.info(f"POST /user/create body={json.dumps(body, ensure_ascii=False)}")
+    log.info("POST /user/create body=%s", json.dumps(body, ensure_ascii=False))
 
     user_id = body.get("userId") or body.get("id")
 
     return {
         "status": "ok",
-        "userId": user_id
+        "userId": user_id,
     }
 
 
@@ -93,10 +137,10 @@ async def user_verify(request: Request):
     try:
         body = await request.json()
     except Exception as e:
-        log.error(f"Failed to parse /user/verify body: {e}")
+        log.error("Failed to parse /user/verify body: %s", e)
         raise HTTPException(status_code=400, detail="invalid json body")
 
-    log.info(f"POST /user/verify body={json.dumps(body, ensure_ascii=False)}")
+    log.info("POST /user/verify body=%s", json.dumps(body, ensure_ascii=False))
 
     return {"status": "ok"}
 
@@ -110,10 +154,10 @@ async def receive_documents(request: Request):
     try:
         body = await request.json()
     except Exception as e:
-        log.error(f"Failed to parse PUT / body: {e}")
+        log.error("Failed to parse PUT / body: %s", e)
         raise HTTPException(status_code=400, detail="invalid json body")
 
-    log.info(f"PUT / (documents) body={json.dumps(body, ensure_ascii=False)}")
+    log.info("PUT / (documents) body=%s", json.dumps(body, ensure_ascii=False))
 
     return {"status": "ok"}
 
@@ -126,9 +170,9 @@ async def subscription_event(request: Request):
     try:
         body = await request.json()
     except Exception as e:
-        log.error(f"Failed to parse /subscription/event body: {e}")
+        log.error("Failed to parse /subscription/event body: %s", e)
         raise HTTPException(status_code=400, detail="invalid json body")
 
-    log.info(f"POST /subscription/event body={json.dumps(body, ensure_ascii=False)}")
+    log.info("POST /subscription/event body=%s", json.dumps(body, ensure_ascii=False))
 
     return {"status": "ok"}
