@@ -12,7 +12,7 @@ router = APIRouter(tags=["Tenants"])
 
 class TenantCreate(BaseModel):
     name: str
-    evotor_api_key: str
+    evotor_api_key: str = ""
     moysklad_token: str
 
 
@@ -28,7 +28,6 @@ class TenantFiscalConfig(BaseModel):
     fiscal_token: str
     fiscal_client_uid: str
     fiscal_device_uid: str
-
 
 class TenantPublic(BaseModel):
     id: str
@@ -59,13 +58,18 @@ def create_tenant(body: TenantCreate):
         INSERT INTO tenants (id, name, evotor_api_key, moysklad_token, created_at)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (tenant_id, body.name, body.evotor_api_key, body.moysklad_token, now),
+        (
+            tenant_id,
+            body.name,
+            body.evotor_api_key or "",
+            body.moysklad_token,
+            now,
+        ),
     )
     conn.commit()
     conn.close()
 
     return {"id": tenant_id}
-
 
 @router.patch("/tenants/{tenant_id}/moysklad")
 def configure_moysklad(tenant_id: str, body: TenantMoySkladConfig):

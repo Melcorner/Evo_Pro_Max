@@ -460,47 +460,76 @@ def _detect_barcode_format(value: str) -> str:
 _price_type_meta_cache: dict[str, dict] = {}
 _currency_meta_cache: dict[str, dict] = {}
 
+def _extract_rows_from_ms_response(data) -> list:
+    if isinstance(data, dict):
+        rows = data.get("rows", [])
+        return rows if isinstance(rows, list) else []
+
+    if isinstance(data, list):
+        return data
+
+    return []
 
 def _get_default_price_type_meta(ms_token: str) -> dict:
     """Получает meta дефолтного priceType из МойСклад и кэширует на lifetime процесса."""
     cached = _price_type_meta_cache.get(ms_token)
     if cached:
         return cached
+
     url = f"{MS_BASE}/context/companysettings/pricetype"
     r = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
     if not r.ok:
         log.error("Failed to fetch priceType list status=%s body=%s", r.status_code, r.text)
         r.raise_for_status()
-    rows = r.json().get("rows", [])
+
+    rows = _extract_rows_from_ms_response(r.json())
     if not rows:
         raise ValueError("No price types found in MoySklad companysettings")
-    meta = rows[0]["meta"]
+
+    first = rows[0]
+    if not isinstance(first, dict) or "meta" not in first:
+        raise ValueError("Invalid price type response structure from MoySklad")
+
+    meta = first["meta"]
     _price_type_meta_cache[ms_token] = meta
     return meta
-
 
 def _get_default_currency_meta(ms_token: str) -> dict:
     """Получает meta дефолтной (национальной) валюты и кэширует на lifetime процесса."""
     cached = _currency_meta_cache.get(ms_token)
     if cached:
         return cached
+
     url = f"{MS_BASE}/entity/currency"
-    r = requests.get(url, headers=_ms_headers(ms_token), params={"filter": "default=true"}, timeout=20)
+    r = requests.get(
+        url,
+        headers=_ms_headers(ms_token),
+        params={"filter": "default=true"},
+        timeout=20,
+    )
     if not r.ok:
         log.error("Failed to fetch currency list status=%s body=%s", r.status_code, r.text)
         r.raise_for_status()
-    rows = r.json().get("rows", [])
+
+    rows = _extract_rows_from_ms_response(r.json())
+
     if not rows:
-        # fallback: берём первую валюту без фильтра
         r2 = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
-        r2.raise_for_status()
-        rows = r2.json().get("rows", [])
+        if not r2.ok:
+            log.error("Failed to fetch fallback currency list status=%s body=%s", r2.status_code, r2.text)
+            r2.raise_for_status()
+        rows = _extract_rows_from_ms_response(r2.json())
+
     if not rows:
         raise ValueError("No currencies found in MoySklad")
-    meta = rows[0]["meta"]
+
+    first = rows[0]
+    if not isinstance(first, dict) or "meta" not in first:
+        raise ValueError("Invalid currency response structure from MoySklad")
+
+    meta = first["meta"]
     _currency_meta_cache[ms_token] = meta
     return meta
-
 
 def _create_ms_product(ms_token: str, product: dict) -> str:
     price_type_meta = _get_default_price_type_meta(ms_token)
@@ -555,9 +584,11 @@ def initial_sync(tenant_id: str):
         )
 
     if not tenant.get("evotor_token"):
-        raise HTTPException(status_code=400, detail="evotor_token not configured")
+        raise HTTPException(status_code=409, detail="Evotor token is not connected yet")
+
     if not tenant.get("evotor_store_id"):
-        raise HTTPException(status_code=400, detail="evotor_store_id not configured")
+        raise HTTPException(status_code=409, detail="Evotor store is not selected yet")
+
     if not tenant.get("moysklad_token"):
         raise HTTPException(status_code=400, detail="moysklad_token not configured")
 
@@ -623,7 +654,7 @@ def initial_sync(tenant_id: str):
             log.warning("Mapping conflict evotor_id=%s ms_id=%s", evotor_id, ms_id)
             failed += 1
 
-    if failed == 0:
+    if failed == 0 and synced > 0:
         conn = get_connection()
         conn.execute("UPDATE tenants SET sync_completed_at = ? WHERE id = ?", (_now(), tenant_id))
         conn.commit()

@@ -21,6 +21,7 @@ from app.api.evotor import router as evotor_router
 from app.api.sync import router as sync_router
 from app.api.moysklad_webhooks import router as moysklad_webhooks_router
 from app.api.monitoring import router as monitoring_router
+from app.api.onboarding import router as onboarding_router
 
 setup_logging()
 log = logging.getLogger("api")
@@ -56,6 +57,7 @@ app.include_router(events_router, dependencies=admin_dependencies)
 app.include_router(mappings_router, dependencies=admin_dependencies)
 app.include_router(errors_router, dependencies=admin_dependencies)
 app.include_router(monitoring_router, dependencies=admin_dependencies)
+app.include_router(onboarding_router)
 
 # Public / external callbacks
 app.include_router(webhooks_router)

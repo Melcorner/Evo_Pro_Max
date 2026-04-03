@@ -18,7 +18,17 @@ def init_db():
         )
         """
     )
-
+        
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS evotor_connections (
+        id TEXT PRIMARY KEY,
+        evotor_user_id TEXT NOT NULL UNIQUE,
+        evotor_token TEXT NOT NULL,
+        stores_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )
+    """)
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS event_store (

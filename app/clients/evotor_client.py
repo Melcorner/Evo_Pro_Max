@@ -131,3 +131,23 @@ class EvotorClient:
             r.raise_for_status()
 
         log.info(f"Deleted Evotor product id={evotor_product_id}")
+    
+def fetch_stores_by_token(token: str) -> list[dict]:
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{EVOTOR_BASE}/stores"
+
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+
+    data = r.json()
+
+    if isinstance(data, list):
+        return data
+    
+    if isinstance(data, dict):
+        for key in ("items", "stores", "rows"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+
+    raise ValueError(f"Unexpected Evotor /stores response: {type(data).__name__}")  
