@@ -8,6 +8,7 @@ from fastapi import APIRouter, Form, HTTPException
 from fastapi.responses import HTMLResponse
 
 from app.db import get_connection
+from app.clients.evotor_client import fetch_stores_by_token
 
 router = APIRouter(tags=["Onboarding"])
 log = logging.getLogger("api.onboarding")
@@ -116,68 +117,90 @@ def _extract_store_name(store: dict, fallback_id: str) -> str:
     ).strip()
 
 
-def _load_connections() -> list[dict]:
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, evotor_user_id, stores_json, created_at, updated_at
-        FROM evotor_connections
-        ORDER BY updated_at DESC
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return rows
-
-
-def _load_connection(connection_id: str) -> dict:
+def _load_session(session_id: str) -> dict:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT *
-        FROM evotor_connections
+        FROM evotor_onboarding_sessions
         WHERE id = ?
-    """, (connection_id,))
+    """, (session_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
-        raise HTTPException(status_code=404, detail="Evotor connection not found")
+        raise HTTPException(status_code=404, detail="Onboarding session not found")
     return dict(row)
 
 
 @router.get("/onboarding/evotor/connect", response_class=HTMLResponse)
-def onboarding_evotor_connect():
-    rows = _load_connections()
-
-    parts = [
-        """
-        <p><strong>Шаг 1.</strong> Установите или переавторизуйте приложение Эвотор.</p>
-        <p>После этого Эвотор должен вызвать <code>/api/v1/user/token</code>, и здесь появится подключение аккаунта со списком магазинов.</p>
-        """
-    ]
-
-    if not rows:
-        parts.append('<div class="error">Подключения Эвотор пока не найдены.</div>')
-
-    for row in rows:
-        stores = json.loads(row["stores_json"] or "[]")
-        parts.append(f"""
-        <div class="store">
-            <p><strong>Evotor user ID:</strong> <code>{html.escape(row["evotor_user_id"])}</code></p>
-            <p><strong>Магазинов найдено:</strong> {len(stores)}</p>
-            <p><a href="/onboarding/evotor/connections/{html.escape(row["id"])}/stores">Выбрать магазин</a></p>
+def onboarding_token_form():
+    body = """
+    <form method="post" action="/onboarding/evotor/connect">
+        <div class="field">
+            <label>Evotor token</label>
+            <input name="evotor_token" required />
         </div>
-        """)
+        <button type="submit">Получить мои магазины</button>
+    </form>
+    """
+    return HTMLResponse(_layout("Подключение Эвотор", body))
 
-    return HTMLResponse(_layout("Подключение Эвотор", "".join(parts)))
 
+@router.post("/onboarding/evotor/connect", response_class=HTMLResponse)
+def onboarding_token_submit(evotor_token: str = Form(...)):
+    evotor_token = evotor_token.strip()
+    if not evotor_token:
+        body = '<div class="error">Evotor token обязателен.</div>'
+        return HTMLResponse(_layout("Ошибка подключения", body), status_code=400)
 
-@router.get("/onboarding/evotor/connections/{connection_id}/stores", response_class=HTMLResponse)
-def onboarding_evotor_stores(connection_id: str):
-    connection = _load_connection(connection_id)
-    stores = json.loads(connection["stores_json"] or "[]")
+    try:
+        stores = fetch_stores_by_token(evotor_token)
+    except Exception as e:
+        log.exception("Failed to fetch stores by Evotor token")
+        body = f'<div class="error">Не удалось получить магазины по token: {html.escape(str(e))}</div>'
+        return HTMLResponse(_layout("Ошибка подключения", body), status_code=502)
+
+    now = int(time.time())
+    session_id = str(uuid.uuid4())
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO evotor_onboarding_sessions (
+                id, evotor_token, stores_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            session_id,
+            evotor_token,
+            json.dumps(stores, ensure_ascii=False),
+            now,
+            now,
+        ))
+        conn.commit()
+    finally:
+        conn.close()
 
     if not stores:
-        body = '<div class="error">Для этого подключения не найдено ни одного магазина.</div>'
+        body = '<div class="error">По этому token не найдено ни одного магазина.</div>'
+        return HTMLResponse(_layout("Магазины не найдены", body), status_code=400)
+
+    stores_link = f"/onboarding/evotor/sessions/{session_id}/stores"
+    body = f"""
+    <div class="success">Магазины успешно получены.</div>
+    <p><a href="{html.escape(stores_link)}">Перейти к выбору магазина</a></p>
+    """
+    return HTMLResponse(_layout("Подключение Эвотор", body))
+
+
+@router.get("/onboarding/evotor/sessions/{session_id}/stores", response_class=HTMLResponse)
+def onboarding_evotor_stores(session_id: str):
+    session = _load_session(session_id)
+    stores = json.loads(session["stores_json"] or "[]")
+
+    if not stores:
+        body = '<div class="error">Для этой onboarding-сессии магазины не найдены.</div>'
         return HTMLResponse(_layout("Выбор магазина", body), status_code=400)
 
     parts = []
@@ -191,18 +214,18 @@ def onboarding_evotor_stores(connection_id: str):
         <div class="store">
             <p><strong>Магазин:</strong> {html.escape(store_name)}</p>
             <p><strong>Store ID:</strong> <code>{html.escape(store_id)}</code></p>
-            <p><a href="/onboarding/evotor/connections/{html.escape(connection_id)}/stores/{html.escape(store_id)}/profile">Создать профиль для этого магазина</a></p>
+            <p><a href="/onboarding/evotor/sessions/{html.escape(session_id)}/stores/{html.escape(store_id)}/profile">Создать профиль для этого магазина</a></p>
         </div>
         """)
 
     return HTMLResponse(_layout("Выбор магазина Эвотор", "".join(parts)))
 
 
-@router.get("/onboarding/evotor/connections/{connection_id}/stores/{store_id}/profile", response_class=HTMLResponse)
-def onboarding_profile_form(connection_id: str, store_id: str):
+@router.get("/onboarding/evotor/sessions/{session_id}/stores/{store_id}/profile", response_class=HTMLResponse)
+def onboarding_profile_form(session_id: str, store_id: str):
     body = f"""
     <form method="post" action="/onboarding/store-profile">
-        <input type="hidden" name="connection_id" value="{html.escape(connection_id)}" />
+        <input type="hidden" name="session_id" value="{html.escape(session_id)}" />
         <input type="hidden" name="evotor_store_id" value="{html.escape(store_id)}" />
 
         <div class="field">
@@ -253,7 +276,7 @@ def onboarding_profile_form(connection_id: str, store_id: str):
 
 @router.post("/onboarding/store-profile", response_class=HTMLResponse)
 def onboarding_store_profile_submit(
-    connection_id: str = Form(...),
+    session_id: str = Form(...),
     evotor_store_id: str = Form(...),
     name: str = Form(...),
     moysklad_token: str = Form(...),
@@ -264,7 +287,7 @@ def onboarding_store_profile_submit(
     fiscal_client_uid: str = Form(""),
     fiscal_device_uid: str = Form(""),
 ):
-    connection = _load_connection(connection_id)
+    session = _load_session(session_id)
 
     tenant_id = str(uuid.uuid4())
     now = int(time.time())
@@ -276,8 +299,8 @@ def onboarding_store_profile_submit(
         cur.execute("""
             SELECT id
             FROM tenants
-            WHERE evotor_user_id = ? AND evotor_store_id = ?
-        """, (connection["evotor_user_id"], evotor_store_id))
+            WHERE evotor_store_id = ?
+        """, (evotor_store_id,))
         existing = cur.fetchone()
         if existing:
             body = f'<div class="error">Профиль для этого магазина уже существует: <code>{html.escape(existing["id"])}</code></div>'
@@ -287,10 +310,10 @@ def onboarding_store_profile_submit(
             """
             INSERT INTO tenants (
                 id, name, evotor_api_key, moysklad_token, created_at,
-                evotor_user_id, evotor_token, evotor_store_id,
+                evotor_token, evotor_store_id,
                 ms_organization_id, ms_store_id, ms_agent_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 tenant_id,
@@ -298,8 +321,7 @@ def onboarding_store_profile_submit(
                 "",
                 moysklad_token.strip(),
                 now,
-                connection["evotor_user_id"],
-                connection["evotor_token"],
+                session["evotor_token"],
                 evotor_store_id.strip(),
                 ms_organization_id.strip(),
                 ms_store_id.strip(),
@@ -320,6 +342,12 @@ def onboarding_store_profile_submit(
             ))
 
         conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        log.exception("Failed to create store profile")
+        body = f'<div class="error">Не удалось создать профиль магазина: {html.escape(str(e))}</div>'
+        return HTMLResponse(_layout("Ошибка создания профиля", body), status_code=500)
     finally:
         conn.close()
 

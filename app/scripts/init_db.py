@@ -29,6 +29,17 @@ def init_db():
         updated_at INTEGER NOT NULL
     )
     """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS evotor_onboarding_sessions (
+        id TEXT PRIMARY KEY,
+        evotor_token TEXT NOT NULL,
+        stores_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )
+    """)
+
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS event_store (
