@@ -263,3 +263,60 @@ def list_tenants():
         )
 
     return result
+@router.delete("/tenants/{tenant_id}")
+def delete_tenant(tenant_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id, name FROM tenants WHERE id = ?", (tenant_id,))
+    tenant = cur.fetchone()
+    if not tenant:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    try:
+        cur.execute("BEGIN")
+
+        cur.execute("DELETE FROM mappings WHERE tenant_id = ?", (tenant_id,))
+        deleted_mappings = cur.rowcount
+
+        cur.execute("DELETE FROM errors WHERE tenant_id = ?", (tenant_id,))
+        deleted_errors = cur.rowcount
+
+        cur.execute("DELETE FROM stock_sync_status WHERE tenant_id = ?", (tenant_id,))
+        deleted_stock_sync_status = cur.rowcount
+
+        cur.execute("DELETE FROM fiscalization_checks WHERE tenant_id = ?", (tenant_id,))
+        deleted_fiscalization_checks = cur.rowcount
+
+        cur.execute("DELETE FROM processed_events WHERE tenant_id = ?", (tenant_id,))
+        deleted_processed_events = cur.rowcount
+
+        cur.execute("DELETE FROM event_store WHERE tenant_id = ?", (tenant_id,))
+        deleted_event_store = cur.rowcount
+
+        cur.execute("DELETE FROM tenants WHERE id = ?", (tenant_id,))
+        deleted_tenants = cur.rowcount
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "status": "ok",
+        "deleted": {
+            "tenant_id": tenant_id,
+            "tenant_name": tenant["name"],
+            "tenants": deleted_tenants,
+            "mappings": deleted_mappings,
+            "errors": deleted_errors,
+            "stock_sync_status": deleted_stock_sync_status,
+            "fiscalization_checks": deleted_fiscalization_checks,
+            "processed_events": deleted_processed_events,
+            "event_store": deleted_event_store,
+        }
+    }

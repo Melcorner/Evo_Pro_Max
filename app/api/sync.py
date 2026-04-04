@@ -247,10 +247,6 @@ def _map_ms_tracking_type_to_evotor_type(ms_product: dict, current_type: str | N
 
     mapping = {
         "MILK": "DAIRY_MARKED",
-        # reserve room for future extensions if/when those categories appear in MS:
-        # "WATER": "WATER_MARKED",
-        # "TOBACCO": "TOBACCO_MARKED",
-        # "MEDICINE": "MEDICINE_MARKED",
     }
 
     evotor_type = mapping.get(str(tracking_type).upper())
@@ -318,14 +314,11 @@ def _build_evotor_product_payload(
         payload.pop("barcodes", None)
 
     classification_code = _extract_classification_code(ms_product)
-    # Evotor rejects classification_code for at least DAIRY_MARKED with
-    # validation "must be null", so do not send it for marked milk.
     if classification_code and payload.get("type") not in {"DAIRY_MARKED"}:
         payload["classification_code"] = classification_code
     else:
         payload.pop("classification_code", None)
 
-    # Product sync must not overwrite stock. Preserve quantity if the product already exists.
     if current_product and "quantity" in current_product:
         payload["quantity"] = current_product["quantity"]
 
@@ -369,11 +362,6 @@ def _search_ms_products(ms_token: str, search: str | None = None, limit: int = 1
 
 
 def _get_ms_product_stock(ms_token: str, ms_product_id: str) -> float:
-    """
-    Читает остаток товара через /report/stock/all.
-    Использование assortment ненадёжно: при нулевом остатке rows может быть пустым.
-    /report/stock/all всегда возвращает строку для товара, даже при quantity=0.
-    """
     url = f"{MS_BASE}/report/stock/all"
     params = {"filter": f"product={MS_BASE}/entity/product/{ms_product_id}"}
     r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
@@ -384,7 +372,6 @@ def _get_ms_product_stock(ms_token: str, ms_product_id: str) -> float:
     data = r.json()
     rows = data.get("rows", []) if isinstance(data, dict) else []
     if not rows:
-        # Товар не найден в отчёте — возвращаем 0 (не исключение)
         log.warning("Product %s not found in MoySklad stock report, returning 0", ms_product_id)
         return 0.0
 
@@ -398,7 +385,6 @@ def _get_ms_product_stock(ms_token: str, ms_product_id: str) -> float:
         except (TypeError, ValueError):
             pass
 
-    # Строка есть, но поля остатка нет — товар найден, остаток 0
     log.warning("Stock field not found for product %s, returning 0", ms_product_id)
     return 0.0
 
@@ -418,14 +404,6 @@ def _get_evotor_products(evotor_token: str, store_id: str) -> list:
 
 
 def _find_ms_product_by_external_code(ms_token: str, external_code: str) -> str | None:
-    """
-    Ищет товар в МойСклад по externalCode (= evotor_id).
-    Используется в initial_sync для защиты от дублей при повторном запуске
-    после частичного падения: если товар уже создан, но mapping не сохранился.
-
-    При любой HTTP-ошибке бросает исключение — не возвращает None,
-    чтобы не пропустить сетевой сбой и не создать дубль.
-    """
     url = f"{MS_BASE}/entity/product"
     params = {"filter": f"externalCode={external_code}"}
     r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
@@ -456,22 +434,48 @@ def _detect_barcode_format(value: str) -> str:
     return "code128"
 
 
-# Fix 7 (Major): кэш для мета дефолтного priceType — href без UUID вызывает 400
+# ------------------------------------------------------------------------------
+# Маппинги Эвотор → МойСклад (используются при initial sync)
+# ------------------------------------------------------------------------------
+
+# Эвотор tax → МС vat + vatEnabled
+EVOTOR_TAX_TO_MS: dict[str, dict] = {
+    "NO_VAT":  {"vat": 0,  "vatEnabled": False},
+    "VAT_0":   {"vat": 0,  "vatEnabled": True},
+    "VAT_5":   {"vat": 5,  "vatEnabled": True},
+    "VAT_7":   {"vat": 7,  "vatEnabled": True},
+    "VAT_10":  {"vat": 10, "vatEnabled": True},
+    "VAT_18":  {"vat": 18, "vatEnabled": True},
+    "VAT_20":  {"vat": 20, "vatEnabled": True},
+    "VAT_22":  {"vat": 22, "vatEnabled": True},
+}
+
+# Эвотор type → МС trackingType
+# NORMAL намеренно отсутствует — МС ставит NOT_TRACKED по умолчанию,
+# явная передача NOT_TRACKED вызывает ошибку валидации для ряда товаров.
+EVOTOR_TYPE_TO_MS_TRACKING: dict[str, str] = {
+    "DAIRY_MARKED":    "MILK",
+    "TOBACCO_MARKED":  "TOBACCO",
+    "SHOES_MARKED":    "SHOES",
+    "MEDICINE_MARKED": "MEDICINE",
+    "WATER":           "WATER",
+}
+
+# Fix 7: кэш для мета дефолтного priceType и валюты
 _price_type_meta_cache: dict[str, dict] = {}
 _currency_meta_cache: dict[str, dict] = {}
+
 
 def _extract_rows_from_ms_response(data) -> list:
     if isinstance(data, dict):
         rows = data.get("rows", [])
         return rows if isinstance(rows, list) else []
-
     if isinstance(data, list):
         return data
-
     return []
 
+
 def _get_default_price_type_meta(ms_token: str) -> dict:
-    """Получает meta дефолтного priceType из МойСклад и кэширует на lifetime процесса."""
     cached = _price_type_meta_cache.get(ms_token)
     if cached:
         return cached
@@ -494,8 +498,8 @@ def _get_default_price_type_meta(ms_token: str) -> dict:
     _price_type_meta_cache[ms_token] = meta
     return meta
 
+
 def _get_default_currency_meta(ms_token: str) -> dict:
-    """Получает meta дефолтной (национальной) валюты и кэширует на lifetime процесса."""
     cached = _currency_meta_cache.get(ms_token)
     if cached:
         return cached
@@ -531,9 +535,11 @@ def _get_default_currency_meta(ms_token: str) -> dict:
     _currency_meta_cache[ms_token] = meta
     return meta
 
+
 def _create_ms_product(ms_token: str, product: dict) -> str:
     price_type_meta = _get_default_price_type_meta(ms_token)
     currency_meta = _get_default_currency_meta(ms_token)
+
     payload = {
         "name": product["name"],
         "externalCode": product["id"],
@@ -553,16 +559,46 @@ def _create_ms_product(ms_token: str, product: dict) -> str:
             "currency": {"meta": currency_meta},
         }
 
+    # --- НДС ---
+    evotor_tax = str(product.get("tax") or "").strip().upper()
+    if evotor_tax:
+        vat_fields = EVOTOR_TAX_TO_MS.get(evotor_tax)
+        if vat_fields:
+            payload["vat"] = vat_fields["vat"]
+            payload["vatEnabled"] = vat_fields["vatEnabled"]
+        else:
+            log.warning(
+                "Unknown Evotor tax=%s for product id=%s — skipping VAT fields",
+                evotor_tax,
+                product.get("id"),
+            )
+
+    # --- Маркировка ---
+    evotor_type = str(product.get("type") or "NORMAL").strip().upper()
+    ms_tracking = EVOTOR_TYPE_TO_MS_TRACKING.get(evotor_type)
+    if ms_tracking:
+        payload["trackingType"] = ms_tracking
+    # NORMAL → не передаём trackingType, МС ставит NOT_TRACKED сам
+
+    # --- Штрихкоды ---
     barcodes = product.get("barcodes", [])
     if barcodes:
-        # Передаём все штрихкоды и определяем их формат
-        payload["barcodes"] = [{_detect_barcode_format(bc): str(bc).strip()} for bc in barcodes if str(bc).strip()]
+        payload["barcodes"] = [
+            {_detect_barcode_format(bc): str(bc).strip()}
+            for bc in barcodes
+            if str(bc).strip()
+        ]
 
     url = f"{MS_BASE}/entity/product"
     r = requests.post(url, headers=_ms_headers(ms_token), json=payload, timeout=20)
 
     if not r.ok:
-        log.error("MoySklad create product error status=%s body=%s", r.status_code, r.text)
+        log.error(
+            "MoySklad create product error status=%s body=%s payload=%s",
+            r.status_code,
+            r.text,
+            payload,
+        )
         r.raise_for_status()
 
     ms_product = r.json()
@@ -626,11 +662,6 @@ def initial_sync(tenant_id: str):
             continue
 
         try:
-            # Защита от дублей: ищем товар по externalCode=evotor_id.
-            # Если товар уже есть в МойСклад — сохраняем только mapping, не создаём.
-            # Если поиск вернул HTTP-ошибку (401, 429, 5xx, сеть) — бросаем исключение.
-            # Это останавливает обработку текущего товара (записывается в errors/failed)
-            # и переходит к следующему, не создавая дубль при неопределённом состоянии.
             ms_id = _find_ms_product_by_external_code(tenant["moysklad_token"], evotor_id)
             if ms_id:
                 log.info(
@@ -640,7 +671,14 @@ def initial_sync(tenant_id: str):
                 )
             else:
                 ms_id = _create_ms_product(tenant["moysklad_token"], product)
-                log.info("Created MS product evotor_id=%s ms_id=%s name=%s", evotor_id, ms_id, product.get("name"))
+                log.info(
+                    "Created MS product evotor_id=%s ms_id=%s name=%s tax=%s type=%s",
+                    evotor_id,
+                    ms_id,
+                    product.get("name"),
+                    product.get("tax"),
+                    product.get("type"),
+                )
         except Exception as e:
             log.error("Failed to create MS product evotor_id=%s name=%s err=%s", evotor_id, product.get("name"), e)
             failed += 1
@@ -1049,10 +1087,6 @@ def sync_stock_to_evotor(tenant_id: str, ms_product_id: str):
         stock_value = ms_client.get_product_stock(ms_product_id)
         evotor_client.update_product_stock(evotor_product_id, stock_value)
 
-        # Одиночная синхронизация не затирает статус и счётчики reconcile.
-        # Если запись уже есть — сохраняем status/счётчики, обновляем только last_sync_at.
-        # Если записи ещё нет (reconcile ни разу не запускался) — создаём с базовыми значениями,
-        # чтобы /stock/status показывал last_sync_time, а не "configured".
         existing = _get_stock_status_row(tenant_id)
         _upsert_stock_status(
             tenant_id=tenant_id,
@@ -1085,8 +1119,7 @@ def sync_stock_to_evotor(tenant_id: str, ms_product_id: str):
         )
         raise HTTPException(status_code=502, detail=f"Failed to sync stock to Evotor: {err_text}")
 
-# ------------------------------------------------------------------------------
-# Fiscalization: MoySklad demand -> Evotor receipt
+
 # ------------------------------------------------------------------------------
 # Fiscalization: MoySklad demand -> fiscalization24.ru
 # ------------------------------------------------------------------------------
@@ -1105,21 +1138,17 @@ VAT_MS_TO_FISCAL = {
 
 # Маппинг типов товаров Эвотор → fiscalization24
 EVOTOR_TYPE_TO_FISCAL = {
-    "NORMAL":        0,   # обычный
-    "DAIRY_MARKED":  12,  # молочная продукция
-    "ALCOHOL_MARKED": 1,  # маркированный алкоголь
-    "TOBACCO_MARKED": 4,  # маркированный табак
-    "SHOES_MARKED":  5,   # маркированная обувь
-    "MEDICINE_MARKED": 6, # маркированные лекарства
-    "WATER":         13,  # вода
+    "NORMAL":         0,   # обычный
+    "DAIRY_MARKED":   12,  # молочная продукция
+    "ALCOHOL_MARKED":  1,  # маркированный алкоголь
+    "TOBACCO_MARKED":  4,  # маркированный табак
+    "SHOES_MARKED":    5,  # маркированная обувь
+    "MEDICINE_MARKED": 6,  # маркированные лекарства
+    "WATER":          13,  # вода
 }
 
 
 def _money_from_ms(value) -> float:
-    """
-    МойСклад хранит денежные значения в копейках.
-    fiscalization24 по документации ожидает число с точкой до второго знака.
-    """
     try:
         return round(float(value or 0) / 100.0, 2)
     except (TypeError, ValueError):
@@ -1127,13 +1156,12 @@ def _money_from_ms(value) -> float:
 
 
 def _fetch_demand_positions(ms_token: str, positions_raw) -> list:
-    """Читает позиции demand — inline список или meta-ссылка."""
     if isinstance(positions_raw, dict) and "meta" in positions_raw:
         pos_url = positions_raw["meta"]["href"]
         r = requests.get(
             pos_url,
             headers=_ms_headers(ms_token),
-            params={"expand": "assortment"},  # нужно для name и trackingType
+            params={"expand": "assortment"},
             timeout=20,
         )
         if not r.ok:
@@ -1160,11 +1188,8 @@ def _map_demand_to_fiscal_check(
         meta = assortment.get("meta", {}) or {}
 
         quantity = round(float(item.get("quantity", 1) or 1), 3)
-
-        # МойСклад отдаёт цены в копейках — переводим в рубли с копейками
         price_value = _money_from_ms(item.get("price"))
 
-        # Fix: корректная логика vatEnabled — None != False
         vat = item.get("vat", 0) or 0
         vat_enabled = item.get("vatEnabled")
         if vat_enabled is False:
@@ -1176,14 +1201,12 @@ def _map_demand_to_fiscal_check(
         tracking_type = assortment.get("trackingType") or "NORMAL"
         product_type = EVOTOR_TYPE_TO_FISCAL.get(str(tracking_type).upper(), 0)
 
-        # Fix 2: discount в позициях demand — процент (0..100)
         discount_percent = float(item.get("discount", 0) or 0)
         if discount_percent < 0 or discount_percent > 100:
             raise ValueError(
                 f"Fiscalization discount must be 0..100, got {discount_percent}"
             )
 
-        # fallback имени
         product_name = (
             assortment.get("name")
             or item.get("name")
@@ -1209,13 +1232,11 @@ def _map_demand_to_fiscal_check(
             "quantity": quantity,
         })
 
-    # Fix 2 (Critical): делим на 100
     total_sum_value = _money_from_ms(demand.get("sum"))
 
     if total_sum_value <= 0:
         raise ValueError(f"Fiscalization total sum must be > 0, got {total_sum_value}")
 
-    # Самопроверка: сравниваем итог по позициям с суммой документа
     calc_sum = round(sum(
         p["price"] * p["quantity"] * (1 - p["discount"] / 100.0)
         for p in fiscal_products
@@ -1370,10 +1391,7 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
     tenant = _load_tenant(tenant_id)
 
     if not tenant.get("sync_completed_at"):
-        raise HTTPException(
-            status_code=409,
-            detail="Initial sync not completed.",
-        )
+        raise HTTPException(status_code=409, detail="Initial sync not completed.")
     if not tenant.get("moysklad_token"):
         raise HTTPException(status_code=400, detail="moysklad_token not configured")
     if not tenant.get("fiscal_token"):
@@ -1441,15 +1459,12 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
         description = result.get("Info") if isinstance(result.get("Info"), str) else None
         error_code = None
         error_message = None
-        # Fix 4 (Major): читаем реальный статус из ответа API вместо хардкода 1
         state = None
         if isinstance(result, dict):
             state = (result.get("CheckState") or result.get("checkState") or {}).get("State")
-        status = int(state) if state is not None else 2  # 2 = sent_to_device как минимум
+        status = int(state) if state is not None else 2
     except Exception as e:
         response_json = str(e)
-        # Fix 5 (Major): transport error — оставляем status=1 (new) для возможности retry,
-        # не ставим status=9 (fiscal error), это разные классы инцидентов
         try:
             _save_fiscal_check(
                 tenant_id, check_uid, ms_demand_id,
@@ -1462,7 +1477,10 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
                 error_message=str(e),
             )
         except Exception:
-            log.exception("Failed to save fiscalization error record tenant_id=%s ms_demand_id=%s", tenant_id, ms_demand_id)
+            log.exception(
+                "Failed to save fiscalization error record tenant_id=%s ms_demand_id=%s",
+                tenant_id, ms_demand_id,
+            )
         raise HTTPException(status_code=502, detail=f"Failed to send check: {e}")
 
     try:
@@ -1506,8 +1524,7 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
 @router.get("/sync/{tenant_id}/fiscalization/{uid}")
 def get_fiscal_check_status(tenant_id: str, uid: str):
     """
-    Получает актуальный статус чека из fiscalization24.ru
-    и обновляет запись в БД.
+    Получает актуальный статус чека из fiscalization24.ru и обновляет запись в БД.
 
     Статусы:
     1  — новый
@@ -1523,7 +1540,6 @@ def get_fiscal_check_status(tenant_id: str, uid: str):
     if not tenant.get("fiscal_token"):
         raise HTTPException(status_code=400, detail="fiscal_token not configured")
 
-    # Проверяем что uid принадлежит этому tenant
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(

@@ -39,12 +39,6 @@ class MappingCreate(BaseModel):
     entity_type: str
     evotor_id: str
     ms_id: str
-    
-class MappingDelete(BaseModel):
-    tenant_id: str
-    entity_type: str
-    evotor_id: str
-    ms_id: str
 
 # ==============================================================================
 # MappingStore instance
@@ -105,19 +99,14 @@ def list_mappings(
         if conditions:
             where_clause = " WHERE " + " AND ".join(conditions)
 
-        # считаем total
         cursor.execute(
             "SELECT COUNT(*) FROM mappings" + where_clause,
             params
         )
         total = cursor.fetchone()[0]
 
-        # получаем данные
         query = base_query + where_clause + " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-        cursor.execute(
-            query,
-            params + [limit, offset]
-        )
+        cursor.execute(query, params + [limit, offset])
         rows = cursor.fetchall()
         items = [dict(r) for r in rows]
 
@@ -162,41 +151,133 @@ def create_mapping(data: MappingCreate):
             "message": "ms_id already mapped to another evotor_id"
         }
 
-    return {
-        "status": "ok"
-    }
+    return {"status": "ok"}
+
+
 # ==============================================================================
-# DELETE /mappings
+# DELETE /mappings/{tenant_id}/{entity_type}/{evotor_id}
+# Удалить один конкретный маппинг
 # ==============================================================================
 
-@router.delete("/", summary="Удалить маппинг по tenant/entity/evotor_id")
-def delete_mapping(data: MappingDelete = Body(...)):
+@router.delete(
+    "/{tenant_id}/{entity_type}/{evotor_id}",
+    summary="Удалить маппинг по evotor_id",
+)
+def delete_mapping(tenant_id: str, entity_type: str, evotor_id: str):
     """
-    Удаляет маппинг Evotor ID <-> MS ID.
-    """
+    Удаляет один маппинг по `tenant_id` + `entity_type` + `evotor_id`.
 
+    Пример:
+    ```
+    DELETE /mappings/my-tenant/product/evotor-uuid-123
+    ```
+    """
     conn = get_connection()
-    cursor = conn.cursor()
-
     try:
+        cursor = conn.cursor()
         cursor.execute(
-            """
-            DELETE FROM mappings
-            WHERE tenant_id=? AND entity_type=? AND evotor_id=?
-            """,
-            (data.tenant_id, data.entity_type, data.evotor_id)
+            "DELETE FROM mappings WHERE tenant_id=? AND entity_type=? AND evotor_id=?",
+            (tenant_id, entity_type, evotor_id),
         )
-
         conn.commit()
 
         if cursor.rowcount == 0:
-            return {"status": "not_found", "message": "Mapping не найден"}
+            raise HTTPException(status_code=404, detail="Маппинг не найден")
 
-        return {"status": "ok", "message": "Mapping удалён"}
+        log.info(
+            "Mapping deleted tenant_id=%s entity_type=%s evotor_id=%s",
+            tenant_id, entity_type, evotor_id,
+        )
+        return {"status": "ok", "deleted": 1}
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"Error deleting mapping: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
 
+
+# ==============================================================================
+# DELETE /mappings/{tenant_id}/{entity_type}
+# Удалить все маппинги тенанта по типу сущности
+# ==============================================================================
+
+@router.delete(
+    "/{tenant_id}/{entity_type}",
+    summary="Удалить все маппинги тенанта по типу сущности",
+)
+def delete_mappings_by_type(tenant_id: str, entity_type: str):
+    """
+    Удаляет все маппинги для `tenant_id` + `entity_type`.
+
+    Полезно для сброса маппингов товаров перед повторным initial sync.
+
+    Пример:
+    ```
+    DELETE /mappings/my-tenant/product
+    ```
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM mappings WHERE tenant_id=? AND entity_type=?",
+            (tenant_id, entity_type),
+        )
+        conn.commit()
+        deleted = cursor.rowcount
+
+        log.info(
+            "Mappings deleted tenant_id=%s entity_type=%s count=%s",
+            tenant_id, entity_type, deleted,
+        )
+        return {"status": "ok", "deleted": deleted}
+
+    except Exception as e:
+        log.error(f"Error deleting mappings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# ==============================================================================
+# DELETE /mappings/{tenant_id}
+# Удалить все маппинги тенанта
+# ==============================================================================
+
+@router.delete(
+    "/{tenant_id}",
+    summary="Удалить все маппинги тенанта",
+)
+def delete_all_tenant_mappings(tenant_id: str):
+    """
+    Удаляет все маппинги для указанного `tenant_id`.
+
+    Пример:
+    ```
+    DELETE /mappings/my-tenant
+    ```
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM mappings WHERE tenant_id=?",
+            (tenant_id,),
+        )
+        conn.commit()
+        deleted = cursor.rowcount
+
+        log.info(
+            "All mappings deleted tenant_id=%s count=%s",
+            tenant_id, deleted,
+        )
+        return {"status": "ok", "deleted": deleted}
+
+    except Exception as e:
+        log.error(f"Error deleting mappings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
