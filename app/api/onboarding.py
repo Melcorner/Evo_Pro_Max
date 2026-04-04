@@ -8,7 +8,7 @@ import requests
 from fastapi import APIRouter, Form, HTTPException
 from fastapi.responses import HTMLResponse
 
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 from app.clients.evotor_client import fetch_stores_by_token
 
 router = APIRouter(tags=["Onboarding"])
@@ -179,7 +179,7 @@ def _load_session(session_id: str) -> dict:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT * FROM evotor_onboarding_sessions WHERE id = ?",
+        aq("SELECT * FROM evotor_onboarding_sessions WHERE id = ?"),
         (session_id,),
     )
     row = cur.fetchone()
@@ -244,10 +244,10 @@ def onboarding_token_submit(evotor_token: str = Form(...)):
     try:
         cur = conn.cursor()
         cur.execute(
-            """
+            aq("""
             INSERT INTO evotor_onboarding_sessions (id, evotor_token, stores_json, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?)
-            """,
+            """),
             (session_id, evotor_token, json.dumps(stores, ensure_ascii=False), now, now),
         )
         conn.commit()
@@ -360,19 +360,18 @@ def onboarding_ms_token_submit(
         body = '<div class="error">В МойСклад не найдено ни одного контрагента.</div>'
         return HTMLResponse(_layout("Ошибка", body), status_code=400)
 
-    # Сохраняем токен и данные в сессию, чтобы не передавать их скрытыми полями
     now = int(time.time())
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            """
+            aq("""
             UPDATE evotor_onboarding_sessions
             SET moysklad_token  = ?,
                 ms_data_json    = ?,
                 updated_at      = ?
             WHERE id = ?
-            """,
+            """),
             (
                 moysklad_token,
                 json.dumps(
@@ -387,14 +386,9 @@ def onboarding_ms_token_submit(
     finally:
         conn.close()
 
-    profile_url = (
-        f"/onboarding/evotor/sessions/{html.escape(session_id)}"
-        f"/stores/{html.escape(store_id)}/profile"
-    )
-
-    org_select    = _select("ms_organization_id", orgs)
-    store_select  = _select("ms_store_id", ms_stores)
-    agent_select  = _select("ms_agent_id", agents)
+    org_select   = _select("ms_organization_id", orgs)
+    store_select = _select("ms_store_id", ms_stores)
+    agent_select = _select("ms_agent_id", agents)
 
     body = f"""
     <div class="success">Данные МойСклад успешно загружены.</div>
@@ -469,13 +463,11 @@ def onboarding_store_profile_submit(
 ):
     session = _load_session(session_id)
 
-    # Достаём MS-токен и данные из сессии (не из формы)
     moysklad_token = session.get("moysklad_token", "").strip()
     if not moysklad_token:
         body = '<div class="error">Сессия не содержит MoySklad token. Начните онбординг заново.</div>'
         return HTMLResponse(_layout("Ошибка", body), status_code=400)
 
-    # Валидируем что выбранные ID действительно из нашего загруженного списка
     ms_data = json.loads(session.get("ms_data_json") or "{}")
     valid_org_ids   = {item["id"] for item in ms_data.get("orgs",   [])}
     valid_store_ids = {item["id"] for item in ms_data.get("stores", [])}
@@ -499,7 +491,7 @@ def onboarding_store_profile_submit(
         cur = conn.cursor()
 
         cur.execute(
-            "SELECT id FROM tenants WHERE evotor_store_id = ?",
+            aq("SELECT id FROM tenants WHERE evotor_store_id = ?"),
             (evotor_store_id,),
         )
         existing = cur.fetchone()
@@ -511,13 +503,13 @@ def onboarding_store_profile_submit(
             return HTMLResponse(_layout("Профиль уже существует", body), status_code=409)
 
         cur.execute(
-            """
+            aq("""
             INSERT INTO tenants (
                 id, name, evotor_api_key, moysklad_token, created_at,
                 evotor_token, evotor_store_id,
                 ms_organization_id, ms_store_id, ms_agent_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            """),
             (
                 tenant_id,
                 name.strip(),
@@ -534,11 +526,11 @@ def onboarding_store_profile_submit(
 
         if fiscal_token.strip() and fiscal_client_uid.strip() and fiscal_device_uid.strip():
             cur.execute(
-                """
+                aq("""
                 UPDATE tenants
                 SET fiscal_token = ?, fiscal_client_uid = ?, fiscal_device_uid = ?
                 WHERE id = ?
-                """,
+                """),
                 (fiscal_token.strip(), fiscal_client_uid.strip(), fiscal_device_uid.strip(), tenant_id),
             )
 
@@ -555,11 +547,9 @@ def onboarding_store_profile_submit(
     body = f"""
     <div class="success">
         <strong>Профиль магазина успешно создан!</strong><br><br>
-        Tenant ID: <code>{html.escape(tenant_id)}</code>
     </div>
     <p style="color:#5b6475; font-size:14px;">
-        Следующий шаг — выполните первичную синхронизацию товаров:<br>
-        <code>POST /sync/{html.escape(tenant_id)}/initial</code>
+        Следующий шаг — выполните первичную синхронизацию товаров<br>
     </p>
     """
     return HTMLResponse(_layout("Профиль создан", body))
