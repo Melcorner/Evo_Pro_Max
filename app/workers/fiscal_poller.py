@@ -22,15 +22,15 @@ import os
 import signal
 import time
 
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 from app.logger import setup_logging
 
 setup_logging()
 log = logging.getLogger("fiscal_poller")
 
-POLL_INTERVAL_SEC = int(os.getenv("FISCAL_POLL_INTERVAL_SEC", "60"))
-POLL_STALE_SEC = int(os.getenv("FISCAL_POLL_STALE_SEC", "30"))
-POLL_MAX_ATTEMPTS = int(os.getenv("FISCAL_POLL_MAX_ATTEMPTS", "20"))
+POLL_INTERVAL_SEC  = int(os.getenv("FISCAL_POLL_INTERVAL_SEC",  "60"))
+POLL_STALE_SEC     = int(os.getenv("FISCAL_POLL_STALE_SEC",     "30"))
+POLL_MAX_ATTEMPTS  = int(os.getenv("FISCAL_POLL_MAX_ATTEMPTS",  "20"))
 
 PENDING_STATUSES = (1, 2, 5)
 
@@ -55,7 +55,7 @@ def _load_pending_checks() -> list[dict]:
     try:
         cur = conn.cursor()
         cur.execute(
-            """
+            aq("""
             SELECT fc.uid, fc.tenant_id, fc.ms_demand_id,
                    fc.status, fc.attempt,
                    fc.last_poll_at, fc.next_poll_at,
@@ -67,7 +67,7 @@ def _load_pending_checks() -> list[dict]:
               AND fc.updated_at < ?
             ORDER BY fc.updated_at
             LIMIT 50
-            """,
+            """),
             (now, stale_before),
         )
         rows = cur.fetchall()
@@ -83,20 +83,21 @@ def _update_check(uid: str, new_status: int, state_dict: dict, attempt: int) -> 
 
     conn = get_connection()
     try:
-        conn.execute(
-            """
+        cur = conn.cursor()
+        cur.execute(
+            aq("""
             UPDATE fiscalization_checks
-            SET status         = ?,
-                description    = ?,
-                error_code     = ?,
-                error_message  = ?,
-                response_json  = ?,
-                attempt        = ?,
-                last_poll_at   = ?,
-                next_poll_at   = ?,
-                updated_at     = ?
+            SET status              = ?,
+                description         = ?,
+                error_code          = ?,
+                error_message       = ?,
+                response_json       = ?,
+                attempt             = ?,
+                last_poll_at        = ?,
+                next_poll_at        = ?,
+                updated_at          = ?
             WHERE uid = ?
-            """,
+            """),
             (
                 new_status,
                 state_dict.get("Description"),
@@ -122,8 +123,9 @@ def _mark_transport_error(uid: str, error: str, attempt: int) -> None:
 
     conn = get_connection()
     try:
-        conn.execute(
-            """
+        cur = conn.cursor()
+        cur.execute(
+            aq("""
             UPDATE fiscalization_checks
             SET last_transport_error = ?,
                 attempt              = ?,
@@ -131,7 +133,7 @@ def _mark_transport_error(uid: str, error: str, attempt: int) -> None:
                 next_poll_at         = ?,
                 updated_at           = ?
             WHERE uid = ?
-            """,
+            """),
             (error, attempt, now, next_poll_at, now, uid),
         )
         conn.commit()
@@ -142,30 +144,26 @@ def _mark_transport_error(uid: str, error: str, attempt: int) -> None:
 def _poll_one(check: dict) -> None:
     from app.clients.fiscalization_client import FiscalizationClient
 
-    uid = check["uid"]
-    tenant_id = check["tenant_id"]
+    uid          = check["uid"]
+    tenant_id    = check["tenant_id"]
     fiscal_token = check.get("fiscal_token")
-    attempt = (check.get("attempt") or 0) + 1
+    attempt      = (check.get("attempt") or 0) + 1
 
     if not fiscal_token:
         error_text = "fiscal_token missing for tenant"
         log.warning(
             "fiscal_token missing tenant_id=%s uid=%s attempt=%s",
-            tenant_id,
-            uid,
-            attempt,
+            tenant_id, uid, attempt,
         )
         _mark_transport_error(uid, error_text, attempt)
 
         if attempt >= POLL_MAX_ATTEMPTS:
             log.error(
                 "Max poll attempts reached with missing fiscal_token uid=%s tenant_id=%s — marking as error (9)",
-                uid,
-                tenant_id,
+                uid, tenant_id,
             )
             _update_check(
-                uid,
-                9,
+                uid, 9,
                 {"ErrorMessage": f"Max poll attempts ({POLL_MAX_ATTEMPTS}) exceeded: {error_text}"},
                 attempt,
             )
@@ -173,34 +171,26 @@ def _poll_one(check: dict) -> None:
 
     log.info(
         "Polling fiscal check uid=%s tenant_id=%s attempt=%s current_status=%s",
-        uid,
-        tenant_id,
-        attempt,
-        check["status"],
+        uid, tenant_id, attempt, check["status"],
     )
 
     try:
         client = FiscalizationClient(fiscal_token)
-        state = client.get_check_state(uid)
+        state  = client.get_check_state(uid)
     except Exception as e:
         log.warning(
             "Transport error polling uid=%s tenant_id=%s attempt=%s err=%s",
-            uid,
-            tenant_id,
-            attempt,
-            e,
+            uid, tenant_id, attempt, e,
         )
         _mark_transport_error(uid, str(e), attempt)
 
         if attempt >= POLL_MAX_ATTEMPTS:
             log.error(
                 "Max poll attempts reached uid=%s tenant_id=%s — marking as error (9)",
-                uid,
-                tenant_id,
+                uid, tenant_id,
             )
             _update_check(
-                uid,
-                9,
+                uid, 9,
                 {"ErrorMessage": f"Max poll attempts ({POLL_MAX_ATTEMPTS}) exceeded: {e}"},
                 attempt,
             )
@@ -210,11 +200,7 @@ def _poll_one(check: dict) -> None:
 
     log.info(
         "Fiscal check uid=%s tenant_id=%s status: %s -> %s description=%s",
-        uid,
-        tenant_id,
-        check["status"],
-        new_status,
-        state.get("Description"),
+        uid, tenant_id, check["status"], new_status, state.get("Description"),
     )
 
     _update_check(uid, new_status, state, attempt)
@@ -224,10 +210,7 @@ def _poll_one(check: dict) -> None:
     elif new_status == 9:
         log.error(
             "Fiscal check ERROR uid=%s tenant_id=%s error=%s message=%s",
-            uid,
-            tenant_id,
-            state.get("Error"),
-            state.get("ErrorMessage"),
+            uid, tenant_id, state.get("Error"), state.get("ErrorMessage"),
         )
 
 
@@ -253,9 +236,7 @@ def poll_cycle() -> int:
 def main_loop() -> None:
     log.info(
         "Fiscal poller started interval=%ss stale=%ss max_attempts=%s",
-        POLL_INTERVAL_SEC,
-        POLL_STALE_SEC,
-        POLL_MAX_ATTEMPTS,
+        POLL_INTERVAL_SEC, POLL_STALE_SEC, POLL_MAX_ATTEMPTS,
     )
 
     while not _shutdown:
@@ -268,10 +249,7 @@ def main_loop() -> None:
         if _shutdown:
             break
 
-        if processed == 0:
-            time.sleep(POLL_INTERVAL_SEC)
-        else:
-            time.sleep(5)
+        time.sleep(5 if processed > 0 else POLL_INTERVAL_SEC)
 
     log.info("Fiscal poller stopped gracefully")
 

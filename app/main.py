@@ -9,7 +9,7 @@ import time
 from fastapi import Depends, FastAPI
 
 from app.logger import setup_logging
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 from app.security import require_admin_api_token
 
 from app.api.tenants import router as tenants_router
@@ -106,11 +106,11 @@ def health():
         cur.fetchone()
 
         cur.execute(
-            """
+            aq("""
             SELECT service_name, last_seen_at
             FROM service_heartbeats
             WHERE service_name = ?
-            """,
+            """),
             (WORKER_HEARTBEAT_NAME,),
         )
         heartbeat_row = cur.fetchone()

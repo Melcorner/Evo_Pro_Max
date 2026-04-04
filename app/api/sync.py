@@ -4,7 +4,7 @@ import logging
 import requests
 
 from fastapi import APIRouter, HTTPException
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 from app.stores.mapping_store import MappingStore
 
 log = logging.getLogger("api.sync")
@@ -25,7 +25,7 @@ def _now() -> int:
 def _load_tenant(tenant_id: str) -> dict:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM tenants WHERE id = ?", (tenant_id,))
+    cur.execute(aq("SELECT * FROM tenants WHERE id = ?"), (tenant_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
@@ -57,8 +57,9 @@ def _upsert_stock_status(
 ) -> None:
     now = _now()
     conn = get_connection()
-    conn.execute(
-        """
+    cur = conn.cursor()
+    cur.execute(
+        aq("""
         INSERT INTO stock_sync_status (
             tenant_id,
             status,
@@ -78,7 +79,7 @@ def _upsert_stock_status(
             last_error=excluded.last_error,
             synced_items_count=excluded.synced_items_count,
             total_items_count=excluded.total_items_count
-        """,
+        """),
         (
             tenant_id,
             status,
@@ -97,7 +98,7 @@ def _upsert_stock_status(
 def _get_stock_status_row(tenant_id: str) -> dict | None:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM stock_sync_status WHERE tenant_id = ?", (tenant_id,))
+    cur.execute(aq("SELECT * FROM stock_sync_status WHERE tenant_id = ?"), (tenant_id,))
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
@@ -107,12 +108,12 @@ def _list_product_mappings(tenant_id: str) -> list[dict]:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """
+        aq("""
         SELECT tenant_id, entity_type, evotor_id, ms_id, created_at, updated_at
         FROM mappings
         WHERE tenant_id = ? AND entity_type = 'product'
         ORDER BY created_at ASC
-        """,
+        """),
         (tenant_id,),
     )
     rows = cur.fetchall()
@@ -694,7 +695,8 @@ def initial_sync(tenant_id: str):
 
     if failed == 0 and synced > 0:
         conn = get_connection()
-        conn.execute("UPDATE tenants SET sync_completed_at = ? WHERE id = ?", (_now(), tenant_id))
+        cur = conn.cursor()
+        cur.execute(aq("UPDATE tenants SET sync_completed_at = ? WHERE id = ?"), (_now(), tenant_id))
         conn.commit()
         conn.close()
         log.info("Initial sync completed tenant_id=%s synced=%s", tenant_id, synced)
@@ -716,7 +718,7 @@ def sync_status(tenant_id: str):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT COUNT(*) as cnt FROM mappings WHERE tenant_id = ? AND entity_type = 'product'",
+        aq("SELECT COUNT(*) as cnt FROM mappings WHERE tenant_id = ? AND entity_type = 'product'"),
         (tenant_id,),
     )
     mapping_count = cur.fetchone()["cnt"]
@@ -1267,11 +1269,11 @@ def _get_existing_fiscal_check(tenant_id: str, ms_demand_id: str) -> dict | None
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        """
+        aq("""
         SELECT *
         FROM fiscalization_checks
         WHERE tenant_id = ? AND ms_demand_id = ?
-        """,
+        """),
         (tenant_id, ms_demand_id),
     )
     row = cur.fetchone()
@@ -1292,85 +1294,69 @@ def _save_fiscal_check(
     error_code: int | None = None,
     error_message: str | None = None,
 ) -> None:
-    import sqlite3
-
     now = _now()
-    last_error = None
-
-    for attempt in range(5):
-        conn = get_connection()
-        try:
-            conn.execute(
-                """
-                INSERT INTO fiscalization_checks (
-                    uid, tenant_id, ms_demand_id,
-                    fiscal_client_uid, fiscal_device_uid,
-                    status, description, error_code, error_message,
-                    request_json, response_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(uid) DO UPDATE SET
-                    status=excluded.status,
-                    description=excluded.description,
-                    error_code=excluded.error_code,
-                    error_message=excluded.error_message,
-                    response_json=excluded.response_json,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    uid,
-                    tenant_id,
-                    ms_demand_id,
-                    fiscal_client_uid,
-                    fiscal_device_uid,
-                    status,
-                    description,
-                    error_code,
-                    error_message,
-                    request_json,
-                    response_json,
-                    now,
-                    now,
-                ),
-            )
-            conn.commit()
-            return
-        except sqlite3.OperationalError as e:
-            conn.rollback()
-            if "database is locked" not in str(e).lower():
-                raise
-            last_error = e
-            time.sleep(0.3 * (attempt + 1))
-        finally:
-            conn.close()
-
-    if last_error is not None:
-        raise last_error
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("""
+            INSERT INTO fiscalization_checks (
+                uid, tenant_id, ms_demand_id,
+                fiscal_client_uid, fiscal_device_uid,
+                status, description, error_code, error_message,
+                request_json, response_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(uid) DO UPDATE SET
+                status=excluded.status,
+                description=excluded.description,
+                error_code=excluded.error_code,
+                error_message=excluded.error_message,
+                response_json=excluded.response_json,
+                updated_at=excluded.updated_at
+            """),
+            (
+                uid, tenant_id, ms_demand_id,
+                fiscal_client_uid, fiscal_device_uid,
+                status, description, error_code, error_message,
+                request_json, response_json,
+                now, now,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _update_fiscal_check_state(uid: str, state: dict) -> None:
     now = _now()
     import json as _json
     conn = get_connection()
-    conn.execute(
-        """
-        UPDATE fiscalization_checks
-        SET status=?, description=?, error_code=?, error_message=?,
-            response_json=?, updated_at=?
-        WHERE uid=?
-        """,
-        (
-            state.get("State", 1),
-            state.get("Description"),
-            state.get("Error"),
-            state.get("ErrorMessage"),
-            _json.dumps(state, ensure_ascii=False),
-            now,
-            uid,
-        ),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("""
+            UPDATE fiscalization_checks
+            SET status=?, description=?, error_code=?, error_message=?,
+                response_json=?, updated_at=?
+            WHERE uid=?
+            """),
+            (
+                state.get("State", 1),
+                state.get("Description"),
+                state.get("Error"),
+                state.get("ErrorMessage"),
+                _json.dumps(state, ensure_ascii=False),
+                now,
+                uid,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @router.post("/sync/{tenant_id}/fiscalize/{ms_demand_id}")
@@ -1384,7 +1370,6 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
       повторный POST не создаёт второй чек, а возвращает existing uid.
     """
     import json as _json
-    import sqlite3
     import uuid as _uuid
     from app.clients.fiscalization_client import FiscalizationClient
 
@@ -1494,22 +1479,22 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
             error_code=error_code,
             error_message=error_message,
         )
-    except sqlite3.IntegrityError as e:
-        if "fiscalization_checks.tenant_id, fiscalization_checks.ms_demand_id" not in str(e):
-            raise
-        existing = _get_existing_fiscal_check(tenant_id, ms_demand_id)
-        if not existing:
-            raise
-        return {
-            "status": "already_exists",
-            "uid": existing["uid"],
-            "tenant_id": existing["tenant_id"],
-            "ms_demand_id": existing["ms_demand_id"],
-            "state": existing["status"],
-            "description": existing.get("description"),
-            "error_code": existing.get("error_code"),
-            "error_message": existing.get("error_message"),
-        }
+    except Exception as e:
+        err_str = str(e).lower()
+        if "unique" in err_str or "duplicate" in err_str:
+            existing = _get_existing_fiscal_check(tenant_id, ms_demand_id)
+            if existing:
+                return {
+                    "status": "already_exists",
+                    "uid": existing["uid"],
+                    "tenant_id": existing["tenant_id"],
+                    "ms_demand_id": existing["ms_demand_id"],
+                    "state": existing["status"],
+                    "description": existing.get("description"),
+                    "error_code": existing.get("error_code"),
+                    "error_message": existing.get("error_message"),
+                }
+        raise
 
     return {
         "status": "queued",
@@ -1543,7 +1528,7 @@ def get_fiscal_check_status(tenant_id: str, uid: str):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT * FROM fiscalization_checks WHERE uid=? AND tenant_id=?",
+        aq("SELECT * FROM fiscalization_checks WHERE uid=? AND tenant_id=?"),
         (uid, tenant_id),
     )
     row = cur.fetchone()

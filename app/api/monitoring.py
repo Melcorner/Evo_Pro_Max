@@ -6,7 +6,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 
 router = APIRouter(tags=["Monitoring"])
 
@@ -41,11 +41,11 @@ def _load_dashboard_snapshot() -> dict:
         cur = conn.cursor()
 
         cur.execute(
-            """
+            aq("""
             SELECT service_name, last_seen_at
             FROM service_heartbeats
             WHERE service_name = ?
-            """,
+            """),
             (WORKER_HEARTBEAT_NAME,),
         )
         heartbeat_row = cur.fetchone()
@@ -70,40 +70,27 @@ def _load_dashboard_snapshot() -> dict:
             event_counts[row["status"]] = row["cnt"]
 
         cur.execute(
-            """
+            aq("""
             SELECT
-                id,
-                tenant_id,
-                event_type,
-                event_key,
-                status,
-                retries,
-                next_retry_at,
-                last_error_message,
-                created_at,
-                updated_at
+                id, tenant_id, event_type, event_key,
+                status, retries, next_retry_at,
+                last_error_message, created_at, updated_at
             FROM event_store
             WHERE status IN ('RETRY', 'FAILED')
             ORDER BY updated_at DESC
             LIMIT ?
-            """,
+            """),
             (PROBLEM_EVENTS_LIMIT,),
         )
         problem_events = [dict(row) for row in cur.fetchall()]
 
         cur.execute(
-            """
-            SELECT
-                id,
-                event_id,
-                tenant_id,
-                error_code,
-                message,
-                created_at
+            aq("""
+            SELECT id, event_id, tenant_id, error_code, message, created_at
             FROM errors
             ORDER BY created_at DESC
             LIMIT ?
-            """,
+            """),
             (ERRORS_LIMIT,),
         )
         errors = [dict(row) for row in cur.fetchall()]
@@ -123,18 +110,13 @@ def _load_dashboard_snapshot() -> dict:
         stock_last_sync_at = stock_last_sync_row["last_sync_at"] if stock_last_sync_row else None
 
         cur.execute(
-            """
-            SELECT
-                id,
-                tenant_id,
-                event_key,
-                created_at,
-                updated_at
+            aq("""
+            SELECT id, tenant_id, event_key, created_at, updated_at
             FROM event_store
             WHERE status = 'DONE'
             ORDER BY updated_at DESC
             LIMIT ?
-            """,
+            """),
             (LATENCY_SAMPLE_SIZE,),
         )
         done_rows = [dict(row) for row in cur.fetchall()]

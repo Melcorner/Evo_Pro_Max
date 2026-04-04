@@ -2,7 +2,7 @@ import time
 import logging
 
 from fastapi import APIRouter, HTTPException
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 
 log = logging.getLogger("api")
 router = APIRouter(tags=["Events"])
@@ -37,28 +37,22 @@ def list_failed_events():
     conn.close()
     return rows
 
+
 @router.get("/events/{event_id}")
 def get_event(event_id: str):
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute("""
+    cur.execute(
+        aq("""
         SELECT
-            id,
-            tenant_id,
-            event_type,
-            event_key,
-            payload_json,
-            status,
-            retries,
-            next_retry_at,
-            last_error_message,
-            created_at,
-            updated_at
+            id, tenant_id, event_type, event_key, payload_json,
+            status, retries, next_retry_at, last_error_message,
+            created_at, updated_at
         FROM event_store
         WHERE id = ?
-    """, (event_id,))
-
+        """),
+        (event_id,),
+    )
     row = cur.fetchone()
     conn.close()
 
@@ -67,15 +61,14 @@ def get_event(event_id: str):
 
     return dict(row)
 
+
 @router.post("/events/{event_id}/requeue")
 def requeue_event(event_id: str):
-    """
-    Переводит FAILED событие обратно в NEW для повторной обработки.
-    """
+    """Переводит FAILED событие обратно в NEW для повторной обработки."""
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM event_store WHERE id = ?", (event_id,))
+    cur.execute(aq("SELECT * FROM event_store WHERE id = ?"), (event_id,))
     row = cur.fetchone()
 
     if not row:
@@ -86,12 +79,12 @@ def requeue_event(event_id: str):
         conn.close()
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot requeue event with status={row['status']}. Only FAILED events can be requeued."
+            detail=f"Cannot requeue event with status={row['status']}. Only FAILED events can be requeued.",
         )
 
     now = int(time.time())
-
-    cur.execute("""
+    cur.execute(
+        aq("""
         UPDATE event_store
         SET status = 'NEW',
             retries = 0,
@@ -99,11 +92,11 @@ def requeue_event(event_id: str):
             last_error_message = NULL,
             updated_at = ?
         WHERE id = ?
-    """, (now, event_id))
-
+        """),
+        (now, event_id),
+    )
     conn.commit()
     conn.close()
 
     log.info(f"Requeued event_id={event_id} -> NEW")
-
     return {"event_id": event_id, "status": "NEW", "message": "Event requeued successfully"}

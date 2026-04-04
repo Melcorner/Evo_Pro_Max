@@ -3,7 +3,7 @@ import logging
 import os
 import time
 
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 
 log = logging.getLogger("moysklad")
 
@@ -20,7 +20,7 @@ class MoySkladClient:
     def _load_token(self):
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT moysklad_token FROM tenants WHERE id = ?", (self.tenant_id,))
+        cur.execute(aq("SELECT moysklad_token FROM tenants WHERE id = ?"), (self.tenant_id,))
         row = cur.fetchone()
         conn.close()
         if not row:
@@ -208,7 +208,6 @@ class MoySkladClient:
             except (TypeError, ValueError):
                 pass
 
-        # Строка есть, поле остатка отсутствует — товар есть, остаток 0
         log.warning("Stock field not found for product %s, returning 0", ms_product_id)
         return 0.0
 
@@ -269,7 +268,7 @@ class MoySkladClient:
         for row in rows:
             for candidate in self._extract_email_candidates(row):
                 if candidate.strip().lower() == email_lower:
-                    log.debug(f"Counterparty found by email={email_lower} id={row.get('id')}")  # PII: debug only
+                    log.debug(f"Counterparty found by email={email_lower} id={row.get('id')}")
                     return row
         return None
 
@@ -285,10 +284,10 @@ class MoySkladClient:
         for row in rows:
             for candidate in self._extract_phone_candidates(row):
                 if self._normalize_phone(candidate) == normalized_target:
-                    log.debug(f"Counterparty found by phone={normalized_target} id={row.get('id')}")  # PII: debug only
+                    log.debug(f"Counterparty found by phone={normalized_target} id={row.get('id')}")
                     return row
         return None
-    
+
     def create_counterparty(
         self,
         name: str | None,

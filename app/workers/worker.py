@@ -8,7 +8,7 @@ from app.logger import setup_logging
 from app.services.error_logic import classify_error, RETRY, FAILED
 from app.stores.error_store import insert_error
 from app.services.event_dispatcher import dispatch_event
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 
 setup_logging()
 log = logging.getLogger("worker")
@@ -36,14 +36,15 @@ def heartbeat_worker() -> None:
     meta_json = json.dumps({"service": WORKER_HEARTBEAT_NAME})
     conn = get_connection()
     try:
-        conn.execute(
-            """
+        cur = conn.cursor()
+        cur.execute(
+            aq("""
             INSERT INTO service_heartbeats (service_name, last_seen_at, meta_json)
             VALUES (?, ?, ?)
             ON CONFLICT(service_name) DO UPDATE SET
                 last_seen_at = excluded.last_seen_at,
                 meta_json = excluded.meta_json
-            """,
+            """),
             (WORKER_HEARTBEAT_NAME, now, meta_json),
         )
         conn.commit()
@@ -67,12 +68,12 @@ def recover_stale_processing() -> None:
         cur = conn.cursor()
 
         cur.execute(
-            """
+            aq("""
             SELECT *
             FROM event_store
             WHERE status = 'PROCESSING'
               AND updated_at < ?
-            """,
+            """),
             (stale_before,),
         )
         rows = cur.fetchall()
@@ -83,7 +84,7 @@ def recover_stale_processing() -> None:
             locked_at = row["updated_at"]
 
             cur.execute(
-                """
+                aq("""
                 UPDATE event_store
                 SET status = CASE WHEN retries + 1 >= 5 THEN 'FAILED' ELSE 'RETRY' END,
                     retries = retries + 1,
@@ -94,7 +95,7 @@ def recover_stale_processing() -> None:
                 WHERE id = ?
                   AND status = 'PROCESSING'
                   AND updated_at = ?
-                """,
+                """),
                 (
                     now + 60,
                     "STALE_PROCESSING",
@@ -138,13 +139,13 @@ def process_one_event():
     now = int(time.time())
 
     cursor.execute(
-        """
+        aq("""
         SELECT * FROM event_store
         WHERE (status = 'NEW')
            OR (status = 'RETRY' AND next_retry_at IS NOT NULL AND next_retry_at <= ? AND retries < 5)
         ORDER BY created_at
         LIMIT 1
-        """,
+        """),
         (now,),
     )
     row = cursor.fetchone()
@@ -164,11 +165,11 @@ def process_one_event():
 
     locked_at = int(time.time())
     cursor.execute(
-        """
+        aq("""
         UPDATE event_store
         SET status = 'PROCESSING', updated_at = ?
         WHERE id = ? AND status IN ('NEW','RETRY')
-        """,
+        """),
         (locked_at, event_id),
     )
 
@@ -186,11 +187,11 @@ def process_one_event():
         now = int(time.time())
 
         cursor.execute(
-            """
+            aq("""
             UPDATE event_store
             SET status = 'DONE', updated_at = ?
             WHERE id = ? AND status = 'PROCESSING' AND updated_at = ?
-            """,
+            """),
             (now, event_id, locked_at),
         )
 
@@ -203,10 +204,11 @@ def process_one_event():
             return True
 
         cursor.execute(
-            """
-            INSERT OR IGNORE INTO processed_events (tenant_id, event_key, result_ref, processed_at)
+            aq("""
+            INSERT INTO processed_events (tenant_id, event_key, result_ref, processed_at)
             VALUES (?, ?, ?, ?)
-            """,
+            ON CONFLICT (tenant_id, event_key) DO NOTHING
+            """),
             (row["tenant_id"], row["event_key"], result_ref, now),
         )
 
@@ -249,7 +251,7 @@ def process_one_event():
 
         if go_failed:
             cursor.execute(
-                """
+                aq("""
                 UPDATE event_store
                 SET status = 'FAILED',
                     retries = ?,
@@ -258,12 +260,12 @@ def process_one_event():
                     last_error_message = ?,
                     updated_at = ?
                 WHERE id = ? AND status = 'PROCESSING' AND updated_at = ?
-                """,
+                """),
                 (new_retries, error_code, err, now, event_id, locked_at),
             )
         else:
             cursor.execute(
-                """
+                aq("""
                 UPDATE event_store
                 SET status = 'RETRY',
                     retries = ?,
@@ -272,7 +274,7 @@ def process_one_event():
                     last_error_message = ?,
                     updated_at = ?
                 WHERE id = ? AND status = 'PROCESSING' AND updated_at = ?
-                """,
+                """),
                 (new_retries, now + delay, error_code, err, now, event_id, locked_at),
             )
 

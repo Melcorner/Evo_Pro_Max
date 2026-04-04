@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 
 router = APIRouter(tags=["Tenants"])
 
@@ -54,10 +54,10 @@ def create_tenant(body: TenantCreate):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        """
+        aq("""
         INSERT INTO tenants (id, name, evotor_api_key, moysklad_token, created_at)
         VALUES (?, ?, ?, ?, ?)
-        """,
+        """),
         (
             tenant_id,
             body.name,
@@ -71,19 +71,20 @@ def create_tenant(body: TenantCreate):
 
     return {"id": tenant_id}
 
+
 @router.patch("/tenants/{tenant_id}/moysklad")
 def configure_moysklad(tenant_id: str, body: TenantMoySkladConfig):
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id FROM tenants WHERE id = ?", (tenant_id,))
+    cursor.execute(aq("SELECT id FROM tenants WHERE id = ?"), (tenant_id,))
     if not cursor.fetchone():
         conn.close()
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     if body.moysklad_token is not None:
         cursor.execute(
-            """
+            aq("""
             UPDATE tenants
             SET moysklad_token = ?,
                 ms_organization_id = ?,
@@ -91,7 +92,7 @@ def configure_moysklad(tenant_id: str, body: TenantMoySkladConfig):
                 ms_agent_id = ?,
                 evotor_store_id = ?
             WHERE id = ?
-            """,
+            """),
             (
                 body.moysklad_token,
                 body.ms_organization_id,
@@ -103,14 +104,14 @@ def configure_moysklad(tenant_id: str, body: TenantMoySkladConfig):
         )
     else:
         cursor.execute(
-            """
+            aq("""
             UPDATE tenants
             SET ms_organization_id = ?,
                 ms_store_id = ?,
                 ms_agent_id = ?,
                 evotor_store_id = ?
             WHERE id = ?
-            """,
+            """),
             (
                 body.ms_organization_id,
                 body.ms_store_id,
@@ -131,19 +132,19 @@ def configure_fiscal(tenant_id: str, body: TenantFiscalConfig):
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id FROM tenants WHERE id = ?", (tenant_id,))
+    cursor.execute(aq("SELECT id FROM tenants WHERE id = ?"), (tenant_id,))
     if not cursor.fetchone():
         conn.close()
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     cursor.execute(
-        """
+        aq("""
         UPDATE tenants
         SET fiscal_token = ?,
             fiscal_client_uid = ?,
             fiscal_device_uid = ?
         WHERE id = ?
-        """,
+        """),
         (body.fiscal_token, body.fiscal_client_uid, body.fiscal_device_uid, tenant_id),
     )
 
@@ -158,7 +159,7 @@ def complete_sync(tenant_id: str):
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id, sync_completed_at FROM tenants WHERE id = ?", (tenant_id,))
+    cursor.execute(aq("SELECT id, sync_completed_at FROM tenants WHERE id = ?"), (tenant_id,))
     row = cursor.fetchone()
 
     if not row:
@@ -174,7 +175,7 @@ def complete_sync(tenant_id: str):
         }
 
     now = int(time.time())
-    cursor.execute("UPDATE tenants SET sync_completed_at = ? WHERE id = ?", (now, tenant_id))
+    cursor.execute(aq("UPDATE tenants SET sync_completed_at = ? WHERE id = ?"), (now, tenant_id))
 
     conn.commit()
     conn.close()
@@ -192,12 +193,12 @@ def reset_sync(tenant_id: str):
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id FROM tenants WHERE id = ?", (tenant_id,))
+    cursor.execute(aq("SELECT id FROM tenants WHERE id = ?"), (tenant_id,))
     if not cursor.fetchone():
         conn.close()
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    cursor.execute("UPDATE tenants SET sync_completed_at = NULL WHERE id = ?", (tenant_id,))
+    cursor.execute(aq("UPDATE tenants SET sync_completed_at = NULL WHERE id = ?"), (tenant_id,))
 
     conn.commit()
     conn.close()
@@ -263,39 +264,39 @@ def list_tenants():
         )
 
     return result
+
+
 @router.delete("/tenants/{tenant_id}")
 def delete_tenant(tenant_id: str):
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("SELECT id, name FROM tenants WHERE id = ?", (tenant_id,))
+    cur.execute(aq("SELECT id, name FROM tenants WHERE id = ?"), (tenant_id,))
     tenant = cur.fetchone()
     if not tenant:
         conn.close()
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     try:
-        cur.execute("BEGIN")
-
-        cur.execute("DELETE FROM mappings WHERE tenant_id = ?", (tenant_id,))
+        cur.execute(aq("DELETE FROM mappings WHERE tenant_id = ?"), (tenant_id,))
         deleted_mappings = cur.rowcount
 
-        cur.execute("DELETE FROM errors WHERE tenant_id = ?", (tenant_id,))
+        cur.execute(aq("DELETE FROM errors WHERE tenant_id = ?"), (tenant_id,))
         deleted_errors = cur.rowcount
 
-        cur.execute("DELETE FROM stock_sync_status WHERE tenant_id = ?", (tenant_id,))
+        cur.execute(aq("DELETE FROM stock_sync_status WHERE tenant_id = ?"), (tenant_id,))
         deleted_stock_sync_status = cur.rowcount
 
-        cur.execute("DELETE FROM fiscalization_checks WHERE tenant_id = ?", (tenant_id,))
+        cur.execute(aq("DELETE FROM fiscalization_checks WHERE tenant_id = ?"), (tenant_id,))
         deleted_fiscalization_checks = cur.rowcount
 
-        cur.execute("DELETE FROM processed_events WHERE tenant_id = ?", (tenant_id,))
+        cur.execute(aq("DELETE FROM processed_events WHERE tenant_id = ?"), (tenant_id,))
         deleted_processed_events = cur.rowcount
 
-        cur.execute("DELETE FROM event_store WHERE tenant_id = ?", (tenant_id,))
+        cur.execute(aq("DELETE FROM event_store WHERE tenant_id = ?"), (tenant_id,))
         deleted_event_store = cur.rowcount
 
-        cur.execute("DELETE FROM tenants WHERE id = ?", (tenant_id,))
+        cur.execute(aq("DELETE FROM tenants WHERE id = ?"), (tenant_id,))
         deleted_tenants = cur.rowcount
 
         conn.commit()

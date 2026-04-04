@@ -4,7 +4,7 @@ from typing import Optional, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict
 
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 from app.stores.mapping_store import MappingStore
 from app.clients.moysklad_client import MoySkladClient
 from app.clients.evotor_client import EvotorClient
@@ -58,7 +58,7 @@ class MoySkladWebhook(BaseModel):
 def _load_tenant(tenant_id: str) -> dict:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM tenants WHERE id = ?", (tenant_id,))
+    cur.execute(aq("SELECT * FROM tenants WHERE id = ?"), (tenant_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
@@ -82,7 +82,6 @@ def _get_document_positions(ms_client: MoySkladClient, doc_type: str, doc_id: st
     """
     import requests
 
-    # Берём BASE_URL с инстанса, а не с класса — чтобы уважать env-переменную MS_BASE_URL
     url = f"{ms_client.BASE_URL}/entity/{doc_type}/{doc_id}/positions"
     r = requests.get(url, headers=ms_client._headers(), timeout=15)
 
@@ -104,13 +103,13 @@ def _get_document_positions(ms_client: MoySkladClient, doc_type: str, doc_id: st
         if ms_id:
             product_ids.append(ms_id)
 
-    log.info(f"Extracted {len(product_ids)} product_ids from {doc_type}/{doc_id}")
+    log.info("Extracted %s product_ids from %s/%s", len(product_ids), doc_type, doc_id)
     return product_ids
 
 
 def _sync_stock_for_products(
     tenant_id: str,
-    ms_product_ids: List[str]
+    ms_product_ids: List[str],
 ) -> dict:
     """
     Синхронизирует остатки для списка товаров МойСклад → Эвотор.
@@ -126,34 +125,37 @@ def _sync_stock_for_products(
     errors = []
 
     for ms_id in ms_product_ids:
-        # Ищем evotor_id через маппинг
         evotor_id = store.get_by_ms_id(
             tenant_id=tenant_id,
             entity_type="product",
-            ms_id=ms_id
+            ms_id=ms_id,
         )
 
         if not evotor_id:
-            log.warning(f"No mapping for ms_id={ms_id} tenant_id={tenant_id} — skipping stock sync")
+            log.warning(
+                "No mapping for ms_id=%s tenant_id=%s — skipping stock sync",
+                ms_id, tenant_id,
+            )
             skipped += 1
             continue
 
-        # Получаем остаток из МойСклад
         try:
             quantity = ms_client.get_product_stock(ms_id)
         except Exception as e:
-            log.error(f"Failed to get stock ms_id={ms_id} err={e}")
+            log.error("Failed to get stock ms_id=%s err=%s", ms_id, e)
             failed += 1
             errors.append({"ms_id": ms_id, "error": str(e)})
             continue
 
-        # Обновляем остаток в Эвотор
         try:
             evotor_client.update_product_stock(evotor_id, quantity)
-            log.info(f"Stock synced ms_id={ms_id} evotor_id={evotor_id} quantity={quantity}")
+            log.info(
+                "Stock synced ms_id=%s evotor_id=%s quantity=%s",
+                ms_id, evotor_id, quantity,
+            )
             synced += 1
         except Exception as e:
-            log.error(f"Failed to update Evotor stock evotor_id={evotor_id} err={e}")
+            log.error("Failed to update Evotor stock evotor_id=%s err=%s", evotor_id, e)
             failed += 1
             errors.append({"ms_id": ms_id, "evotor_id": evotor_id, "error": str(e)})
 
@@ -161,7 +163,7 @@ def _sync_stock_for_products(
         "synced": synced,
         "skipped": skipped,
         "failed": failed,
-        "errors": errors
+        "errors": errors,
     }
 
 
@@ -171,11 +173,11 @@ def _sync_stock_for_products(
 
 # Поддерживаемые типы документов → триггеры изменения остатков
 STOCK_TRIGGER_TYPES = {
-    "demand",       # Отгрузка — остатки уменьшились
-    "supply",       # Приёмка — остатки увеличились
-    "inventory",    # Инвентаризация — остатки скорректированы
-    "loss",         # Списание — остатки уменьшились
-    "enter",        # Оприходование — остатки увеличились
+    "demand",    # Отгрузка — остатки уменьшились
+    "supply",    # Приёмка — остатки увеличились
+    "inventory", # Инвентаризация — остатки скорректированы
+    "loss",      # Списание — остатки уменьшились
+    "enter",     # Оприходование — остатки увеличились
 }
 
 
@@ -186,20 +188,11 @@ async def moysklad_webhook(tenant_id: str, body: MoySkladWebhook):
 
     При создании/изменении отгрузки, приёмки, инвентаризации, списания или оприходования —
     автоматически синхронизирует остатки затронутых товаров в Эвотор.
-
-    Настройка webhook в МойСклад через API:
-    POST https://api.moysklad.ru/api/remap/1.2/entity/webhook
-    {
-        "url": "https://{your-domain}/webhooks/moysklad/{tenant_id}",
-        "action": "CREATE,UPDATE",
-        "entityType": "demand"
-    }
-    Повторить для: supply, inventory, loss, enter.
     """
     tenant = _load_tenant(tenant_id)
 
     if not tenant.get("sync_completed_at"):
-        log.warning(f"MoySklad webhook received but sync not completed tenant_id={tenant_id}")
+        log.warning("MoySklad webhook received but sync not completed tenant_id=%s", tenant_id)
         return {"status": "skipped", "reason": "initial sync not completed"}
 
     total_synced = 0
@@ -215,16 +208,18 @@ async def moysklad_webhook(tenant_id: str, body: MoySkladWebhook):
         doc_id = _extract_ms_id_from_href(href)
 
         if not doc_type or doc_type not in STOCK_TRIGGER_TYPES:
-            log.info(f"Skipping non-stock doc_type={doc_type} href={href}")
+            log.info("Skipping non-stock doc_type=%s href=%s", doc_type, href)
             continue
 
         if not doc_id:
-            log.warning(f"Cannot extract doc_id from href={href}")
+            log.warning("Cannot extract doc_id from href=%s", href)
             continue
 
-        log.info(f"Processing MoySklad webhook doc_type={doc_type} doc_id={doc_id} tenant_id={tenant_id}")
+        log.info(
+            "Processing MoySklad webhook doc_type=%s doc_id=%s tenant_id=%s",
+            doc_type, doc_id, tenant_id,
+        )
 
-        # Получаем товары из позиций документа
         try:
             ms_product_ids = _get_document_positions(ms_client, doc_type, doc_id)
         except Exception as e:
@@ -243,10 +238,9 @@ async def moysklad_webhook(tenant_id: str, body: MoySkladWebhook):
             continue
 
         if not ms_product_ids:
-            log.info(f"No products found in doc_type={doc_type} doc_id={doc_id}")
+            log.info("No products found in doc_type=%s doc_id=%s", doc_type, doc_id)
             continue
 
-        # Синхронизируем остатки
         result = _sync_stock_for_products(tenant_id, ms_product_ids)
 
         total_synced += result["synced"]
@@ -261,18 +255,17 @@ async def moysklad_webhook(tenant_id: str, body: MoySkladWebhook):
         })
 
     log.info(
-        f"MoySklad webhook processed tenant_id={tenant_id} "
-        f"docs={len(processed_docs)} synced={total_synced} failed={total_failed}"
+        "MoySklad webhook processed tenant_id=%s docs=%s synced=%s failed=%s",
+        tenant_id, len(processed_docs), total_synced, total_failed,
     )
 
-    final_status = "ok" if total_failed == 0 else "partial"
     return {
-        "status": final_status,
+        "status": "ok" if total_failed == 0 else "partial",
         "docs_processed": len(processed_docs),
         "synced": total_synced,
         "skipped": total_skipped,
         "failed": total_failed,
-        "details": processed_docs
+        "details": processed_docs,
     }
 
 
@@ -281,7 +274,6 @@ def _extract_doc_type_from_href(href: str) -> Optional[str]:
     if not href:
         return None
     parts = href.rstrip("/").split("/")
-    # href: .../entity/demand/uuid
     try:
         entity_idx = parts.index("entity")
         return parts[entity_idx + 1]
