@@ -2,12 +2,13 @@
 
 Интеграционная шина между **Эвотор** и **МойСклад**.
 
-Проект решает четыре основные задачи:
+Проект решает пять основных задач:
 
 1. Приём продаж из Эвотор и формирование документов в МойСклад
 2. Синхронизация товаров и остатков между МойСклад и Эвотор
 3. Автоматическое обновление остатков по webhook от МойСклад
 4. Фискализация документа **Отгрузка** из МойСклад через **Универсальный фискализатор**
+5. Наблюдаемость integration bus: monitoring, metrics, dashboards, logs и alerts
 
 ---
 
@@ -24,6 +25,9 @@
 - обработка через `worker`
 - маппинг товаров `evotor_id -> ms_id`
 - создание документа **Отгрузка** в МойСклад
+- поддержка двух способов маршрутизации webhook:
+  - `POST /webhooks/evotor/{tenant_id}` — tenant передан явно
+  - `POST /webhooks/evotor` — tenant автоматически резолвится по `evotor_store_id` или `evotor_user_id`
 
 #### Покупатель
 
@@ -204,6 +208,23 @@ GET /sync/{tenant_id}/fiscalization/{uid}
 - `9` — ошибка
 - `10` — успешно фискализирован
 
+#### Fiscal poller
+
+Для проверки статусов чеков реализован отдельный фоновый процесс `fiscal_poller`.
+
+Он:
+
+- выбирает pending-записи из `fiscalization_checks`
+- опрашивает fiscalization24 через `get_check_state(uid)`
+- обновляет статус чека
+- ведёт счётчики polling-результатов и backlog pending-checks
+
+Запуск:
+
+```bash
+python -m app.workers.fiscal_poller
+```
+
 #### Текущее ограничение MVP
 
 Текущая версия фискализации работает в упрощённом сценарии:
@@ -216,7 +237,7 @@ GET /sync/{tenant_id}/fiscalization/{uid}
 
 ---
 
-### 5. Мониторинг integration bus
+### 5. Monitoring: JSON snapshot + HTML dashboard
 
 Реализован базовый backend-дашборд мониторинга для контроля состояния integration bus.
 
@@ -314,14 +335,253 @@ Dashboard был проверен на следующих сценариях:
 
 ---
 
-### 6. Alerts: Telegram + email
+### 6. Prometheus metrics
 
-Реализован отдельный контур автоматических уведомлений для критичных состояний integration bus.
+Реализован отдельный слой метрик для Prometheus.
 
-Поддерживаются два канала доставки:
+#### API metrics
 
-- Telegram
-- email
+`GET /metrics`
+
+API экспортирует Prometheus-метрики через отдельный endpoint `/metrics`.
+
+Базовые метрики API:
+
+- `integration_api_requests_total`
+- `integration_api_request_duration_seconds`
+- `integration_api_exceptions_total`
+
+Дополнительно перед отдачей `/metrics` обновляются DB-derived gauge-метрики по состоянию integration bus.
+
+#### Worker metrics exporter
+
+Основной `worker` запускает отдельный HTTP exporter для Prometheus.
+
+Базовые метрики worker:
+
+- `integration_worker_cycles_total`
+- `integration_worker_idle_cycles_total`
+- `integration_worker_events_picked_total`
+- `integration_worker_events_processed_total`
+- `integration_worker_processing_duration_seconds`
+- `integration_worker_last_heartbeat_unixtime`
+- `integration_worker_stale_recovered_total`
+
+Exporter worker доступен на отдельном порту, по умолчанию:
+
+```text
+http://127.0.0.1:8001/metrics
+```
+
+#### Fiscal poller metrics exporter
+
+`fiscal_poller` также экспортирует отдельные метрики.
+
+Базовые метрики fiscal poller:
+
+- `integration_fiscal_poller_cycles_total`
+- `integration_fiscal_poller_pending_checks`
+- `integration_fiscal_poller_polled_total`
+- `integration_fiscal_poller_poll_duration_seconds`
+
+Exporter fiscal poller доступен по умолчанию:
+
+```text
+http://127.0.0.1:8002/metrics
+```
+
+#### Метрики фискализации
+
+В API-слое добавлены отдельные метрики для ручек фискализации:
+
+- `integration_fiscalization_requests_total`
+- `integration_fiscalization_request_duration_seconds`
+- `integration_fiscalization_status_checks_total`
+- `integration_fiscalization_state_total`
+
+Тем самым контур observability покрывает:
+
+- API
+- worker
+- fiscal poller
+- фискализацию
+
+---
+
+### 7. Structured logging + Loki
+
+Реализовано структурированное логирование в JSON-формате и агрегация логов через Loki.
+
+#### JSON logging
+
+Логирование поддерживает два режима:
+
+- `text`
+- `json`
+
+Для observability используется `json`.
+
+В JSON-логах поддерживаются поля:
+
+- `timestamp`
+- `level`
+- `logger`
+- `service`
+- `message`
+
+И дополнительные контекстные поля:
+
+- `component`
+- `tenant_id`
+- `event_id`
+- `event_key`
+- `uid`
+- `operation`
+- `status`
+- `duration_ms`
+- `doc_type`
+- `doc_id`
+- `exception_type`
+
+#### Логи в файлы
+
+Каждый процесс может писать логи не только в stdout, но и в файл.
+
+Используются переменные:
+
+```env
+LOG_TO_FILE=true
+LOG_FILE_PATH=logs/api.log
+```
+
+Для observability используются три файла:
+
+- `logs/api.log`
+- `logs/worker.log`
+- `logs/fiscal_poller.log`
+
+#### Loki + Promtail
+
+В docker-compose observability-стека добавлены:
+
+- `loki`
+- `promtail`
+
+Promtail читает лог-файлы из `logs/` и отправляет их в Loki.
+
+Для потоков логов используются отдельные labels:
+
+- `app=api`
+- `app=worker`
+- `app=fiscal_poller`
+
+Тем самым логи можно просматривать в Grafana через datasource `Loki`.
+
+---
+
+### 8. Grafana dashboards
+
+Реализованы отдельные дашборды Grafana, соответствующие контурам системы.
+
+#### Набор дашбордов
+
+Созданы пять отдельных дашбордов:
+
+- `API`
+- `Worker`
+- `Fiscal poller`
+- `Фискализация`
+- `Logs`
+
+#### Дашборд API
+
+Показывает:
+
+- общий request rate
+- error rate
+- p95 latency
+- request rate по путям
+- latency по путям
+- ошибки по status code
+
+#### Дашборд Worker
+
+Показывает:
+
+- heartbeat age
+- cycles rate
+- idle cycles rate
+- picked events rate
+- processed results
+- processing duration p95
+- stale recovered total
+
+#### Дашборд Fiscal poller
+
+Показывает:
+
+- pending checks
+- cycles rate
+- polling results
+- poll duration p95
+- results timeline
+
+#### Дашборд Фискализация
+
+Показывает:
+
+- fiscalization requests total
+- requests by result
+- request duration p95
+- status checks total
+- status checks by result
+- observed states
+- state timeline
+
+#### Дашборд Logs
+
+Показывает централизованные логи из Loki. Текущий набор панелей может включать:
+
+- API logs
+- API webhook logs
+- Worker logs
+- Worker failed messages
+- Fiscal poller logs
+- Fiscal messages
+- All errors
+
+Конкретный состав панелей зависит от экспортированного JSON дашборда, но логически Logs dashboard покрывает API, worker, fiscal poller и сводку ошибок.
+
+Дашборды могут быть экспортированы в JSON и сохранены в репозитории как dashboard artifacts.
+
+---
+
+### 9. Alerts: Prometheus rules + Telegram + email
+
+В проекте одновременно реализованы два уровня alerting:
+
+1. Prometheus alert rules
+2. отдельный `alert_worker` с доставкой в Telegram и email
+
+#### Базовые alert rules
+
+Для Prometheus добавлены базовые alert rules.
+
+Они покрывают следующие сценарии:
+
+- `IntegrationWorkerHeartbeatStale`
+- `IntegrationApiErrorRateHigh`
+- `IntegrationApiLatencyP95High`
+- `IntegrationFiscalPollerPendingChecksHigh`
+- `IntegrationWorkerRetryOrFailedActivity`
+
+Rules подключаются через файл:
+
+```text
+observability/prometheus/alerts.yml
+```
+
+И оцениваются Prometheus автоматически.
 
 #### Alert worker
 
@@ -331,7 +591,7 @@ Alert worker работает отдельно от основного `worker` 
 
 Он периодически читает состояние системы напрямую из БД и отправляет уведомления в Telegram и/или на email в зависимости от конфигурации.
 
-#### Что проверяется
+#### Что проверяется alert worker
 
 Реализованы четыре типа сигналов:
 
@@ -469,9 +729,12 @@ ADMIN_API_TOKEN=token
 Без admin auth остаются:
 
 - `/health`
+- `/metrics`
+- `/webhooks/evotor`
 - `/webhooks/evotor/{tenant_id}`
 - `/webhooks/moysklad/{tenant_id}`
 - `/api/v1/user/token`
+- onboarding-ручки `/onboarding/...`
 
 #### Использование в Swagger
 
@@ -531,37 +794,43 @@ Manual/API Trigger → sync.py → MoySklad API / Evotor API → mappings / stoc
 Manual/API Trigger → sync.py → MoySklad demand → mapper → FiscalizationClient → fiscalization24
 ```
 
-### Мониторинг
+### Fiscal poller
 
 ```text
-event_store / errors / service_heartbeats → monitoring.py → JSON snapshot / HTML dashboard
+fiscalization_checks → fiscal_poller.py → fiscalization24 get_check_state → update fiscalization_checks
 ```
 
-Контур мониторинга не вмешивается в обработку событий и не меняет pipeline integration bus.
+### Monitoring + metrics + logs + alerts
 
-Он использует уже существующие данные:
+```text
+event_store / errors / service_heartbeats / fiscalization_checks / stock_sync_status
+  → monitoring.py / Prometheus metrics / JSON logs
+  → Grafana / Loki / Prometheus rules / alert_worker
+```
+
+Контуры monitoring, metrics, logs и alerting не вмешиваются в обработку бизнес-событий и не меняют pipeline integration bus.
+
+Они используют уже существующие данные:
 
 - `event_store`
 - `errors`
 - `service_heartbeats`
+- `fiscalization_checks`
+- `stock_sync_status`
 
-Тем самым monitoring является лёгким слоем наблюдаемости поверх существующей архитектуры.
+Тем самым observability является отдельным слоем наблюдаемости поверх существующей архитектуры.
 
 ### Alerts: Telegram + email
 
 ```text
-service_heartbeats / event_store / stock_sync_status → alert_worker.py → alert_logic.py → telegram_client.py / email_client.py → Telegram Bot API / SMTP
+service_heartbeats / event_store / stock_sync_status
+  → alert_worker.py
+  → alert_logic.py
+  → telegram_client.py / email_client.py
+  → Telegram Bot API / SMTP
 ```
 
-Контур alerting работает отдельно от основного `worker` и не влияет на обработку продаж, товаров и остатков.
-
-Он использует уже существующие данные:
-
-- `service_heartbeats`
-- `event_store`
-- `stock_sync_status`
-
-Тем самым alerting является отдельным контуром наблюдаемости и оповещений поверх integration bus.
+Контур alerting работает отдельно от основного `worker` и не влияет на обработку продаж, товаров, остатков и фискализации.
 
 ---
 
@@ -598,66 +867,6 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 - `degraded` — worker stale, есть FAILED события или ошибки stock sync
 - `error` — не удалось подключиться к БД
 
-Пример ответа (`status: ok`):
-
-```json
-{
-  "status": "ok",
-  "service": "integration-bus",
-  "timestamp": 1712000000,
-  "checks": {
-    "api": { "status": "ok" },
-    "db": { "status": "ok" },
-    "worker": {
-      "status": "ok",
-      "last_seen_at": 1712000000,
-      "stale_after_sec": 30
-    }
-  },
-  "events": {
-    "new": 0,
-    "retry": 0,
-    "failed": 0,
-    "processing": 0,
-    "last_processed_at": 1711999990
-  },
-  "stock_sync": {
-    "tenants_with_error": 0,
-    "last_sync_at": 1711999800
-  }
-}
-```
-
-Пример ответа (`status: degraded`):
-
-```json
-{
-  "status": "degraded",
-  "service": "integration-bus",
-  "timestamp": 1712000000,
-  "checks": {
-    "api": { "status": "ok" },
-    "db": { "status": "ok" },
-    "worker": {
-      "status": "stale",
-      "last_seen_at": 1711999900,
-      "stale_after_sec": 30
-    }
-  },
-  "events": {
-    "new": 2,
-    "retry": 1,
-    "failed": 3,
-    "processing": 0,
-    "last_processed_at": 1711999850
-  },
-  "stock_sync": {
-    "tenants_with_error": 1,
-    "last_sync_at": 1711999800
-  }
-}
-```
-
 ---
 
 ## API endpoint'ы
@@ -667,6 +876,7 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 | Метод | URL | Описание |
 |---|---|---|
 | GET | `/health` | Проверка сервера и фоновых сервисов |
+| GET | `/metrics` | Prometheus-метрики API |
 
 ### Tenants
 
@@ -683,7 +893,8 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 
 | Метод | URL | Описание |
 |---|---|---|
-| POST | `/webhooks/evotor/{tenant_id}` | Принять webhook от Эвотор |
+| POST | `/webhooks/evotor` | Принять webhook от Эвотор с авто-резолвом tenant |
+| POST | `/webhooks/evotor/{tenant_id}` | Принять webhook от Эвотор с явным tenant |
 | POST | `/webhooks/moysklad/{tenant_id}` | Принять webhook от МойСклад |
 | POST | `/api/v1/user/token` | Сохранить токен Эвотор |
 
@@ -714,6 +925,18 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 | POST | `/events/{id}/requeue` | Повторная постановка FAILED → NEW |
 | GET | `/errors` | Журнал ошибок |
 
+### Onboarding
+
+| Метод | URL | Описание |
+|---|---|---|
+| GET | `/onboarding/evotor/connect` | HTML-форма подключения Эвотор по token |
+| POST | `/onboarding/evotor/connect` | Получить список магазинов Эвотор |
+| GET | `/onboarding/evotor/sessions/{session_id}/stores` | Выбрать магазин Эвотор |
+| GET | `/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token` | Форма ввода token МойСклад |
+| POST | `/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token` | Загрузить организации, склады и контрагентов МойСклад |
+| GET | `/onboarding/evotor/sessions/{session_id}/stores/{store_id}/configure` | Форма выбора org/store/agent |
+| POST | `/onboarding/evotor/sessions/{session_id}/stores/{store_id}/configure` | Создать tenant и сохранить конфигурацию магазина |
+
 ### Monitoring
 
 | Метод | URL | Описание |
@@ -726,6 +949,7 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 ## Требования
 
 - Python 3.11+
+- Docker Desktop
 - Доступ к API Эвотор
 - Доступ к API МойСклад
 - Доступ к API Универсального фискализатора
@@ -776,6 +1000,11 @@ SMTP_USE_TLS=false
 
 ALERT_POLL_INTERVAL_SEC=30
 WORKER_STALE_AFTER_SEC=30
+
+WORKER_METRICS_HOST=0.0.0.0
+WORKER_METRICS_PORT=8001
+FISCAL_POLLER_METRICS_HOST=0.0.0.0
+FISCAL_POLLER_METRICS_PORT=8002
 ```
 
 ### 4. Инициализировать БД
@@ -790,8 +1019,19 @@ python -m app.scripts.init_db
 
 ### API сервер
 
+Для локальной разработки:
+
 ```bash
 uvicorn app.main:app --reload
+```
+
+Для observability-контура с логированием в файл:
+
+```bash
+LOG_TO_FILE=true
+LOG_FILE_PATH=logs/api.log
+SERVICE_NAME=integration-api
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 Swagger:
@@ -800,7 +1040,19 @@ Swagger:
 ### Worker
 
 ```bash
+LOG_TO_FILE=true
+LOG_FILE_PATH=logs/worker.log
+SERVICE_NAME=integration-worker
 python -m app.workers.worker
+```
+
+### Fiscal poller
+
+```bash
+LOG_TO_FILE=true
+LOG_FILE_PATH=logs/fiscal_poller.log
+SERVICE_NAME=integration-fiscal-poller
+python -m app.workers.fiscal_poller
 ```
 
 ### Alert worker
@@ -809,12 +1061,33 @@ python -m app.workers.worker
 python -m app.workers.alert_worker
 ```
 
+По умолчанию alert worker можно запускать без file logging — тогда его логи останутся в stdout. Если нужно собирать их через Loki, включи `LOG_TO_FILE=true`, задай отдельный `LOG_FILE_PATH` и добавь этот файл в Promtail.
+
 Alert worker использует настроенные каналы доставки:
 
 - Telegram, если заданы `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`
 - email, если заданы SMTP-параметры
 
 Если настроены оба канала, уведомления отправляются и в Telegram, и на email.
+
+### Observability stack
+
+```bash
+docker compose -f docker-compose.observability.yml up -d
+```
+
+Поднимаются:
+
+- `prometheus`
+- `grafana`
+- `loki`
+- `promtail`
+
+Проверка:
+
+```bash
+docker compose -f docker-compose.observability.yml ps
+```
 
 ### Dashboard
 
@@ -831,6 +1104,22 @@ GET /dashboard
 ```
 
 Оба endpoint'а защищены `ADMIN_API_TOKEN`.
+
+Grafana по умолчанию:
+
+- `http://127.0.0.1:3000`
+
+Prometheus:
+
+- `http://127.0.0.1:9090`
+
+Loki ready endpoint:
+
+- `http://127.0.0.1:3100/ready`
+
+Promtail targets:
+
+- `http://127.0.0.1:9080/targets`
 
 ---
 
@@ -861,16 +1150,25 @@ GET /dashboard
 - alert и recovery по `RETRY` событиям
 - alert и recovery по ошибкам синхронизации остатков
 
+Дополнительно для Prometheus rules можно проверять:
+
+- `/api/v1/rules`
+- `/api/v1/alerts`
+
+на стороне Prometheus.
+
 ---
 
 ## Базовый сценарий настройки
 
-1. Создать tenant
+1. Создать tenant вручную через API **или** пройти HTML onboarding `/onboarding/evotor/connect`
 2. Настроить МойСклад и Эвотор
-3. Сохранить токен Эвотор через `/api/v1/user/token`
+3. Сохранить токен Эвотор через `/api/v1/user/token` или завершить onboarding-цепочку до создания tenant
 4. Выполнить `POST /sync/{tenant_id}/initial`
 5. Настроить реквизиты фискализации через `PATCH /tenants/{tenant_id}/fiscal`
 6. Проверить статус через `GET /sync/{tenant_id}/status`
+7. Поднять observability stack через `docker compose -f docker-compose.observability.yml up -d`
+8. Запустить `worker`, `fiscal_poller` и при необходимости `alert_worker`
 
 ---
 
@@ -919,12 +1217,25 @@ curl -H "Authorization: Bearer token" \
   "http://127.0.0.1:8000/monitoring/dashboard"
 ```
 
+### Проверить worker metrics
+
+```bash
+curl "http://127.0.0.1:8001/metrics"
+```
+
+### Проверить fiscal poller metrics
+
+```bash
+curl "http://127.0.0.1:8002/metrics"
+```
+
 ---
 
 ## Дальнейшее развитие
 
 - поддержка card/mixed payment в фискализации
-- Dockerization и деплой
+- dashboard provisioning из репозитория как dashboard-as-code, если он ещё не включён в локальном окружении
+- дополнительные Grafana alert delivery / Alertmanager при необходимости
 - расширение dashboard: фильтры, цветовая индикация, дополнительные метрики
 - дополнительные E2E-тесты
 - верификация webhook МойСклад (эндпоинт сейчас публичный)

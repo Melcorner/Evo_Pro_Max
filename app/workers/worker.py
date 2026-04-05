@@ -4,6 +4,18 @@ import os
 import signal
 import time
 
+from app.observability.metrics import (
+    observe_duration,
+    start_worker_metrics_server,
+    worker_cycles_total,
+    worker_events_picked_total,
+    worker_events_processed_total,
+    worker_idle_cycles_total,
+    worker_last_heartbeat_unixtime,
+    worker_processing_duration_seconds,
+    worker_stale_recovered_total,
+)
+
 from app.logger import setup_logging
 from app.services.error_logic import classify_error, RETRY, FAILED
 from app.stores.error_store import insert_error
@@ -13,10 +25,47 @@ from app.db import get_connection, adapt_query as aq
 setup_logging()
 log = logging.getLogger("worker")
 
+
+def _event_extra(
+    row: dict | None = None,
+    *,
+    event_id: str | None = None,
+    operation: str,
+    status: str | None = None,
+    exception_type: str | None = None,
+    component: str = "worker",
+) -> dict:
+    payload = {
+        "component": component,
+        "operation": operation,
+    }
+
+    if row is not None:
+        if row.get("tenant_id") is not None:
+            payload["tenant_id"] = row["tenant_id"]
+        if row.get("id") is not None:
+            payload["event_id"] = row["id"]
+        if row.get("event_key") is not None:
+            payload["event_key"] = row["event_key"]
+
+    if event_id is not None:
+        payload["event_id"] = event_id
+
+    if status is not None:
+        payload["status"] = status
+
+    if exception_type is not None:
+        payload["exception_type"] = exception_type
+
+    return payload
+
+
 WORKER_HEARTBEAT_NAME = "worker"
 WORKER_HEARTBEAT_INTERVAL_SEC = int(os.getenv("WORKER_HEARTBEAT_INTERVAL_SEC", "5"))
 STALE_PROCESSING_TIMEOUT_SEC = int(os.getenv("STALE_PROCESSING_TIMEOUT_SEC", "300"))
 STALE_PROCESSING_CHECK_INTERVAL_SEC = int(os.getenv("STALE_PROCESSING_CHECK_INTERVAL_SEC", "60"))
+WORKER_METRICS_HOST = os.getenv("WORKER_METRICS_HOST", "0.0.0.0")
+WORKER_METRICS_PORT = int(os.getenv("WORKER_METRICS_PORT", "8001"))
 
 _shutdown = False
 
@@ -27,12 +76,37 @@ def _handle_signal(signum, frame):
     _shutdown = True
 
 
+def _start_metrics_exporter() -> None:
+    if WORKER_METRICS_PORT <= 0:
+        log.info(
+            "Worker Prometheus exporter disabled because WORKER_METRICS_PORT=%s",
+            WORKER_METRICS_PORT,
+        )
+        return
+
+    try:
+        start_worker_metrics_server(port=WORKER_METRICS_PORT, host=WORKER_METRICS_HOST)
+        log.info(
+            "Worker Prometheus exporter listening on http://%s:%s/metrics",
+            WORKER_METRICS_HOST,
+            WORKER_METRICS_PORT,
+        )
+    except Exception:
+        log.exception(
+            "Failed to start worker Prometheus exporter host=%s port=%s",
+            WORKER_METRICS_HOST,
+            WORKER_METRICS_PORT,
+        )
+
+
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
 
 
 def heartbeat_worker() -> None:
     now = int(time.time())
+    worker_last_heartbeat_unixtime.set(now)
+
     meta_json = json.dumps({"service": WORKER_HEARTBEAT_NAME})
     conn = get_connection()
     try:
@@ -82,6 +156,7 @@ def recover_stale_processing() -> None:
 
         for row in rows:
             locked_at = row["updated_at"]
+            will_fail = (row["retries"] + 1) >= 5
 
             cur.execute(
                 aq("""
@@ -108,8 +183,12 @@ def recover_stale_processing() -> None:
 
             if cur.rowcount == 0:
                 log.info(
-                    "Skip stale recovery CAS miss event_id=%s — event already changed state",
-                    row["id"],
+                    "worker stale recovery cas miss",
+                    extra=_event_extra(
+                        row,
+                        operation="worker.recover_stale_processing",
+                        status="cas_miss",
+                    ),
                 )
                 continue
 
@@ -120,10 +199,22 @@ def recover_stale_processing() -> None:
                 message="stale PROCESSING: recovered by worker",
                 response_body=None,
             )
+
+            worker_stale_recovered_total.labels(
+                result="failed" if will_fail else "retry"
+            ).inc()
+
             recovered += 1
 
         if recovered:
-            log.warning("Recovered %s stale PROCESSING event(s) -> RETRY/FAILED", recovered)
+            log.warning(
+                "worker stale processing recovered",
+                extra={
+                    "component": "worker",
+                    "operation": "worker.recover_stale_processing",
+                    "status": "recovered",
+                },
+            )
 
         conn.commit()
     except Exception:
@@ -156,11 +247,12 @@ def process_one_event():
 
     event_id = row["id"]
     log.info(
-        "Picked event_id=%s status=%s retries=%s event_key=%s",
-        event_id,
-        row["status"],
-        row["retries"],
-        row["event_key"],
+        "worker event picked",
+        extra=_event_extra(
+            row,
+            operation="worker.process_one_event",
+            status="picked",
+        ),
     )
 
     locked_at = int(time.time())
@@ -174,47 +266,79 @@ def process_one_event():
     )
 
     if cursor.rowcount == 0:
+        worker_events_processed_total.labels(result="cas_miss").inc()
         conn.close()
         return True
 
     conn.commit()
-    log.info("Locked event_id=%s -> PROCESSING locked_at=%s", event_id, locked_at)
+    worker_events_picked_total.inc()
+
+    log.info(
+        "worker event locked",
+        extra=_event_extra(
+            row,
+            operation="worker.process_one_event",
+            status="processing",
+        ),
+    )
 
     try:
-        log.info("Processing event_id=%s event_type=%s", event_id, row["event_type"])
-
-        result_ref = dispatch_event(row)
-        now = int(time.time())
-
-        cursor.execute(
-            aq("""
-            UPDATE event_store
-            SET status = 'DONE', updated_at = ?
-            WHERE id = ? AND status = 'PROCESSING' AND updated_at = ?
-            """),
-            (now, event_id, locked_at),
-        )
-
-        if cursor.rowcount == 0:
-            log.warning(
-                "CAS miss on DONE: event_id=%s was already recovered by stale-recovery — skipping DONE",
-                event_id,
+        with observe_duration(worker_processing_duration_seconds):
+            log.info(
+                "worker event processing",
+                extra=_event_extra(
+                    row,
+                    operation="worker.process_one_event",
+                    status="processing",
+                ),
             )
+
+            result_ref = dispatch_event(row)
+            now = int(time.time())
+
+            cursor.execute(
+                aq("""
+                UPDATE event_store
+                SET status = 'DONE', updated_at = ?
+                WHERE id = ? AND status = 'PROCESSING' AND updated_at = ?
+                """),
+                (now, event_id, locked_at),
+            )
+
+            if cursor.rowcount == 0:
+                log.warning(
+                    "worker event cas miss on done",
+                    extra=_event_extra(
+                        row,
+                        operation="worker.process_one_event",
+                        status="cas_miss",
+                    ),
+                )
+                conn.commit()
+                worker_events_processed_total.labels(result="cas_miss").inc()
+                return True
+
+            cursor.execute(
+                aq("""
+                INSERT INTO processed_events (tenant_id, event_key, result_ref, processed_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (tenant_id, event_key) DO NOTHING
+                """),
+                (row["tenant_id"], row["event_key"], result_ref, now),
+            )
+
             conn.commit()
+            worker_events_processed_total.labels(result="done").inc()
+
+            log.info(
+                "worker event done",
+                extra=_event_extra(
+                    row,
+                    operation="worker.process_one_event",
+                    status="done",
+                ),
+            )
             return True
-
-        cursor.execute(
-            aq("""
-            INSERT INTO processed_events (tenant_id, event_key, result_ref, processed_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT (tenant_id, event_key) DO NOTHING
-            """),
-            (row["tenant_id"], row["event_key"], result_ref, now),
-        )
-
-        conn.commit()
-        log.info("DONE event_id=%s event_key=%s", event_id, row["event_key"])
-        return True
 
     except Exception as e:
         now = int(time.time())
@@ -236,14 +360,13 @@ def process_one_event():
                 response_body = None
 
         log.warning(
-            "Handler error event_id=%s event_key=%s tenant_id=%s event_type=%s retries=%s decision=%s err=%s",
-            event_id,
-            row["event_key"],
-            row["tenant_id"],
-            row["event_type"],
-            new_retries,
-            decision,
-            err,
+            "worker handler error",
+            extra=_event_extra(
+                row,
+                operation="worker.process_one_event",
+                status=decision.lower(),
+                exception_type=type(e).__name__,
+            ),
         )
 
         delay = 60 * (2 ** (new_retries - 1))
@@ -280,31 +403,41 @@ def process_one_event():
 
         if cursor.rowcount == 0:
             log.warning(
-                "CAS miss on error path: event_id=%s was already recovered by stale-recovery — skipping retry/failed overwrite",
-                event_id,
+                "worker event cas miss on error path",
+                extra=_event_extra(
+                    row,
+                    operation="worker.process_one_event",
+                    status="cas_miss",
+                ),
             )
             conn.commit()
+            worker_events_processed_total.labels(result="cas_miss").inc()
             return True
 
         insert_error(conn, row, error_code, err, response_body)
         conn.commit()
 
         if go_failed:
+            worker_events_processed_total.labels(result="failed").inc()
             log.error(
-                "FAILED event_id=%s event_key=%s retries=%s err=%s",
-                event_id,
-                row["event_key"],
-                new_retries,
-                err,
+                "worker event failed",
+                extra=_event_extra(
+                    row,
+                    operation="worker.process_one_event",
+                    status="failed",
+                    exception_type=type(e).__name__,
+                ),
             )
         else:
+            worker_events_processed_total.labels(result="retry").inc()
             log.warning(
-                "RETRY event_id=%s event_key=%s retries=%s next_retry_at=%s err=%s",
-                event_id,
-                row["event_key"],
-                new_retries,
-                now + delay,
-                err,
+                "worker event scheduled for retry",
+                extra=_event_extra(
+                    row,
+                    operation="worker.process_one_event",
+                    status="retry",
+                    exception_type=type(e).__name__,
+                ),
             )
 
         return True
@@ -314,11 +447,13 @@ def process_one_event():
 
 
 def main_loop():
+    _start_metrics_exporter()
     log.info("Worker started")
     last_heartbeat_at = 0
     last_stale_check_at = 0
 
     while not _shutdown:
+        worker_cycles_total.inc()
         now = time.time()
 
         if now - last_heartbeat_at >= WORKER_HEARTBEAT_INTERVAL_SEC:
@@ -335,6 +470,7 @@ def main_loop():
             heartbeat_worker()
             last_heartbeat_at = time.time()
         else:
+            worker_idle_cycles_total.inc()
             time.sleep(2)
 
     log.info("Worker stopped gracefully")
