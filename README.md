@@ -16,8 +16,7 @@
 ### 1. Продажи Эвотор → МойСклад
 
 - приём webhook событий от Эвотор
-- поддержка форматов:
-  - `SELL`
+- поддержка формата:
   - `ReceiptCreated`
 - нормализация payload продажи
 - сохранение события в `event_store`
@@ -63,7 +62,7 @@
 Первичная синхронизация:
 
 - получает товары из Эвотор
-- создаёт товары в МойСклад
+- создаёт товары в МойСклад (с НДС и типом маркировки)
 - сохраняет `mappings`
 - переводит tenant в режим `МойСклад → Эвотор`
 
@@ -132,7 +131,7 @@ Webhook от МойСклад обновляет остатки в Эвотор 
 
 **МойСклад demand → fiscalization24 → касса Эвотор**
 
-#### Новый клиент `fiscalization_client.py`
+#### Клиент `fiscalization_client.py`
 
 Поддерживает:
 
@@ -255,36 +254,6 @@ GET /sync/{tenant_id}/fiscalization/{uid}
 - таблица проблемных событий
 - таблица последних ошибок
 
-#### Problem Events
-
-В блоке **Problem Events** показываются проблемные события из `event_store` со статусами:
-
-- `RETRY`
-- `FAILED`
-
-Для каждого события отображаются:
-
-- `Event ID`
-- `tenant_id`
-- `event_type`
-- `event_key`
-- `status`
-- `retries`
-- `last_error_message`
-- `updated_at`
-
-#### Recent Errors
-
-В блоке **Recent Errors** показываются последние записи из таблицы `errors`.
-
-Для каждой ошибки отображаются:
-
-- `event_id`
-- `tenant_id`
-- `error_code`
-- `message`
-- `created_at`
-
 #### Latency
 
 Latency рассчитывается для успешных событий (`status = DONE`) по формуле:
@@ -292,25 +261,6 @@ Latency рассчитывается для успешных событий (`st
 ```text
 updated_at - created_at
 ```
-
-То есть latency — это время прохождения события через integration bus от момента записи в очередь до завершения обработки.
-
-Для dashboard используются:
-
-- `avg_latency_sec` — средняя latency по последним успешным событиям
-- `max_latency_sec` — максимальная latency
-- `last_latency_sec` — latency последнего успешного события
-
-#### Проверенные сценарии
-
-Dashboard был проверен на следующих сценариях:
-
-- `worker stale`
-- восстановление worker (`stale → ok`)
-- появление `DONE`
-- появление `FAILED`
-- появление `RETRY`
-- отображение ошибок в `errors`
 
 ---
 
@@ -329,10 +279,6 @@ Dashboard был проверен на следующих сценариях:
 
 Alert worker работает отдельно от основного `worker` и не вмешивается в обработку событий.
 
-Он периодически читает состояние системы напрямую из БД и отправляет уведомления в Telegram и/или на email в зависимости от конфигурации.
-
-#### Что проверяется
-
 Реализованы четыре типа сигналов:
 
 - `worker stale` или отсутствие heartbeat
@@ -340,74 +286,7 @@ Alert worker работает отдельно от основного `worker` 
 - наличие событий со статусом `RETRY`
 - наличие ошибок синхронизации остатков в `stock_sync_status`
 
-#### Alert flow
-
-Alert worker:
-
-1. читает heartbeat основного worker из `service_heartbeats`
-2. считает количество событий `FAILED` в `event_store`
-3. считает количество событий `RETRY` в `event_store`
-4. считает количество ошибок синхронизации остатков в `stock_sync_status`
-5. строит текущее состояние alert snapshot
-6. сравнивает его с предыдущим состоянием
-7. отправляет alert или recovery сообщение по доступным каналам доставки только при смене состояния
-
-#### Anti-spam
-
-Чтобы не отправлять одинаковые уведомления на каждой итерации цикла, используется простая защита от спама по состоянию.
-
-Alert отправляется только при переходе:
-
-- `ok → stale`
-- `FAILED = 0 → FAILED > 0`
-- `RETRY = 0 → RETRY > 0`
-- `stock sync errors = 0 → stock sync errors > 0`
-
-Recovery отправляется только при переходе:
-
-- `stale → ok`
-- `FAILED > 0 → FAILED = 0`
-- `RETRY > 0 → RETRY = 0`
-- `stock sync errors > 0 → stock sync errors = 0`
-
-На первом цикле alert worker только фиксирует baseline без отправки сообщений.
-
-#### Каналы доставки
-
-Поддерживаются два канала доставки уведомлений:
-
-- Telegram через Bot API
-- email через SMTP
-
-Оба канала могут работать одновременно. Если настроен только один канал, alert worker продолжает работать через него.
-
-#### Alert messages
-
-Поддерживаются следующие типы уведомлений:
-
-- alert по проблеме с heartbeat worker
-- recovery по восстановлению worker
-- alert по появлению `FAILED` событий
-- recovery по очистке `FAILED` событий
-- alert по появлению `RETRY` событий
-- recovery по очистке `RETRY` событий
-- alert по появлению ошибок синхронизации остатков
-- recovery по очистке ошибок синхронизации остатков
-
-#### Проверенные сценарии
-
-Alerts были проверены на следующих сценариях:
-
-- остановка основного worker и переход в `stale`
-- восстановление worker и возврат в `ok`
-- появление `FAILED` события
-- очистка `FAILED` событий и recovery
-- появление `RETRY` события
-- очистка `RETRY` событий и recovery
-- появление ошибки синхронизации остатков
-- очистка ошибки синхронизации остатков и recovery
-- доставка уведомлений одновременно в Telegram и на email
-- успешная отправка alert и recovery писем через SMTP
+Alert отправляется только при смене состояния (anti-spam).
 
 ---
 
@@ -442,19 +321,7 @@ EVOTOR_WEBHOOK_SECRET=your_secret
 ADMIN_API_TOKEN=token
 ```
 
-Логика:
-
-- если `ADMIN_API_TOKEN` задан, защищённые ручки требуют заголовок:
-
-  ```http
-  Authorization: Bearer <ADMIN_API_TOKEN>
-  ```
-
-- если токен не задан, защита отключается — это удобно для локальной разработки
-
 #### Какие ручки защищены
-
-Под Bearer-auth находятся:
 
 - `/tenants`
 - `/sync`
@@ -466,42 +333,11 @@ ADMIN_API_TOKEN=token
 
 #### Какие ручки публичные
 
-Без admin auth остаются:
-
 - `/health`
 - `/webhooks/evotor/{tenant_id}`
 - `/webhooks/moysklad/{tenant_id}`
 - `/api/v1/user/token`
-
-#### Использование в Swagger
-
-После включения admin auth:
-
-1. открой `/docs`
-2. нажми кнопку **Authorize**
-3. введи токен
-4. Swagger начнёт автоматически подставлять `Authorization` в защищённые запросы
-
-#### Использование через curl
-
-Пример:
-
-```bash
-curl -X GET "http://127.0.0.1:8000/events" \
-  -H "Authorization: Bearer token"
-```
-
-Если токен не передан:
-
-- `401 Missing Authorization header`
-
-Если схема неверная:
-
-- `401 Invalid Authorization scheme`
-
-Если токен неверный:
-
-- `401 Invalid admin token`
+- `/onboarding`
 
 ---
 
@@ -537,31 +373,11 @@ Manual/API Trigger → sync.py → MoySklad demand → mapper → FiscalizationC
 event_store / errors / service_heartbeats → monitoring.py → JSON snapshot / HTML dashboard
 ```
 
-Контур мониторинга не вмешивается в обработку событий и не меняет pipeline integration bus.
-
-Он использует уже существующие данные:
-
-- `event_store`
-- `errors`
-- `service_heartbeats`
-
-Тем самым monitoring является лёгким слоем наблюдаемости поверх существующей архитектуры.
-
 ### Alerts: Telegram + email
 
 ```text
 service_heartbeats / event_store / stock_sync_status → alert_worker.py → alert_logic.py → telegram_client.py / email_client.py → Telegram Bot API / SMTP
 ```
-
-Контур alerting работает отдельно от основного `worker` и не влияет на обработку продаж, товаров и остатков.
-
-Он использует уже существующие данные:
-
-- `service_heartbeats`
-- `event_store`
-- `stock_sync_status`
-
-Тем самым alerting является отдельным контуром наблюдаемости и оповещений поверх integration bus.
 
 ---
 
@@ -598,66 +414,6 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 - `degraded` — worker stale, есть FAILED события или ошибки stock sync
 - `error` — не удалось подключиться к БД
 
-Пример ответа (`status: ok`):
-
-```json
-{
-  "status": "ok",
-  "service": "integration-bus",
-  "timestamp": 1712000000,
-  "checks": {
-    "api": { "status": "ok" },
-    "db": { "status": "ok" },
-    "worker": {
-      "status": "ok",
-      "last_seen_at": 1712000000,
-      "stale_after_sec": 30
-    }
-  },
-  "events": {
-    "new": 0,
-    "retry": 0,
-    "failed": 0,
-    "processing": 0,
-    "last_processed_at": 1711999990
-  },
-  "stock_sync": {
-    "tenants_with_error": 0,
-    "last_sync_at": 1711999800
-  }
-}
-```
-
-Пример ответа (`status: degraded`):
-
-```json
-{
-  "status": "degraded",
-  "service": "integration-bus",
-  "timestamp": 1712000000,
-  "checks": {
-    "api": { "status": "ok" },
-    "db": { "status": "ok" },
-    "worker": {
-      "status": "stale",
-      "last_seen_at": 1711999900,
-      "stale_after_sec": 30
-    }
-  },
-  "events": {
-    "new": 2,
-    "retry": 1,
-    "failed": 3,
-    "processing": 0,
-    "last_processed_at": 1711999850
-  },
-  "stock_sync": {
-    "tenants_with_error": 1,
-    "last_sync_at": 1711999800
-  }
-}
-```
-
 ---
 
 ## API endpoint'ы
@@ -667,6 +423,16 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 | Метод | URL | Описание |
 |---|---|---|
 | GET | `/health` | Проверка сервера и фоновых сервисов |
+
+### Onboarding
+
+| Метод | URL | Описание |
+|---|---|---|
+| GET | `/onboarding/evotor/connect` | Форма ввода Evotor token |
+| POST | `/onboarding/evotor/connect` | Получить магазины по Evotor token |
+| GET | `/onboarding/evotor/sessions/{session_id}/stores` | Выбор магазина Эвотор |
+| POST | `/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token` | Загрузить данные МойСклад |
+| POST | `/onboarding/store-profile` | Создать профиль магазина |
 
 ### Tenants
 
@@ -678,6 +444,7 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 | PATCH | `/tenants/{tenant_id}/fiscal` | Сохранить конфигурацию фискализации |
 | POST | `/tenants/{tenant_id}/complete-sync` | Отметить initial sync как завершённую |
 | DELETE | `/tenants/{tenant_id}/complete-sync` | Сбросить initial sync |
+| DELETE | `/tenants/{tenant_id}` | Удалить tenant и все связанные данные |
 
 ### Webhooks
 
@@ -703,6 +470,16 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 | POST | `/sync/{tenant_id}/stock/reconcile` | Batch-синхронизация остатков |
 | GET | `/sync/{tenant_id}/stock/status` | Статус последней синхронизации остатков |
 
+### Mappings
+
+| Метод | URL | Описание |
+|---|---|---|
+| GET | `/mappings` | Список маппингов (фильтр по tenant_id, entity_type) |
+| POST | `/mappings/` | Создать или обновить маппинг |
+| DELETE | `/mappings/{tenant_id}/{entity_type}/{evotor_id}` | Удалить один маппинг |
+| DELETE | `/mappings/{tenant_id}/{entity_type}` | Удалить все маппинги тенанта по типу |
+| DELETE | `/mappings/{tenant_id}` | Удалить все маппинги тенанта |
+
 ### Диагностика
 
 | Метод | URL | Описание |
@@ -726,6 +503,7 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 ## Требования
 
 - Python 3.11+
+- PostgreSQL 14+
 - Доступ к API Эвотор
 - Доступ к API МойСклад
 - Доступ к API Универсального фискализатора
@@ -759,12 +537,18 @@ pip install -r requirements.txt
 ### 3. Настроить `.env`
 
 ```env
+# База данных
+DATABASE_URL=postgresql://user:password@localhost:5432/evotor_ms
+
+# Безопасность
 EVOTOR_WEBHOOK_SECRET=your_secret
 ADMIN_API_TOKEN=token
 
+# Telegram alerts (опционально)
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 
+# Email alerts (опционально)
 SMTP_HOST=smtp.mail.ru
 SMTP_PORT=465
 SMTP_USERNAME=your_mail_login@mail.ru
@@ -774,14 +558,37 @@ ALERT_EMAIL_TO=recipient@example.com
 SMTP_USE_SSL=true
 SMTP_USE_TLS=false
 
+# Worker
 ALERT_POLL_INTERVAL_SEC=30
 WORKER_STALE_AFTER_SEC=30
 ```
 
-### 4. Инициализировать БД
+### 4. Создать базу данных PostgreSQL
+
+```bash
+sudo -u postgres psql
+```
+
+```sql
+CREATE USER evotor WITH PASSWORD 'your_password';
+CREATE DATABASE evotor_ms OWNER evotor;
+GRANT ALL PRIVILEGES ON DATABASE evotor_ms TO evotor;
+\q
+```
+
+### 5. Инициализировать схему БД
 
 ```bash
 python -m app.scripts.init_db
+```
+
+### 6. Миграция с SQLite (если нужно)
+
+Если ранее использовалась SQLite, перенести данные:
+
+```bash
+export SQLITE_PATH=data/app.db
+python -m app.scripts.migrate_to_pg
 ```
 
 ---
@@ -834,43 +641,26 @@ GET /dashboard
 
 ---
 
-## Demo scripts for dashboard
-
-Для локальной проверки dashboard и демонстрации monitoring-сценариев могут использоваться вспомогательные demo-скрипты, которые вставляют тестовые записи в `event_store` и `errors`.
-
-С их помощью можно проверить отображение:
-
-- `DONE`
-- `FAILED`
-- `RETRY`
-- `latency`
-- `Problem Events`
-- `Recent Errors`
-
-Эти скрипты не являются unit-тестами и используются только для ручной демонстрации dashboard.
-
----
-
-## Demo scripts for alerts
-
-Для локальной проверки alerts могут использоваться вспомогательные demo-скрипты, которые создают и удаляют тестовые записи в `event_store` и `stock_sync_status`.
-
-С их помощью можно проверить:
-
-- alert и recovery по `FAILED` событиям
-- alert и recovery по `RETRY` событиям
-- alert и recovery по ошибкам синхронизации остатков
-
----
-
 ## Базовый сценарий настройки
 
-1. Создать tenant
-2. Настроить МойСклад и Эвотор
-3. Сохранить токен Эвотор через `/api/v1/user/token`
+### Через онбординг (рекомендуется)
+
+1. Открыть `/onboarding/evotor/connect`
+2. Ввести Evotor token — система получит список магазинов
+3. Выбрать магазин
+4. Ввести MoySklad token — система автоматически загрузит организации, склады и контрагентов
+5. Выбрать организацию, склад и контрагента по умолчанию из списков
+6. Создать профиль магазина
+7. Выполнить `POST /sync/{tenant_id}/initial`
+
+### Через API вручную
+
+1. Создать tenant: `POST /tenants`
+2. Настроить МойСклад: `PATCH /tenants/{tenant_id}/moysklad`
+3. Сохранить токен Эвотор: `POST /api/v1/user/token`
 4. Выполнить `POST /sync/{tenant_id}/initial`
-5. Настроить реквизиты фискализации через `PATCH /tenants/{tenant_id}/fiscal`
-6. Проверить статус через `GET /sync/{tenant_id}/status`
+5. Настроить фискализацию: `PATCH /tenants/{tenant_id}/fiscal`
+6. Проверить статус: `GET /sync/{tenant_id}/status`
 
 ---
 
@@ -924,7 +714,5 @@ curl -H "Authorization: Bearer token" \
 ## Дальнейшее развитие
 
 - поддержка card/mixed payment в фискализации
-- Dockerization и деплой
 - расширение dashboard: фильтры, цветовая индикация, дополнительные метрики
-- дополнительные E2E-тесты
-- верификация webhook МойСклад (эндпоинт сейчас публичный)
+- E2E-тесты на PostgreSQL
