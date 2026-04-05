@@ -3,7 +3,7 @@ import logging
 import os
 import time
 
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 
 log = logging.getLogger("moysklad")
 
@@ -20,7 +20,7 @@ class MoySkladClient:
     def _load_token(self):
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT moysklad_token FROM tenants WHERE id = ?", (self.tenant_id,))
+        cur.execute(aq("SELECT moysklad_token FROM tenants WHERE id = ?"), (self.tenant_id,))
         row = cur.fetchone()
         conn.close()
         if not row:
@@ -50,19 +50,28 @@ class MoySkladClient:
         self._handle_error(r)
         return r.json()
 
-    def get_products(self, limit: int = 1000, offset: int = 0) -> list:
+    def get_products(self, search: str | None = None, limit: int = 1000, offset: int = 0) -> dict:
+        """
+        Получает список товаров из МойСклад.
+        Возвращает полный JSON-ответ, чтобы можно было брать rows, meta и т.д.
+        """
         url = f"{self.BASE_URL}/entity/product"
+        params = {"limit": limit, "offset": offset}
+
+        if search:
+            params["search"] = search
+
         r = requests.get(
             url,
             headers=self._headers(),
-            params={"limit": limit, "offset": offset},
-            timeout=30,
+            params=params,
+            timeout=30
         )
         self._handle_error(r)
         data = r.json()
-        rows = data.get("rows", [])
-        log.info(f"Fetched {len(rows)} products from MoySklad")
-        return rows
+        rows = data.get("rows", []) if isinstance(data, dict) else []
+        log.info(f"Fetched {len(rows)} products from MoySklad search={search!r}")
+        return data
 
     def get_product(self, ms_product_id: str) -> dict:
         url = f"{self.BASE_URL}/entity/product/{ms_product_id}"
@@ -84,14 +93,57 @@ class MoySkladClient:
         self._handle_error(r)
         return r.json()
 
-    def create_sale_document(self, payload):
+    def find_demand_by_external_code(self, external_code: str) -> dict | None:
+        """
+        Ищет demand в МойСклад по externalCode.
+        Используется для идемпотентного создания — защита от дублей при retry.
+        """
+        external_code = (external_code or "").strip()
+        if not external_code:
+            return None
+        url = f"{self.BASE_URL}/entity/demand"
+        r = requests.get(
+            url,
+            headers=self._headers(),
+            params={"filter": f"externalCode={external_code}"},
+            timeout=20,
+        )
+        self._handle_error(r)
+        rows = r.json().get("rows", [])
+        return rows[0] if rows else None
+
+    def create_sale_document(self, payload: dict, external_code: str | None = None):
+        """
+        Создаёт demand в МойСклад.
+        Если external_code передан — сначала ищет существующий demand по externalCode,
+        и возвращает его без повторного создания (идемпотентность при retry).
+        """
+        external_code = (external_code or payload.get("syncId") or "").strip()
+
+        if external_code:
+            existing = self.find_demand_by_external_code(external_code)
+            if existing:
+                log.info(
+                    "Demand already exists externalCode=%s id=%s — skipping create (idempotent)",
+                    external_code,
+                    existing.get("id"),
+                )
+                return {
+                    "success": True,
+                    "result_ref": existing.get("id"),
+                    "raw_response": existing,
+                    "idempotent": True,
+                }
+            payload = dict(payload)
+            payload["externalCode"] = external_code
+
         if "httpbin.org" in self.BASE_URL:
             url = f"{self.BASE_URL}/post"
         else:
             url = f"{self.BASE_URL}/entity/demand"
 
         log.info(f"Creating sale document url={url}")
-        log.info(f"Sale payload={payload}")
+        log.debug(f"Sale payload={payload}")  # PII: debug only
 
         r = requests.post(url, headers=self._headers(), json=payload, timeout=15)
         log.info(f"MoySklad response={r.status_code}")
@@ -103,18 +155,23 @@ class MoySkladClient:
             "success": True,
             "result_ref": result_ref,
             "raw_response": response_json,
+            "idempotent": False,
         }
 
     # -----------------------------
     # Stock helpers
     # -----------------------------
 
-    def get_product_with_stock(self, ms_product_id: str) -> dict:
+    def get_product_with_stock(self, ms_product_id: str) -> dict | None:
         """
-        Получает товар с остатком из MoySklad через assortment по filter=id=...
+        Получает строку остатка товара через /report/stock/all.
+
+        /entity/assortment при нулевом остатке может вернуть пустой rows,
+        что приводило к исключению вместо 0. /report/stock/all надёжнее —
+        всегда возвращает строку для известного товара.
         """
-        url = f"{self.BASE_URL}/entity/assortment"
-        params = {"filter": f"id={ms_product_id}"}
+        url = f"{self.BASE_URL}/report/stock/all"
+        params = {"filter": f"product={self.BASE_URL}/entity/product/{ms_product_id}"}
 
         try:
             r = requests.get(url, headers=self._headers(), params=params, timeout=20)
@@ -122,19 +179,26 @@ class MoySkladClient:
             data = r.json()
             rows = data.get("rows", []) if isinstance(data, dict) else []
             if not rows:
-                raise Exception(f"Product {ms_product_id} not found in MoySklad assortment")
+                log.warning(
+                    "Product %s not found in MoySklad stock report", ms_product_id
+                )
+                return None
             return rows[0]
         except Exception as e:
             log.warning(
-                f"Failed to fetch assortment stock url={url} ms_product_id={ms_product_id} err={e}"
+                "Failed to fetch stock report ms_product_id=%s err=%s", ms_product_id, e
             )
             raise Exception(f"Failed to fetch product stock from MoySklad: {e}")
 
     def get_product_stock(self, ms_product_id: str) -> float:
         """
         Возвращает текущий остаток товара.
+        Если товар не найден в отчёте — возвращает 0.0 (не исключение).
         """
         data = self.get_product_with_stock(ms_product_id)
+        if data is None:
+            return 0.0
+
         for key in ("stock", "quantity", "inStock"):
             value = data.get(key)
             if value is None:
@@ -144,9 +208,8 @@ class MoySkladClient:
             except (TypeError, ValueError):
                 pass
 
-        raise Exception(
-            f"Stock value is missing or invalid in MoySklad response for product {ms_product_id}"
-        )
+        log.warning("Stock field not found for product %s, returning 0", ms_product_id)
+        return 0.0
 
     # -----------------------------
     # Counterparty helpers
@@ -205,7 +268,7 @@ class MoySkladClient:
         for row in rows:
             for candidate in self._extract_email_candidates(row):
                 if candidate.strip().lower() == email_lower:
-                    log.info(f"Counterparty found by email={email_lower} id={row.get('id')}")
+                    log.debug(f"Counterparty found by email={email_lower} id={row.get('id')}")
                     return row
         return None
 
@@ -221,7 +284,7 @@ class MoySkladClient:
         for row in rows:
             for candidate in self._extract_phone_candidates(row):
                 if self._normalize_phone(candidate) == normalized_target:
-                    log.info(f"Counterparty found by phone={normalized_target} id={row.get('id')}")
+                    log.debug(f"Counterparty found by phone={normalized_target} id={row.get('id')}")
                     return row
         return None
 

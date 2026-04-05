@@ -28,8 +28,10 @@ def validate_sale_payload(payload: dict):
     if not payload.get("id"):
         raise SalePayloadError("Missing required field: id")
 
-    if payload.get("type") not in ("SELL", "sell"):
-        raise SalePayloadError(f"Unexpected document type: {payload.get('type')}")
+    if payload.get("type") != "SELL":
+        doc_type = str(payload.get("type") or "").strip().upper()
+        if doc_type != "SELL":
+            raise SalePayloadError(f"Unexpected document type: {payload.get('type')}")
 
     body = payload.get("body")
     if not body:
@@ -218,7 +220,7 @@ def map_sale_to_ms(
         ms_position = {
             "quantity": quantity,
             "price": round(base_price * 100),
-            "sum": round(base_sum * 100),
+            # "sum" убран — вычисляемое поле в МойСклад, отправка вызывает 400
         }
 
         discount_percent = _extract_discount_percent(item, base_sum, final_sum)
@@ -250,10 +252,11 @@ def map_sale_to_ms(
 
     ms_payload = {
         "syncId": effective_sync_id,
+        "externalCode": effective_sync_id,  # для идемпотентности (find_demand_by_external_code)
         "name": f"Sale {event_id}",
         "description": _build_description(payload, counterparty_resolution_source),
         "positions": ms_positions,
-        "sum": round(total_sum * 100),
+        # "sum" убран — вычисляемое поле в МойСклад
     }
 
     if ms_organization_id:

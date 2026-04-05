@@ -41,8 +41,17 @@ def resolve_counterparty_for_sale(payload: dict, tenant_id: str, default_ms_agen
             if row and row.get("id"):
                 return row["id"], "found_by_phone"
 
+        # МойСклад требует непустое имя контрагента — подбираем fallback
+        create_name = name or email or phone or "Покупатель"
+        if not name:
+            log.debug(
+                "Counterparty name is empty, using fallback tenant_id=%s resolution_source=created_counterparty",
+                tenant_id,
+                # fallback name намеренно не логируется — может содержать email или phone (PII)
+            )
+
         created = client.create_counterparty(
-            name=name,
+            name=create_name,
             phone=phone,
             email=email,
             inn=inn,
@@ -53,9 +62,8 @@ def resolve_counterparty_for_sale(payload: dict, tenant_id: str, default_ms_agen
 
         if default_ms_agent_id:
             log.warning(
-                "Counterparty create returned no id tenant_id=%s customer=%s, fallback to default agent",
+                "Counterparty create returned no id tenant_id=%s resolution_source=default_agent_on_error",
                 tenant_id,
-                customer,
             )
             return default_ms_agent_id, "default_agent_on_error"
 
@@ -64,10 +72,10 @@ def resolve_counterparty_for_sale(payload: dict, tenant_id: str, default_ms_agen
     except Exception as e:
         if default_ms_agent_id:
             log.warning(
-                "Counterparty resolve failed tenant_id=%s err=%s customer=%s, fallback to default agent",
+                "Counterparty resolve failed tenant_id=%s err=%s resolution_source=default_agent_on_error",
                 tenant_id,
                 e,
-                customer,
+                # customer намеренно не логируется — содержит PII (email, phone, name)
             )
             return default_ms_agent_id, "default_agent_on_error"
         raise

@@ -1,68 +1,86 @@
 import json
+import os
 import time
 import uuid
 import logging
+import hmac
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, ConfigDict
 
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 
-router = APIRouter()
+router = APIRouter(tags=["Evotor Webhooks"])
 log = logging.getLogger("api.webhooks")
 
 
+def _get_evotor_webhook_secret() -> str:
+    return os.getenv("EVOTOR_WEBHOOK_SECRET", "").strip()
+
+
+def _verify_evotor_signature(request_headers: dict) -> bool:
+    """
+    Эвотор передаёт токен в заголовке Authorization: Bearer <token>.
+    Проверяем, что токен совпадает с EVOTOR_WEBHOOK_SECRET.
+    Если секрет не настроен — пропускаем проверку (для локальной разработки).
+    """
+    secret = _get_evotor_webhook_secret()
+    if not secret:
+        log.warning("EVOTOR_WEBHOOK_SECRET not set — skipping signature verification")
+        return True
+
+    auth_header = (
+        request_headers.get("authorization")
+        or request_headers.get("Authorization")
+        or ""
+    ).strip()
+
+    if not auth_header.startswith("Bearer "):
+        return False
+
+    token = auth_header.removeprefix("Bearer ").strip()
+    return hmac.compare_digest(token, secret)
+
+
 class EvotorPosition(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     product_id: str
     product_name: Optional[str] = None
     quantity: float
     price: float
     sum: Optional[float] = None
 
-    class Config:
-        extra = "allow"
-
 
 class EvotorBody(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     positions: List[EvotorPosition]
     sum: Optional[float] = None
 
-    class Config:
-        extra = "allow"
-
 
 class EvotorWebhook(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: str
     id: str
     store_id: Optional[str] = None
     device_id: Optional[str] = None
     body: Optional[EvotorBody] = None
 
-    class Config:
-        extra = "allow"
-
 
 LIKELY_CUSTOMER_KEYS = (
-    "buyer",
-    "customer",
-    "client",
-    "contractor",
-    "customerInfo",
-    "buyerInfo",
-    "customer_info",
-    "buyer_info",
-    "buyerRequisites",
-    "buyer_requisites",
-    "paymentCustomer",
-    "payment_customer",
+    "buyer", "customer", "client", "contractor",
+    "customerInfo", "buyerInfo", "customer_info", "buyer_info",
+    "buyerRequisites", "buyer_requisites",
+    "paymentCustomer", "payment_customer",
 )
 
 
 def _pick_first_direct(d: dict, aliases: list[str]):
     if not isinstance(d, dict):
         return None
-
     aliases_lower = {alias.lower() for alias in aliases}
     for key, value in d.items():
         if value in (None, "", [], {}):
@@ -82,61 +100,38 @@ def _safe_float(value):
 
 
 def _extract_customer(candidate_root: dict | None) -> dict | None:
-    """
-    Пытается вытащить данные покупателя из наиболее вероятных полей ReceiptCreated.
-    Работает мягко: если поля нет, пайплайн продажи не ломается.
-    """
     if not isinstance(candidate_root, dict):
         return None
 
     candidate_dicts: list[dict] = []
-
     for key in LIKELY_CUSTOMER_KEYS:
         value = candidate_root.get(key)
         if isinstance(value, dict):
             candidate_dicts.append(value)
-
     candidate_dicts.append(candidate_root)
 
     for candidate in candidate_dicts:
-        name = _pick_first_direct(candidate, [
-            "name", "fullName", "fio", "customerName", "buyerName", "clientName"
-        ])
-        phone = _pick_first_direct(candidate, [
-            "phone", "phoneNumber", "customerPhone", "buyerPhone", "clientPhone", "tel", "telephone", "mobilePhone"
-        ])
-        email = _pick_first_direct(candidate, [
-            "email", "eMail", "mail", "customerEmail", "buyerEmail", "clientEmail"
-        ])
-        inn = _pick_first_direct(candidate, [
-            "inn", "customerInn", "buyerInn", "clientInn", "payerInn"
-        ])
+        name  = _pick_first_direct(candidate, ["name", "fullName", "fio", "customerName", "buyerName", "clientName"])
+        phone = _pick_first_direct(candidate, ["phone", "phoneNumber", "customerPhone", "buyerPhone", "clientPhone", "tel", "telephone", "mobilePhone"])
+        email = _pick_first_direct(candidate, ["email", "eMail", "mail", "customerEmail", "buyerEmail", "clientEmail"])
+        inn   = _pick_first_direct(candidate, ["inn", "customerInn", "buyerInn", "clientInn", "payerInn"])
 
         if any(v not in (None, "") for v in (name, phone, email, inn)):
             return {
-                "name": str(name).strip() if name not in (None, "") else None,
+                "name":  str(name).strip()  if name  not in (None, "") else None,
                 "phone": str(phone).strip() if phone not in (None, "") else None,
                 "email": str(email).strip() if email not in (None, "") else None,
-                "inn": str(inn).strip() if inn not in (None, "") else None,
-                "raw": candidate,
+                "inn":   str(inn).strip()   if inn   not in (None, "") else None,
+                "raw":   candidate,
             }
-
     return None
 
 
 def _normalize_receipt_created(body_dict: dict) -> tuple[str, str, dict] | tuple[None, None, None]:
-    """
-    Преобразует Evotor ReceiptCreated во внутренний формат события.
-
-    Поддерживает несколько реальных вариантов скидок:
-    1) resultPrice / resultSum
-    2) positionDiscount / docDistributedDiscount
-    3) простое поле discount в item + totalDiscount на уровне документа
-    """
     data = body_dict.get("data") or {}
-    receipt_doc_type = data.get("type")
+    receipt_doc_type = (data.get("type") or "").strip().upper()
 
-    if receipt_doc_type not in ("SELL", "sell"):
+    if receipt_doc_type != "SELL":
         return None, None, None
 
     positions = []
@@ -144,17 +139,15 @@ def _normalize_receipt_created(body_dict: dict) -> tuple[str, str, dict] | tuple
     has_any_result_sum = False
 
     for item in data.get("items", []):
-        quantity = _safe_float(item.get("quantity")) or 0.0
-        price = _safe_float(item.get("price")) or 0.0
-        line_sum = _safe_float(item.get("sumPrice"))
+        quantity  = _safe_float(item.get("quantity")) or 0.0
+        price     = _safe_float(item.get("price")) or 0.0
+        line_sum  = _safe_float(item.get("sumPrice"))
         if line_sum is None:
             line_sum = quantity * price
 
         result_price = _safe_float(item.get("resultPrice", item.get("result_price")))
-        result_sum = _safe_float(item.get("resultSum", item.get("result_sum")))
+        result_sum   = _safe_float(item.get("resultSum",   item.get("result_sum")))
 
-        # Реальный payload Эвотор может присылать только абсолютную скидку по позиции:
-        # item.discount = 0.1, без resultSum/resultPrice.
         raw_discount = _safe_float(item.get("discount"))
         if result_sum is None and raw_discount is not None:
             result_sum = max(0.0, line_sum - raw_discount)
@@ -169,24 +162,21 @@ def _normalize_receipt_created(body_dict: dict) -> tuple[str, str, dict] | tuple
             computed_total_sum += line_sum
 
         positions.append({
-            "product_id": item.get("id"),
-            "product_name": item.get("name"),
-            "quantity": quantity,
-            "price": price,
-            "sum": line_sum,
-            "result_price": result_price,
-            "result_sum": result_sum,
-            "position_discount": item.get("positionDiscount", item.get("position_discount")),
-            "doc_distributed_discount": item.get("docDistributedDiscount", item.get("doc_distributed_discount")),
-            "discount": raw_discount,
-            "tax": item.get("tax"),
-            "tax_percent": item.get("taxPercent", item.get("tax_percent")),
-            "raw": item,
+            "product_id":               item.get("id") or item.get("productId") or item.get("product_id"),
+            "product_name":             item.get("name"),
+            "quantity":                 quantity,
+            "price":                    price,
+            "sum":                      line_sum,
+            "result_price":             result_price,
+            "result_sum":               result_sum,
+            "position_discount":        item.get("positionDiscount",        item.get("position_discount")),
+            "doc_distributed_discount": item.get("docDistributedDiscount",  item.get("doc_distributed_discount")),
+            "discount":                 raw_discount,
+            "tax":                      item.get("tax"),
+            "tax_percent":              item.get("taxPercent", item.get("tax_percent")),
+            "raw":                      item,
         })
 
-    # Для итоговой суммы документа приоритет такой:
-    # 1) сумма пересчитанных result_sum по позициям
-    # 2) totalAmount из webhook
     document_sum = computed_total_sum if positions else None
     if not has_any_result_sum:
         total_amount = _safe_float(data.get("totalAmount"))
@@ -194,55 +184,165 @@ def _normalize_receipt_created(body_dict: dict) -> tuple[str, str, dict] | tuple
             document_sum = total_amount
 
     normalized_payload = {
-        "id": body_dict.get("id") or data.get("id") or str(uuid.uuid4()),
-        "type": receipt_doc_type,
-        "store_id": body_dict.get("store_id") or data.get("storeId"),
-        "device_id": body_dict.get("device_id") or data.get("deviceId"),
+        "id":       body_dict.get("id") or data.get("id") or str(uuid.uuid4()),
+        "type":     "SELL",
+        "store_id": body_dict.get("store_id") or body_dict.get("storeId") or data.get("storeId"),
+        "device_id":body_dict.get("device_id") or body_dict.get("deviceId") or data.get("deviceId"),
         "customer": _extract_customer(data),
         "body": {
-            "positions": positions,
-            "sum": document_sum,
-            "doc_discounts": data.get("docDiscounts", data.get("doc_discounts", [])) or [],
+            "positions":      positions,
+            "sum":            document_sum,
+            "doc_discounts":  data.get("docDiscounts", data.get("doc_discounts", [])) or [],
             "total_discount": _safe_float(data.get("totalDiscount")),
-            "total_tax": _safe_float(data.get("totalTax")),
+            "total_tax":      _safe_float(data.get("totalTax")),
         },
         "source_event_type": body_dict.get("type"),
-        "source_data": data,
+        "source_data":       data,
     }
 
-    event_type = "sale"
-    event_key = normalized_payload["id"]
-    return event_type, event_key, normalized_payload
+    return "sale", normalized_payload["id"], normalized_payload
 
 
-@router.post("/webhooks/evotor/{tenant_id}")
-async def evotor_webhook(tenant_id: str, raw_body: EvotorWebhook):
-    body_dict = raw_body.dict()
-
-    log.info(f"RAW EVOTOR BODY tenant_id={tenant_id} body={json.dumps(body_dict, ensure_ascii=False)}")
-
-    # Событие установки приложения — сохраняем токен клиента
-    if "token" in body_dict and "userUuid" in body_dict:
-        evotor_token = body_dict.get("token")
-        evotor_user_id = body_dict.get("userId") or body_dict.get("userUuid")
-
-        log.info(f"Install event tenant_id={tenant_id} userId={evotor_user_id} token_exists={bool(evotor_token)}")
-
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE tenants
-            SET evotor_user_id = ?, evotor_token = ?
-            WHERE id = ?
-            """,
-            (evotor_user_id, evotor_token, tenant_id),
-        )
-        conn.commit()
+def _query_single_tenant_id(sql: str, params: tuple) -> str | None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(aq(sql), params)
+        rows = cur.fetchall()
+    finally:
         conn.close()
 
-        log.info(f"Evotor token saved tenant_id={tenant_id}")
-        return {"status": "accepted"}
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Ambiguous tenant resolution for Evotor webhook. Resolve duplicate Evotor binding first.",
+        )
+    return rows[0]["id"]
+
+
+def _resolve_tenant_id_by_store_id(store_id: str | None) -> str | None:
+    if not store_id:
+        return None
+    return _query_single_tenant_id(
+        "SELECT id FROM tenants WHERE evotor_store_id = ?",
+        (store_id,),
+    )
+
+
+def _resolve_tenant_id_by_user_id(user_id: str | None) -> str | None:
+    if not user_id:
+        return None
+    return _query_single_tenant_id(
+        "SELECT id FROM tenants WHERE evotor_user_id = ?",
+        (user_id,),
+    )
+
+
+def _extract_store_id(body_dict: dict, normalized_payload: dict | None = None) -> str | None:
+    data = body_dict.get("data") or {}
+    if normalized_payload:
+        value = normalized_payload.get("store_id")
+        if value:
+            return str(value)
+    for value in (
+        body_dict.get("store_id"),
+        body_dict.get("storeId"),
+        data.get("store_id"),
+        data.get("storeId"),
+    ):
+        if value:
+            return str(value)
+    return None
+
+
+def _extract_user_id(body_dict: dict) -> str | None:
+    data = body_dict.get("data") or {}
+    for value in (
+        body_dict.get("userId"),
+        body_dict.get("userUuid"),
+        data.get("userId"),
+        data.get("userUuid"),
+    ):
+        if value:
+            return str(value)
+    return None
+
+
+def _resolve_tenant_id(
+    explicit_tenant_id: str | None,
+    body_dict: dict,
+    normalized_payload: dict | None = None,
+) -> str:
+    if explicit_tenant_id:
+        return explicit_tenant_id
+
+    store_id = _extract_store_id(body_dict, normalized_payload=normalized_payload)
+    if store_id:
+        tenant_id = _resolve_tenant_id_by_store_id(store_id)
+        if tenant_id:
+            return tenant_id
+
+    user_id = _extract_user_id(body_dict)
+    if user_id:
+        tenant_id = _resolve_tenant_id_by_user_id(user_id)
+        if tenant_id:
+            return tenant_id
+
+    raise HTTPException(
+        status_code=404,
+        detail="Unable to resolve tenant for Evotor webhook. Configure evotor_store_id or evotor_user_id for this tenant.",
+    )
+
+
+@router.post("/webhooks/evotor")
+@router.post("/webhooks/evotor/{tenant_id}")
+async def evotor_webhook(raw_body: EvotorWebhook, request: Request, tenant_id: str | None = None):
+    if not _verify_evotor_signature(dict(request.headers)):
+        log.warning(
+            "Evotor webhook signature verification failed tenant_id=%s ip=%s user_agent=%s",
+            tenant_id,
+            request.client.host if request.client else "unknown",
+            request.headers.get("user-agent", ""),
+        )
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    body_dict = raw_body.model_dump()
+    log.debug(
+        "RAW EVOTOR BODY tenant_id=%s body=%s",
+        tenant_id,
+        json.dumps(body_dict, ensure_ascii=False),
+    )
+
+    # Событие установки приложения — сохраняем токен клиента
+    if "token" in body_dict and ("userUuid" in body_dict or "userId" in body_dict):
+        resolved_tenant_id = _resolve_tenant_id(tenant_id, body_dict)
+        evotor_token   = body_dict.get("token")
+        evotor_user_id = body_dict.get("userId") or body_dict.get("userUuid")
+
+        log.info(
+            "Install event tenant_id=%s userId=%s token_exists=%s",
+            resolved_tenant_id, evotor_user_id, bool(evotor_token),
+        )
+
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                aq("""
+                UPDATE tenants
+                SET evotor_user_id = ?, evotor_token = ?
+                WHERE id = ?
+                """),
+                (evotor_user_id, evotor_token, resolved_tenant_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        log.info("Evotor token saved tenant_id=%s", resolved_tenant_id)
+        return {"status": "accepted", "tenant_id": resolved_tenant_id}
 
     event_type_raw = body_dict.get("type") or "sale"
 
@@ -250,66 +350,86 @@ async def evotor_webhook(tenant_id: str, raw_body: EvotorWebhook):
         event_type, event_id, normalized_payload = _normalize_receipt_created(body_dict)
 
         if not event_type:
-            log.warning(f"Unsupported ReceiptCreated subtype tenant_id={tenant_id} raw_type={event_type_raw}")
+            log.warning(
+                "Unsupported ReceiptCreated subtype tenant_id=%s raw_type=%s",
+                tenant_id, event_type_raw,
+            )
             return {"status": "skipped", "reason": "unsupported receipt subtype"}
 
         payload_to_store = normalized_payload
     else:
+        normalized_payload = None
         event_id = body_dict.get("id") or str(uuid.uuid4())
         event_type_map = {
-            "SELL": "sale",
-            "sell": "sale",
-            "Receipt": "sale",
-            "receipt": "sale",
+            "SELL": "sale", "sell": "sale",
+            "Receipt": "sale", "receipt": "sale",
         }
-        event_type = event_type_map.get(event_type_raw, event_type_raw.lower())
+        event_type     = event_type_map.get(event_type_raw, event_type_raw.lower())
         payload_to_store = body_dict
 
-    log.info(f"Webhook parsed tenant_id={tenant_id} event_type={event_type} event_key={event_id}")
+    resolved_tenant_id = _resolve_tenant_id(
+        tenant_id, body_dict, normalized_payload=normalized_payload,
+    )
 
-    if event_type not in ("sale", "product"):
-        log.warning(f"Unknown event_type={event_type} raw={event_type_raw} — skipping")
-        return {"status": "skipped", "reason": f"unknown event_type: {event_type_raw}"}
+    log.info(
+        "Webhook parsed tenant_id=%s event_type=%s event_key=%s",
+        resolved_tenant_id, event_type, event_id,
+    )
+
+    if event_type not in ("sale",):
+        log.warning("Unsupported event_type=%s raw=%s — skipping", event_type, event_type_raw)
+        return {"status": "skipped", "reason": f"unsupported event_type: {event_type_raw}"}
 
     now = int(time.time())
     event_store_id = str(uuid.uuid4())
 
     conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT id FROM tenants WHERE id = ?", (tenant_id,))
-    row = cursor.fetchone()
-
-    if row is None:
-        conn.close()
-        raise HTTPException(status_code=404, detail="tenant not found")
-
-    cursor.execute(
-        """
-        SELECT 1 FROM processed_events
-        WHERE tenant_id = ? AND event_key = ?
-        """,
-        (tenant_id, event_id),
-    )
-
-    if cursor.fetchone() is not None:
-        conn.close()
-        log.info(f"Already processed tenant_id={tenant_id} event_key={event_id}")
-        return {"status": "already_processed"}
-
     try:
-        cursor.execute(
-            """
+        cur = conn.cursor()
+
+        cur.execute(aq("SELECT id FROM tenants WHERE id = ?"), (resolved_tenant_id,))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="tenant not found")
+
+        cur.execute(
+            aq("""
+            SELECT 1 FROM processed_events
+            WHERE tenant_id = ? AND event_key = ?
+            """),
+            (resolved_tenant_id, event_id),
+        )
+        if cur.fetchone() is not None:
+            log.info("Already processed tenant_id=%s event_key=%s", resolved_tenant_id, event_id)
+            return {"status": "already_processed", "tenant_id": resolved_tenant_id}
+
+        cur.execute(
+            aq("""
+            SELECT id FROM event_store
+            WHERE tenant_id = ? AND event_key = ?
+            LIMIT 1
+            """),
+            (resolved_tenant_id, event_id),
+        )
+        existing_queued = cur.fetchone()
+        if existing_queued is not None:
+            log.info("Already queued tenant_id=%s event_key=%s", resolved_tenant_id, event_id)
+            return {
+                "status": "already_queued",
+                "event_id": existing_queued["id"],
+                "tenant_id": resolved_tenant_id,
+            }
+
+        cur.execute(
+            aq("""
             INSERT INTO event_store (
                 id, tenant_id, event_type, event_key, payload_json,
-                status, retries, next_retry_at,
-                created_at, updated_at
+                status, retries, next_retry_at, created_at, updated_at
             )
             VALUES (?, ?, ?, ?, ?, 'NEW', 0, NULL, ?, ?)
-            """,
+            """),
             (
                 event_store_id,
-                tenant_id,
+                resolved_tenant_id,
                 event_type,
                 event_id,
                 json.dumps(payload_to_store, ensure_ascii=False),
@@ -318,12 +438,34 @@ async def evotor_webhook(tenant_id: str, raw_body: EvotorWebhook):
             ),
         )
         conn.commit()
+
+    except HTTPException:
+        raise
     except Exception as e:
+        conn.rollback()
+        # Обрабатываем гонку дублей (unique constraint) — возвращаем already_queued
+        err_str = str(e).lower()
+        if "unique" in err_str or "duplicate" in err_str:
+            cur2 = conn.cursor()
+            cur2.execute(
+                aq("SELECT id FROM event_store WHERE tenant_id = ? AND event_key = ? LIMIT 1"),
+                (resolved_tenant_id, event_id),
+            )
+            existing = cur2.fetchone()
+            log.info("Race-duplicate insert tenant_id=%s event_key=%s", resolved_tenant_id, event_id)
+            return {
+                "status": "already_queued",
+                "event_id": existing["id"] if existing else None,
+                "tenant_id": resolved_tenant_id,
+            }
+        log.exception("DB error on event insert tenant_id=%s event_key=%s", resolved_tenant_id, event_id)
+        raise HTTPException(status_code=500, detail="Internal database error")
+    finally:
         conn.close()
-        return {"status": "duplicate_or_error", "detail": str(e)}
 
-    conn.close()
+    log.info(
+        "Event stored NEW event_id=%s tenant_id=%s event_key=%s",
+        event_store_id, resolved_tenant_id, event_id,
+    )
 
-    log.info(f"Event stored NEW event_id={event_store_id} tenant_id={tenant_id} event_key={event_id}")
-
-    return {"status": "accepted", "event_id": event_store_id}
+    return {"status": "accepted", "event_id": event_store_id, "tenant_id": resolved_tenant_id}
