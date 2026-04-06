@@ -6,7 +6,18 @@ import logging
 import os
 import time
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request, Response
+from starlette.responses import Response as StarletteResponse
+
+from app.observability.metrics import (
+    api_exceptions_total,
+    api_request_duration_seconds,
+    api_requests_total,
+    errors_count,
+    event_store_status_count,
+    metrics_response,
+    stock_sync_error_tenants,
+)
 
 from app.logger import setup_logging
 from app.db import get_connection, adapt_query as aq
@@ -29,6 +40,7 @@ log = logging.getLogger("api")
 SERVICE_NAME = "integration-bus"
 WORKER_HEARTBEAT_NAME = "worker"
 WORKER_STALE_AFTER_SEC = int(os.getenv("WORKER_STALE_AFTER_SEC", "30"))
+EVENT_STORE_METRIC_STATUSES = ("NEW", "PROCESSING", "DONE", "RETRY", "FAILED")
 
 openapi_tags = [
     {"name": "Infrastructure", "description": "Служебные endpoint'ы приложения"},
@@ -65,6 +77,54 @@ app.include_router(evotor_router)
 app.include_router(moysklad_webhooks_router)
 
 
+@app.middleware("http")
+async def prometheus_http_metrics(request: Request, call_next):
+    method = request.method
+    start = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or request.url.path
+
+        api_exceptions_total.labels(
+            method=method,
+            path=path,
+            exception_type=exc.__class__.__name__,
+        ).inc()
+
+        api_requests_total.labels(
+            method=method,
+            path=path,
+            status="500",
+        ).inc()
+
+        api_request_duration_seconds.labels(
+            method=method,
+            path=path,
+        ).observe(time.perf_counter() - start)
+
+        raise
+
+    route = request.scope.get("route")
+    path = getattr(route, "path", None) or request.url.path
+    status = str(response.status_code)
+
+    api_requests_total.labels(
+        method=method,
+        path=path,
+        status=status,
+    ).inc()
+
+    api_request_duration_seconds.labels(
+        method=method,
+        path=path,
+    ).observe(time.perf_counter() - start)
+
+    return response
+
+
 def _health_error_response(now_ts: int, detail: str) -> dict:
     return {
         "status": "error",
@@ -91,6 +151,51 @@ def _health_error_response(now_ts: int, detail: str) -> dict:
             "last_sync_at": None,
         },
     }
+
+
+def _refresh_prometheus_db_metrics() -> None:
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT status, COUNT(*) AS cnt
+            FROM event_store
+            GROUP BY status
+            """
+        )
+        counts = {status: 0 for status in EVENT_STORE_METRIC_STATUSES}
+        for row in cur.fetchall():
+            status = row["status"]
+            if status in counts:
+                counts[status] = row["cnt"]
+
+        for status, count in counts.items():
+            event_store_status_count.labels(status=status).set(count)
+
+        cur.execute("SELECT COUNT(*) AS cnt FROM errors")
+        errors_row = cur.fetchone()
+        errors_count.set(errors_row["cnt"] if errors_row else 0)
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM stock_sync_status
+            WHERE status = 'error'
+            """
+        )
+        stock_error_row = cur.fetchone()
+        stock_sync_error_tenants.set(stock_error_row["cnt"] if stock_error_row else 0)
+    except Exception:
+        log.exception("Failed to refresh Prometheus DB gauges")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 @app.get("/health", tags=["Infrastructure"])
@@ -131,7 +236,9 @@ def health():
         )
         event_counts = {"NEW": 0, "RETRY": 0, "FAILED": 0, "PROCESSING": 0}
         for row in cur.fetchall():
-            event_counts[row["status"]] = row["cnt"]
+            status = row["status"]
+            if status in event_counts:
+                event_counts[status] = row["cnt"]
 
         cur.execute("SELECT MAX(processed_at) AS last_processed_at FROM processed_events")
         last_processed_row = cur.fetchone()
@@ -195,3 +302,10 @@ def health():
             "last_sync_at": stock_last_sync_at,
         },
     }
+
+
+@app.get("/metrics", tags=["Infrastructure"])
+def metrics() -> Response:
+    _refresh_prometheus_db_metrics()
+    payload, content_type = metrics_response()
+    return StarletteResponse(content=payload, media_type=content_type)

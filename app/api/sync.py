@@ -4,10 +4,47 @@ import logging
 import requests
 
 from fastapi import APIRouter, HTTPException
+from app.observability.metrics import (
+    fiscalization_request_duration_seconds,
+    fiscalization_requests_total,
+    fiscalization_state_total,
+    fiscalization_status_checks_total,
+    observe_duration,
+)
 from app.db import get_connection, adapt_query as aq
 from app.stores.mapping_store import MappingStore
 
 log = logging.getLogger("api.sync")
+
+
+def _sync_extra(
+    tenant_id: str | None = None,
+    *,
+    uid: str | None = None,
+    doc_id: str | None = None,
+    operation: str,
+    status: str | None = None,
+    exception_type: str | None = None,
+    component: str = "sync",
+) -> dict:
+    payload = {
+        "component": component,
+        "operation": operation,
+    }
+
+    if tenant_id is not None:
+        payload["tenant_id"] = tenant_id
+    if uid is not None:
+        payload["uid"] = uid
+    if doc_id is not None:
+        payload["doc_id"] = doc_id
+    if status is not None:
+        payload["status"] = status
+    if exception_type is not None:
+        payload["exception_type"] = exception_type
+
+    return payload
+
 router = APIRouter(tags=["Sync"])
 
 MS_BASE = os.getenv("MS_BASE_URL", "https://api.moysklad.ru/api/remap/1.2").rstrip("/")
@@ -20,6 +57,17 @@ EVOTOR_BASE = "https://api.evotor.ru"
 
 def _now() -> int:
     return int(time.time())
+
+
+def _fiscalization_state_label(state_code: int) -> str:
+    state_labels = {
+        1: "new",
+        2: "sent_to_device",
+        5: "accepted_by_device",
+        9: "error",
+        10: "fiscalized",
+    }
+    return state_labels.get(state_code, "unknown")
 
 
 def _load_tenant(tenant_id: str) -> dict:
@@ -1373,117 +1421,49 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
     import uuid as _uuid
     from app.clients.fiscalization_client import FiscalizationClient
 
-    tenant = _load_tenant(tenant_id)
+    metric_recorded = False
 
-    if not tenant.get("sync_completed_at"):
-        raise HTTPException(status_code=409, detail="Initial sync not completed.")
-    if not tenant.get("moysklad_token"):
-        raise HTTPException(status_code=400, detail="moysklad_token not configured")
-    if not tenant.get("fiscal_token"):
-        raise HTTPException(
-            status_code=400,
-            detail="fiscal_token not configured. Use PATCH /tenants/{tenant_id}/fiscal",
-        )
-    if not tenant.get("fiscal_client_uid"):
-        raise HTTPException(status_code=400, detail="fiscal_client_uid not configured")
-    if not tenant.get("fiscal_device_uid"):
-        raise HTTPException(status_code=400, detail="fiscal_device_uid not configured")
+    def record_request(result: str) -> None:
+        nonlocal metric_recorded
+        if metric_recorded:
+            return
+        fiscalization_requests_total.labels(result=result).inc()
+        metric_recorded = True
 
-    ms_token = tenant["moysklad_token"]
-    fiscal_client_uid = tenant["fiscal_client_uid"]
-    fiscal_device_uid = tenant["fiscal_device_uid"]
-
-    existing = _get_existing_fiscal_check(tenant_id, ms_demand_id)
-    if existing:
-        return {
-            "status": "already_exists",
-            "uid": existing["uid"],
-            "tenant_id": existing["tenant_id"],
-            "ms_demand_id": existing["ms_demand_id"],
-            "state": existing["status"],
-            "description": existing.get("description"),
-            "error_code": existing.get("error_code"),
-            "error_message": existing.get("error_message"),
-        }
-
-    check_uid = str(_uuid.uuid4())
-
-    try:
-        url = f"{MS_BASE}/entity/demand/{ms_demand_id}"
-        r = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
-        if not r.ok:
-            r.raise_for_status()
-        demand = r.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch demand: {e}")
-
-    try:
-        payload = _map_demand_to_fiscal_check(
-            demand=demand,
-            tenant_id=tenant_id,
-            ms_token=ms_token,
-            fiscal_client_uid=fiscal_client_uid,
-            fiscal_device_uid=fiscal_device_uid,
-            check_uid=check_uid,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Failed to map demand: {e}")
-
-    log.info(
-        "Fiscalizing demand tenant_id=%s ms_demand_id=%s uid=%s positions=%s",
-        tenant_id, ms_demand_id, check_uid, len(payload["Data"]["products"]),
-    )
-
-    request_json = _json.dumps(payload, ensure_ascii=False)
-    try:
-        fiscal_client = FiscalizationClient(tenant["fiscal_token"])
-        result = fiscal_client.create_check(payload)
-        response_json = _json.dumps(result, ensure_ascii=False)
-        description = result.get("Info") if isinstance(result.get("Info"), str) else None
-        error_code = None
-        error_message = None
-        state = None
-        if isinstance(result, dict):
-            state = (result.get("CheckState") or result.get("checkState") or {}).get("State")
-        status = int(state) if state is not None else 2
-    except Exception as e:
-        response_json = str(e)
+    with observe_duration(fiscalization_request_duration_seconds):
         try:
-            _save_fiscal_check(
-                tenant_id, check_uid, ms_demand_id,
-                fiscal_client_uid, fiscal_device_uid,
-                status=1,
-                request_json=request_json,
-                response_json=response_json,
-                description="Send failed (will retry)",
-                error_code=None,
-                error_message=str(e),
-            )
-        except Exception:
-            log.exception(
-                "Failed to save fiscalization error record tenant_id=%s ms_demand_id=%s",
-                tenant_id, ms_demand_id,
-            )
-        raise HTTPException(status_code=502, detail=f"Failed to send check: {e}")
+            tenant = _load_tenant(tenant_id)
 
-    try:
-        _save_fiscal_check(
-            tenant_id, check_uid, ms_demand_id,
-            fiscal_client_uid, fiscal_device_uid,
-            status=status,
-            request_json=request_json,
-            response_json=response_json,
-            description=description,
-            error_code=error_code,
-            error_message=error_message,
-        )
-    except Exception as e:
-        err_str = str(e).lower()
-        if "unique" in err_str or "duplicate" in err_str:
+            if not tenant.get("sync_completed_at"):
+                raise HTTPException(status_code=409, detail="Initial sync not completed.")
+            if not tenant.get("moysklad_token"):
+                raise HTTPException(status_code=400, detail="moysklad_token not configured")
+            if not tenant.get("fiscal_token"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="fiscal_token not configured. Use PATCH /tenants/{tenant_id}/fiscal",
+                )
+            if not tenant.get("fiscal_client_uid"):
+                raise HTTPException(status_code=400, detail="fiscal_client_uid not configured")
+            if not tenant.get("fiscal_device_uid"):
+                raise HTTPException(status_code=400, detail="fiscal_device_uid not configured")
+
+            ms_token = tenant["moysklad_token"]
+            fiscal_client_uid = tenant["fiscal_client_uid"]
+            fiscal_device_uid = tenant["fiscal_device_uid"]
+
             existing = _get_existing_fiscal_check(tenant_id, ms_demand_id)
             if existing:
+                record_request("already_exists")
+                log.info(
+                    "fiscalization request already exists",
+                    extra=_sync_extra(
+                        tenant_id,
+                        doc_id=ms_demand_id,
+                        operation="sync.fiscalize",
+                        status="already_exists",
+                    ),
+                )
                 return {
                     "status": "already_exists",
                     "uid": existing["uid"],
@@ -1494,16 +1474,151 @@ def fiscalize_demand(tenant_id: str, ms_demand_id: str):
                     "error_code": existing.get("error_code"),
                     "error_message": existing.get("error_message"),
                 }
-        raise
 
-    return {
-        "status": "queued",
-        "uid": check_uid,
-        "tenant_id": tenant_id,
-        "ms_demand_id": ms_demand_id,
-        "positions": len(payload["Data"]["products"]),
-        "sum": payload["Data"]["payCashSumma"],
-    }
+            check_uid = str(_uuid.uuid4())
+
+            try:
+                url = f"{MS_BASE}/entity/demand/{ms_demand_id}"
+                r = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
+                if not r.ok:
+                    r.raise_for_status()
+                demand = r.json()
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Failed to fetch demand: {e}")
+
+            try:
+                payload = _map_demand_to_fiscal_check(
+                    demand=demand,
+                    tenant_id=tenant_id,
+                    ms_token=ms_token,
+                    fiscal_client_uid=fiscal_client_uid,
+                    fiscal_device_uid=fiscal_device_uid,
+                    check_uid=check_uid,
+                )
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=422, detail=f"Failed to map demand: {e}")
+
+            log.info(
+                "fiscalization request prepared",
+                extra=_sync_extra(
+                    tenant_id,
+                    uid=check_uid,
+                    doc_id=ms_demand_id,
+                    operation="sync.fiscalize",
+                    status="prepared",
+                ),
+            )
+
+            request_json = _json.dumps(payload, ensure_ascii=False)
+            try:
+                fiscal_client = FiscalizationClient(tenant["fiscal_token"])
+                result = fiscal_client.create_check(payload)
+                response_json = _json.dumps(result, ensure_ascii=False)
+                description = result.get("Info") if isinstance(result.get("Info"), str) else None
+                error_code = None
+                error_message = None
+                state = None
+                if isinstance(result, dict):
+                    state = (result.get("CheckState") or result.get("checkState") or {}).get("State")
+                status = int(state) if state is not None else 2
+            except Exception as e:
+                response_json = str(e)
+                try:
+                    _save_fiscal_check(
+                        tenant_id, check_uid, ms_demand_id,
+                        fiscal_client_uid, fiscal_device_uid,
+                        status=1,
+                        request_json=request_json,
+                        response_json=response_json,
+                        description="Send failed (will retry)",
+                        error_code=None,
+                        error_message=str(e),
+                    )
+                except Exception:
+                    log.exception(
+                        "failed to save fiscalization error record",
+                        extra=_sync_extra(
+                            tenant_id,
+                            doc_id=ms_demand_id,
+                            operation="sync.fiscalize",
+                            status="save_error_failed",
+                        ),
+                    )
+                record_request("send_failed")
+                log.error(
+                    "fiscalization request failed",
+                    extra=_sync_extra(
+                        tenant_id,
+                        doc_id=ms_demand_id,
+                        operation="sync.fiscalize",
+                        status="send_failed",
+                        exception_type=type(e).__name__,
+                    ),
+                )
+                raise HTTPException(status_code=502, detail=f"Failed to send check: {e}")
+
+            try:
+                _save_fiscal_check(
+                    tenant_id, check_uid, ms_demand_id,
+                    fiscal_client_uid, fiscal_device_uid,
+                    status=status,
+                    request_json=request_json,
+                    response_json=response_json,
+                    description=description,
+                    error_code=error_code,
+                    error_message=error_message,
+                )
+            except Exception as e:
+                err_str = str(e).lower()
+                if "unique" in err_str or "duplicate" in err_str:
+                    existing = _get_existing_fiscal_check(tenant_id, ms_demand_id)
+                    if existing:
+                        record_request("already_exists")
+                        return {
+                            "status": "already_exists",
+                            "uid": existing["uid"],
+                            "tenant_id": existing["tenant_id"],
+                            "ms_demand_id": existing["ms_demand_id"],
+                            "state": existing["status"],
+                            "description": existing.get("description"),
+                            "error_code": existing.get("error_code"),
+                            "error_message": existing.get("error_message"),
+                        }
+                record_request("unexpected_error")
+                raise
+
+            fiscalization_state_total.labels(
+                state_label=_fiscalization_state_label(status)
+            ).inc()
+            record_request("queued")
+            log.info(
+                "fiscalization request queued",
+                extra=_sync_extra(
+                    tenant_id,
+                    uid=check_uid,
+                    doc_id=ms_demand_id,
+                    operation="sync.fiscalize",
+                    status="queued",
+                ),
+            )
+            return {
+                "status": "queued",
+                "uid": check_uid,
+                "tenant_id": tenant_id,
+                "ms_demand_id": ms_demand_id,
+                "positions": len(payload["Data"]["products"]),
+                "sum": payload["Data"]["payCashSumma"],
+            }
+        except HTTPException:
+            if not metric_recorded:
+                record_request("unexpected_error")
+            raise
+        except Exception:
+            if not metric_recorded:
+                record_request("unexpected_error")
+            raise
 
 
 @router.get("/sync/{tenant_id}/fiscalization/{uid}")
@@ -1520,6 +1635,15 @@ def get_fiscal_check_status(tenant_id: str, uid: str):
     """
     from app.clients.fiscalization_client import FiscalizationClient
 
+    metric_recorded = False
+
+    def record_status_check(result: str) -> None:
+        nonlocal metric_recorded
+        if metric_recorded:
+            return
+        fiscalization_status_checks_total.labels(result=result).inc()
+        metric_recorded = True
+
     tenant = _load_tenant(tenant_id)
 
     if not tenant.get("fiscal_token"):
@@ -1535,28 +1659,58 @@ def get_fiscal_check_status(tenant_id: str, uid: str):
     conn.close()
 
     if not row:
+        record_status_check("not_found")
+        log.warning(
+            "fiscalization status check not found",
+            extra=_sync_extra(
+                tenant_id,
+                uid=uid,
+                operation="sync.fiscalization_status",
+                status="not_found",
+            ),
+        )
         raise HTTPException(status_code=404, detail="Fiscal check not found")
 
     try:
         fiscal_client = FiscalizationClient(tenant["fiscal_token"])
         state = fiscal_client.get_check_state(uid)
     except Exception as e:
+        record_status_check("transport_error")
+        log.error(
+            "fiscalization status check transport error",
+            extra=_sync_extra(
+                tenant_id,
+                uid=uid,
+                operation="sync.fiscalization_status",
+                status="transport_error",
+                exception_type=type(e).__name__,
+            ),
+        )
         raise HTTPException(status_code=502, detail=f"Failed to get check state: {e}")
 
     _update_fiscal_check_state(uid, state)
 
-    STATE_LABELS = {
-        1: "new", 2: "sent_to_device", 5: "accepted_by_device",
-        9: "error", 10: "fiscalized",
-    }
-    state_code = state.get("State", 1)
+    state_code = int(state.get("State", 1))
+    state_label = _fiscalization_state_label(state_code)
+    fiscalization_state_total.labels(state_label=state_label).inc()
+    record_status_check("ok")
+    log.info(
+        "fiscalization status fetched",
+        extra=_sync_extra(
+            tenant_id,
+            uid=uid,
+            doc_id=dict(row)["ms_demand_id"],
+            operation="sync.fiscalization_status",
+            status=state_label,
+        ),
+    )
 
     return {
         "uid": uid,
         "tenant_id": tenant_id,
         "ms_demand_id": dict(row)["ms_demand_id"],
         "state": state_code,
-        "state_label": STATE_LABELS.get(state_code, "unknown"),
+        "state_label": state_label,
         "description": state.get("Description"),
         "error_code": state.get("Error"),
         "error_message": state.get("ErrorMessage"),
@@ -1584,7 +1738,14 @@ def list_demands(tenant_id: str, limit: int = 20):
     try:
         r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
         if not r.ok:
-            log.error("Failed to fetch demands status=%s body=%s", r.status_code, r.text)
+            log.error(
+                "failed to fetch demands",
+                extra=_sync_extra(
+                    tenant_id,
+                    operation="sync.demands_list",
+                    status="http_error",
+                ),
+            )
             r.raise_for_status()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch demands from MoySklad: {e}")
