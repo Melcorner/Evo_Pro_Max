@@ -77,6 +77,9 @@ services:
         source: grafana-data
         target: /var/lib/grafana
     restart: unless-stopped
+    environment:
+      - GF_SERVER_ROOT_URL=https://a2.v.fomin.fvds.ru/grafana
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
     depends_on:
       - prometheus
       - loki
