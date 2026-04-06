@@ -86,11 +86,10 @@ def _get_pg_connection():
             "psycopg2 не установлен. Выполни: pip install psycopg2-binary"
         )
 
-    conn = psycopg2.connect(DATABASE_URL)
-    # DictCursor позволяет обращаться к колонкам по имени: row["tenant_id"]
-    conn.cursor_factory = psycopg2.extras.RealDictCursor
-    # autocommit=False по умолчанию — транзакции явные, как в SQLite
-    return conn
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
 
 
 # ---------------------------------------------------------------------------

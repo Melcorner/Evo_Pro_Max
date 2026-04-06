@@ -106,42 +106,44 @@ def _upsert_stock_status(
     now = _now()
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        aq("""
-        INSERT INTO stock_sync_status (
-            tenant_id,
-            status,
-            started_at,
-            updated_at,
-            last_sync_at,
-            last_error,
-            synced_items_count,
-            total_items_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(tenant_id)
-        DO UPDATE SET
-            status=excluded.status,
-            started_at=excluded.started_at,
-            updated_at=excluded.updated_at,
-            last_sync_at=excluded.last_sync_at,
-            last_error=excluded.last_error,
-            synced_items_count=excluded.synced_items_count,
-            total_items_count=excluded.total_items_count
-        """),
-        (
-            tenant_id,
-            status,
-            started_at,
-            now,
-            last_sync_at,
-            last_error,
-            synced_items_count,
-            total_items_count,
-        ),
-    )
-    conn.commit()
-    conn.close()
-
+    try:
+        cur.execute(
+            """
+            INSERT INTO stock_sync_status (
+                tenant_id,
+                status,
+                started_at,
+                updated_at,
+                last_sync_at,
+                last_error,
+                synced_items_count,
+                total_items_count
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id)
+            DO UPDATE SET
+                status = EXCLUDED.status,
+                started_at = EXCLUDED.started_at,
+                updated_at = EXCLUDED.updated_at,
+                last_sync_at = EXCLUDED.last_sync_at,
+                last_error = EXCLUDED.last_error,
+                synced_items_count = EXCLUDED.synced_items_count,
+                total_items_count = EXCLUDED.total_items_count
+            """,
+            (
+                tenant_id,
+                status,
+                started_at,
+                now,
+                last_sync_at,
+                last_error,
+                synced_items_count,
+                total_items_count,
+            ),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
 def _get_stock_status_row(tenant_id: str) -> dict | None:
     conn = get_connection()
