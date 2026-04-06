@@ -1,87 +1,45 @@
-services:
-  prometheus:
-    image: prom/prometheus:v2.52.0
-    container_name: integration-prometheus
-    command:
-      - "--config.file=/etc/prometheus-config/prometheus.yml"
-    ports:
-      - "9090:9090"
-    volumes:
-      - type: bind
-        source: ./observability/prometheus
-        target: /etc/prometheus-config
-        read_only: true
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
+auth_enabled: false
 
-  loki:
-    image: grafana/loki:2.9.8
-    container_name: integration-loki
-    command:
-      - "-config.file=/etc/loki/config.yml"
-    ports:
-      - "3100:3100"
-    volumes:
-      - type: bind
-        source: ./observability/loki
-        target: /etc/loki
-        read_only: true
-      - type: volume
-        source: loki-data
-        target: /loki
-    restart: unless-stopped
+server:
+  http_listen_port: 3100
 
-  promtail:
-    image: grafana/promtail:2.9.8
-    container_name: integration-promtail
-    command:
-      - "-config.file=/etc/promtail/config.yml"
-    ports:
-      - "9080:9080"
-    volumes:
-      - type: bind
-        source: ./observability/promtail
-        target: /etc/promtail
-        read_only: true
-      - type: bind
-        source: ./logs
-        target: /var/log/integration
-        read_only: true
-      - type: volume
-        source: promtail-data
-        target: /var/lib/promtail
-    restart: unless-stopped
-    depends_on:
-      - loki
+ingester:
+  lifecycler:
+    address: 127.0.0.1
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+    final_sleep: 0s
+  chunk_idle_period: 5m
+  chunk_retain_period: 30s
 
-  grafana:
-    image: grafana/grafana:12.4.2
-    container_name: integration-grafana
-    ports:
-      - "3000:3000"
-    volumes:
-      - type: bind
-        source: ./observability/grafana/provisioning/datasources
-        target: /etc/grafana/provisioning/datasources
-        read_only: true
-      - type: bind
-        source: ./observability/grafana/provisioning/dashboards
-        target: /etc/grafana/provisioning/dashboards
-        read_only: true
-      - type: bind
-        source: ./observability/grafana/dashboards
-        target: /var/lib/grafana/dashboards
-        read_only: true
-      - type: volume
-        source: grafana-data
-        target: /var/lib/grafana
-    restart: unless-stopped
-    depends_on:
-      - prometheus
-      - loki
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: boltdb-shipper
+      object_store: filesystem
+      schema: v11
+      index:
+        prefix: index_
+        period: 24h
 
-volumes:
-  loki-data:
-  promtail-data:
-  grafana-data:
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/cache
+    shared_store: filesystem
+  filesystem:
+    directory: /loki/chunks
+
+limits_config:
+  enforce_metric_name: false
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+
+chunk_store_config:
+  max_look_back_period: 0s
+
+table_manager:
+  retention_deletes_enabled: false
+  retention_period: 0s
