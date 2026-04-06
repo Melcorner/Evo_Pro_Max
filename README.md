@@ -2,12 +2,13 @@
 
 Интеграционная шина между **Эвотор** и **МойСклад**.
 
-Проект решает четыре основные задачи:
+Проект решает пять основных задач:
 
 1. Приём продаж из Эвотор и формирование документов в МойСклад
 2. Синхронизация товаров и остатков между МойСклад и Эвотор
 3. Автоматическое обновление остатков по webhook от МойСклад
 4. Фискализация документа **Отгрузка** из МойСклад через **Универсальный фискализатор**
+5. Наблюдаемость: метрики Prometheus, дашборды Grafana, логи Loki
 
 ---
 
@@ -93,16 +94,11 @@
 
 #### Синхронизация остатков
 
-- одиночная:
-  - `POST /sync/{tenant_id}/stock/{ms_product_id}`
-- массовая:
-  - `POST /sync/{tenant_id}/stock/reconcile`
-- статус:
-  - `GET /sync/{tenant_id}/stock/status`
+- одиночная: `POST /sync/{tenant_id}/stock/{ms_product_id}`
+- массовая: `POST /sync/{tenant_id}/stock/reconcile`
+- статус: `GET /sync/{tenant_id}/stock/status`
 
 Остатки читаются из МойСклад через `/report/stock/all`.
-
-Для статуса используется таблица `stock_sync_status`.
 
 ---
 
@@ -169,32 +165,6 @@ Webhook от МойСклад обновляет остатки в Эвотор 
 PATCH /tenants/{tenant_id}/fiscal
 ```
 
-#### Работа с demand
-
-Получить последние отгрузки:
-
-```http
-GET /sync/{tenant_id}/demands
-```
-
-Получить клиентов и кассы fiscalization24:
-
-```http
-GET /sync/{tenant_id}/fiscal/clients
-```
-
-Отправить demand на фискализацию:
-
-```http
-POST /sync/{tenant_id}/fiscalize/{ms_demand_id}
-```
-
-Проверить статус чека:
-
-```http
-GET /sync/{tenant_id}/fiscalization/{uid}
-```
-
 #### Статусы чека
 
 - `1` — новый
@@ -217,24 +187,15 @@ GET /sync/{tenant_id}/fiscalization/{uid}
 
 ### 5. Мониторинг integration bus
 
-Реализован базовый backend-дашборд мониторинга для контроля состояния integration bus.
-
 #### JSON snapshot
 
 `GET /monitoring/dashboard`
 
 Возвращает snapshot текущего состояния системы:
 
-- статус сервиса
-- состояние worker
-- количество событий по статусам:
-  - `NEW`
-  - `PROCESSING`
-  - `DONE`
-  - `RETRY`
-  - `FAILED`
-- последние проблемные события
-- последние ошибки
+- статус сервиса и worker
+- количество событий по статусам: `NEW / PROCESSING / DONE / RETRY / FAILED`
+- последние проблемные события и ошибки
 - latency обработки успешных событий
 
 #### HTML dashboard
@@ -243,41 +204,13 @@ GET /sync/{tenant_id}/fiscalization/{uid}
 
 Простая server-rendered HTML-страница для мониторинга без отдельного frontend-приложения.
 
-На странице отображаются:
-
-- общий статус integration bus
-- время последнего обновления
-- время последнего heartbeat worker
-- карточки со статусами событий
-- статус worker
-- `avg / max / last latency`
-- таблица проблемных событий
-- таблица последних ошибок
-
-#### Latency
-
-Latency рассчитывается для успешных событий (`status = DONE`) по формуле:
-
-```text
-updated_at - created_at
-```
-
 ---
 
 ### 6. Alerts: Telegram + email
 
-Реализован отдельный контур автоматических уведомлений для критичных состояний integration bus.
+Отдельный контур автоматических уведомлений.
 
-Поддерживаются два канала доставки:
-
-- Telegram
-- email
-
-#### Alert worker
-
-`python -m app.workers.alert_worker`
-
-Alert worker работает отдельно от основного `worker` и не вмешивается в обработку событий.
+Поддерживаются два канала доставки: Telegram и email.
 
 Реализованы четыре типа сигналов:
 
@@ -290,54 +223,80 @@ Alert отправляется только при смене состояния
 
 ---
 
+### 7. Observability: Prometheus + Grafana + Loki
+
+Полный observability stack на базе Docker Compose.
+
+#### Метрики Prometheus
+
+| Endpoint | Описание |
+|---|---|
+| `GET /metrics` | API метрики |
+| `http://localhost:8001/metrics` | Worker метрики |
+| `http://localhost:8002/metrics` | Fiscal poller метрики |
+
+Метрики включают:
+
+- количество и latency HTTP-запросов к API
+- количество обработанных событий по статусам (`done`, `retry`, `failed`)
+- latency обработки событий worker'ом
+- количество polling-циклов fiscal poller
+- DB-метрики: счётчики `event_store`, `errors`, `stock_sync_status`
+
+#### Grafana дашборды
+
+Доступны по адресу `/grafana/` (через Nginx reverse proxy).
+
+Дашборды:
+
+- **API** — HTTP метрики, latency, error rate
+- **Worker** — события, latency, stale recovery
+- **Fiscal poller** — polling циклы, статусы чеков
+- **Фискализация** — запросы фискализации, статусы
+- **Logs** — логи через Loki
+
+#### Loki + Promtail
+
+Loki собирает JSON-логи из файлов в директории `logs/`.
+
+Для включения логирования в файлы задай в `.env`:
+
+```env
+LOG_TO_FILE=true
+LOG_FILE_PATH=logs/api.log
+LOG_FORMAT=json
+SERVICE_NAME=integration-api
+```
+
+---
+
 ## Безопасность
 
 ### Верификация webhook Эвотор
-
-Для webhook от Эвотор реализована проверка заголовка:
 
 ```http
 Authorization: Bearer <token>
 ```
 
-Секрет берётся из переменной окружения:
-
 ```env
 EVOTOR_WEBHOOK_SECRET=your_secret
 ```
 
-Логика:
-
-- если `EVOTOR_WEBHOOK_SECRET` задан, webhook без корректного Bearer-токена получает `401`
-- если `EVOTOR_WEBHOOK_SECRET` не задан, проверка пропускается для локальной разработки
+Если секрет не задан — проверка пропускается (локальная разработка).
 
 ### Admin API auth
-
-Для внутренних и административных endpoint'ов реализована **Bearer-auth защита** через `ADMIN_API_TOKEN`.
-
-Переменная окружения:
 
 ```env
 ADMIN_API_TOKEN=token
 ```
 
-#### Какие ручки защищены
+#### Защищённые ручки
 
-- `/tenants`
-- `/sync`
-- `/events`
-- `/errors`
-- `/mappings`
-- `/monitoring`
-- `/dashboard`
+- `/tenants`, `/sync`, `/events`, `/errors`, `/mappings`, `/monitoring`, `/dashboard`
 
-#### Какие ручки публичные
+#### Публичные ручки
 
-- `/health`
-- `/webhooks/evotor/{tenant_id}`
-- `/webhooks/moysklad/{tenant_id}`
-- `/api/v1/user/token`
-- `/onboarding`
+- `/health`, `/metrics`, `/webhooks/evotor/{tenant_id}`, `/webhooks/moysklad/{tenant_id}`, `/api/v1/user/token`, `/onboarding`
 
 ---
 
@@ -367,16 +326,17 @@ Manual/API Trigger → sync.py → MoySklad API / Evotor API → mappings / stoc
 Manual/API Trigger → sync.py → MoySklad demand → mapper → FiscalizationClient → fiscalization24
 ```
 
-### Мониторинг
+### Observability
 
 ```text
-event_store / errors / service_heartbeats → monitoring.py → JSON snapshot / HTML dashboard
+API / Worker / Fiscal poller → /metrics → Prometheus → Grafana
+logs/*.log → Promtail → Loki → Grafana
 ```
 
-### Alerts: Telegram + email
+### Alerts
 
 ```text
-service_heartbeats / event_store / stock_sync_status → alert_worker.py → alert_logic.py → telegram_client.py / email_client.py → Telegram Bot API / SMTP
+service_heartbeats / event_store / stock_sync_status → alert_worker.py → Telegram / Email
 ```
 
 ---
@@ -400,14 +360,6 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 
 `GET /health` — публичный endpoint, не требует авторизации.
 
-Показывает общее состояние сервиса:
-
-- статус API и БД
-- heartbeat worker (stale если не отвечал более `WORKER_STALE_AFTER_SEC` секунд)
-- количество событий по статусам: `NEW / RETRY / FAILED / PROCESSING`
-- время последней успешной обработки события
-- количество тенантов с ошибкой синхронизации остатков
-
 Верхний статус:
 
 - `ok` — всё в норме
@@ -423,6 +375,7 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 | Метод | URL | Описание |
 |---|---|---|
 | GET | `/health` | Проверка сервера и фоновых сервисов |
+| GET | `/metrics` | Prometheus метрики |
 
 ### Onboarding
 
@@ -504,6 +457,7 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 
 - Python 3.11+
 - PostgreSQL 14+
+- Docker + Docker Compose (для observability stack)
 - Доступ к API Эвотор
 - Доступ к API МойСклад
 - Доступ к API Универсального фискализатора
@@ -514,18 +468,9 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → ale
 
 ### 1. Создать виртуальное окружение
 
-macOS / Linux:
-
 ```bash
 python3.11 -m venv venv
 source venv/bin/activate
-```
-
-Windows:
-
-```powershell
-py -3.11 -m venv venv
-venv\Scripts\activate
 ```
 
 ### 2. Установить зависимости
@@ -543,6 +488,14 @@ DATABASE_URL=postgresql://user:password@localhost:5432/evotor_ms
 # Безопасность
 EVOTOR_WEBHOOK_SECRET=your_secret
 ADMIN_API_TOKEN=token
+
+# Observability (опционально)
+LOG_TO_FILE=true
+LOG_FILE_PATH=logs/api.log
+LOG_FORMAT=json
+SERVICE_NAME=integration-api
+WORKER_METRICS_PORT=8001
+FISCAL_POLLER_METRICS_PORT=8002
 
 # Telegram alerts (опционально)
 TELEGRAM_BOT_TOKEN=your_bot_token
@@ -584,8 +537,6 @@ python -m app.scripts.init_db
 
 ### 6. Миграция с SQLite (если нужно)
 
-Если ранее использовалась SQLite, перенести данные:
-
 ```bash
 export SQLITE_PATH=data/app.db
 python -m app.scripts.migrate_to_pg
@@ -598,16 +549,21 @@ python -m app.scripts.migrate_to_pg
 ### API сервер
 
 ```bash
-uvicorn app.main:app --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Swagger:
-`http://127.0.0.1:8000/docs`
+Swagger: `http://127.0.0.1:8000/docs`
 
 ### Worker
 
 ```bash
 python -m app.workers.worker
+```
+
+### Fiscal poller
+
+```bash
+python -m app.workers.fiscal_poller
 ```
 
 ### Alert worker
@@ -616,28 +572,18 @@ python -m app.workers.worker
 python -m app.workers.alert_worker
 ```
 
-Alert worker использует настроенные каналы доставки:
-
-- Telegram, если заданы `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`
-- email, если заданы SMTP-параметры
-
-Если настроены оба канала, уведомления отправляются и в Telegram, и на email.
-
-### Dashboard
-
-JSON snapshot:
+### Observability stack
 
 ```bash
-GET /monitoring/dashboard
+mkdir -p logs
+docker compose -f docker-compose.observability.yml up -d
 ```
 
-HTML dashboard:
+Доступные адреса:
 
-```bash
-GET /dashboard
-```
-
-Оба endpoint'а защищены `ADMIN_API_TOKEN`.
+- Grafana: `/grafana/` (через Nginx reverse proxy)
+- Prometheus: `http://localhost:9090`
+- Loki: `http://localhost:3100`
 
 ---
 
@@ -673,26 +619,12 @@ curl -H "Authorization: Bearer token" \
   "http://127.0.0.1:8000/sync/{tenant_id}/demands"
 ```
 
-### Получить клиентов и кассы fiscalization24
-
-```bash
-curl -H "Authorization: Bearer token" \
-  "http://127.0.0.1:8000/sync/{tenant_id}/fiscal/clients"
-```
-
 ### Отправить demand на фискализацию
 
 ```bash
 curl -X POST \
   -H "Authorization: Bearer token" \
   "http://127.0.0.1:8000/sync/{tenant_id}/fiscalize/{ms_demand_id}"
-```
-
-### Получить статус чека
-
-```bash
-curl -H "Authorization: Bearer token" \
-  "http://127.0.0.1:8000/sync/{tenant_id}/fiscalization/{uid}"
 ```
 
 ### Получить события
@@ -707,6 +639,13 @@ curl -H "Authorization: Bearer token" \
 ```bash
 curl -H "Authorization: Bearer token" \
   "http://127.0.0.1:8000/monitoring/dashboard"
+```
+
+### Проверить метрики
+
+```bash
+curl "http://127.0.0.1:8000/metrics"
+curl "http://127.0.0.1:8001/metrics"
 ```
 
 ---
