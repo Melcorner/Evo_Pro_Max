@@ -103,7 +103,10 @@ def init_db():
             sync_completed_at   INTEGER,
             fiscal_token        TEXT,
             fiscal_client_uid   TEXT,
-            fiscal_device_uid   TEXT
+            fiscal_device_uid   TEXT,
+            ms_account_id       TEXT,
+            ms_status           TEXT DEFAULT 'active',
+            updated_at          INTEGER
         )
         """
     )
@@ -372,6 +375,10 @@ def init_db():
         # evotor_onboarding_sessions — новые поля онбординга
         ("evotor_onboarding_sessions", "moysklad_token", "TEXT"),
         ("evotor_onboarding_sessions", "ms_data_json", "TEXT"),
+        # tenants — vendor API поля
+        ("tenants", "ms_account_id", "TEXT"),
+        ("tenants", "ms_status", "TEXT DEFAULT 'active'"),
+        ("tenants", "updated_at", "INTEGER"),
     ]
 
     for table, column, definition in migrations:
