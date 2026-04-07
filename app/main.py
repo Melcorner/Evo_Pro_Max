@@ -33,6 +33,7 @@ from app.api.sync import router as sync_router
 from app.api.moysklad_webhooks import router as moysklad_webhooks_router
 from app.api.monitoring import router as monitoring_router
 from app.api.onboarding import router as onboarding_router
+from app.api.vendor import router as vendor_router
 
 setup_logging()
 log = logging.getLogger("api")
@@ -76,6 +77,7 @@ app.include_router(webhooks_router)
 app.include_router(evotor_router)
 app.include_router(moysklad_webhooks_router)
 
+app.include_router(vendor_router)
 
 @app.middleware("http")
 async def prometheus_http_metrics(request: Request, call_next):
