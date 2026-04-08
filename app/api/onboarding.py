@@ -940,6 +940,15 @@ def onboarding_store_profile_submit(
     {sync_html}
 
     <hr>
+    <div class="section-title">Подключение Telegram</div>
+    <p style="color:#5b6475; font-size:13px;">
+        Подключите Telegram чтобы получать уведомления о сбоях и восстановлении.
+    </p>
+    <a href="/onboarding/tenants/{html.escape(tenant_id)}/telegram" class="btn-secondary">
+        Подключить Telegram →
+    </a>
+
+    <hr>
     <p style="color:#5b6475; font-size:13px; margin-top:16px;">
         Tenant ID: <code>{html.escape(tenant_id)}</code>
     </p>
@@ -960,7 +969,7 @@ def onboarding_tenant_telegram_link(tenant_id: str):
     if not _get_telegram_bot_username():
         return _render_telegram_link_page(
             tenant,
-            error_message="TELEGRAM_BOT_USERNAME не настроен, поэтому deep link для подключения пока недоступен.",
+            error_message="TELEGRAM_BOT_USERNAME не настроен, поэтому ссылка для подключения пока недоступена.",
         )
 
     conn = get_connection()
@@ -976,7 +985,7 @@ def onboarding_tenant_telegram_link(tenant_id: str):
 
     return _render_telegram_link_page(
         tenant,
-        info_message="Ссылка для подключения Telegram создана. Перейдите по deep link и нажмите /start в боте.",
+        info_message="Ссылка для подключения Telegram создана. Перейдите по ссылке и нажмите /start в боте.",
     )
 
 
@@ -993,7 +1002,7 @@ def telegram_link_webhook(update: dict = Body(...)):
     link_token = _extract_telegram_link_token_from_text(text)
     if not link_token:
         if text.startswith("/start"):
-            _reply_in_telegram(chat_id, "Используйте ссылку подключения из onboarding, чтобы привязать Telegram к магазину.")
+            _reply_in_telegram(chat_id, "Используйте ссылку подключения из формы, чтобы привязать Telegram к магазину.")
         return {"ok": True}
 
     now = int(time.time())
