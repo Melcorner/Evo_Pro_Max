@@ -37,10 +37,6 @@ def _ms_fetch(path: str, token: str, params: dict | None = None) -> dict:
 
 
 def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
-    """
-    Возвращает (organizations, stores, agents).
-    Каждый элемент — {"id": "...", "name": "..."}.
-    """
     def extract(data: dict) -> list[dict]:
         return [
             {"id": row["id"], "name": row.get("name") or row.get("description") or row["id"]}
@@ -58,7 +54,11 @@ def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
 # HTML layout
 # ---------------------------------------------------------------------------
 
-def _layout(title: str, body: str) -> str:
+def _layout(title: str, body: str, back_url: str | None = None) -> str:
+    back_btn = ""
+    if back_url:
+        back_btn = f'<a href="{html.escape(back_url)}" class="back-btn">← Назад</a>'
+
     return f"""
 <!DOCTYPE html>
 <html lang="ru">
@@ -118,6 +118,14 @@ def _layout(title: str, body: str) -> str:
             font-weight: 600;
         }}
         button:hover {{ background: #1a44b0; }}
+        .back-btn {{
+            display: inline-block;
+            margin-bottom: 16px;
+            color: #5b6475;
+            font-size: 13px;
+            text-decoration: none;
+        }}
+        .back-btn:hover {{ color: #2458d3; }}
         .success {{
             background: #eef8f0;
             border: 1px solid #b8dfc1;
@@ -134,6 +142,14 @@ def _layout(title: str, body: str) -> str:
             border-radius: 6px;
             margin-bottom: 16px;
         }}
+        .warning {{
+            background: #fffbea;
+            border: 1px solid #f5d97a;
+            color: #7a5c00;
+            padding: 12px 14px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+        }}
         .section-title {{
             font-size: 13px;
             font-weight: 700;
@@ -142,11 +158,66 @@ def _layout(title: str, body: str) -> str:
             color: #8793a8;
             margin: 20px 0 12px;
         }}
+        .sync-result {{
+            background: #f5f7fb;
+            border: 1px solid #d8deea;
+            border-radius: 6px;
+            padding: 12px 14px;
+            margin-top: 16px;
+            font-size: 13px;
+        }}
+        .sync-result table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 8px;
+        }}
+        .sync-result td {{
+            padding: 4px 8px;
+            color: #3a4255;
+        }}
+        .sync-result td:first-child {{
+            color: #8793a8;
+            width: 120px;
+        }}
         code {{
             background: #eef3fb;
             padding: 2px 6px;
             border-radius: 4px;
             font-size: 13px;
+        }}
+        .btn-secondary {{
+            display: inline-block;
+            margin-top: 16px;
+            background: #f5f7fb;
+            color: #2458d3;
+            border: 1px solid #d8deea;
+            border-radius: 6px;
+            padding: 10px 20px;
+            font-size: 14px;
+            font-weight: 600;
+            text-decoration: none;
+        }}
+        .btn-secondary:hover {{
+            background: #eef3fb;
+            text-decoration: none;
+        }}
+        .back-btn {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 16px;
+            padding: 6px 12px;
+            background: #f5f7fb;
+            border: 1px solid #d8deea;
+            border-radius: 6px;
+            color: #5b6475;
+            font-size: 13px;
+            text-decoration: none;
+        }}
+        .back-btn:hover {{
+            background: #eef3fb;
+            color: #2458d3;
+            text-decoration: none;
         }}
         a {{ color: #2458d3; text-decoration: none; }}
         a:hover {{ text-decoration: underline; }}
@@ -156,14 +227,16 @@ def _layout(title: str, body: str) -> str:
 <body>
     <h1>{html.escape(title)}</h1>
     <div class="meta">Создание профиля магазина Evotor ↔ MoySklad</div>
-    <div class="card">{body}</div>
+    <div class="card">
+        {back_btn}
+        {body}
+    </div>
 </body>
 </html>
 """
 
 
 def _select(name: str, items: list[dict]) -> str:
-    """Рендерит <select> где option value=id, текст=name."""
     options = "\n".join(
         f'<option value="{html.escape(item["id"])}">{html.escape(item["name"])}</option>'
         for item in items
@@ -199,6 +272,67 @@ def _extract_store_name(store: dict, fallback_id: str) -> str:
     return str(
         store.get("name") or store.get("title") or store.get("storeName") or f"Store {fallback_id}"
     ).strip()
+
+
+# ---------------------------------------------------------------------------
+# Auto initial sync helper
+# ---------------------------------------------------------------------------
+
+def _run_initial_sync(tenant_id: str) -> dict:
+    """
+    Запускает initial_sync для tenant'а.
+    Возвращает результат синхронизации.
+    """
+    from app.api.sync import initial_sync
+    try:
+        result = initial_sync(tenant_id)
+        return result
+    except Exception as e:
+        log.exception("Auto initial sync failed tenant_id=%s", tenant_id)
+        return {"status": "error", "error": str(e), "synced": 0, "failed": 0, "skipped": 0}
+
+
+def _render_sync_result(result: dict) -> str:
+    """Рендерит результат синхронизации в HTML."""
+    status = result.get("status", "error")
+    synced = result.get("synced", 0)
+    failed = result.get("failed", 0)
+    skipped = result.get("skipped", 0)
+    error = result.get("error", "")
+
+    if status == "error":
+        return f"""
+        <div class="warning">
+            <strong>Профиль создан, но первичная синхронизация не выполнена.</strong><br>
+            Ошибка: {html.escape(str(error))}<br>
+            <small>Запустите синхронизацию вручную через API: <code>POST /sync/{{tenant_id}}/initial</code></small>
+        </div>
+        """
+
+    css_class = "success" if status == "ok" else "warning"
+    status_text = "Синхронизация выполнена успешно" if status == "ok" else "Синхронизация выполнена частично"
+
+    errors_html = ""
+    if result.get("errors"):
+        errors_list = "".join(
+            f'<li>{html.escape(str(e))}</li>'
+            for e in result["errors"][:5]
+        )
+        errors_html = f'<ul style="margin:8px 0 0; padding-left:18px; font-size:12px;">{errors_list}</ul>'
+
+    return f"""
+    <div class="{css_class}">
+        <strong>{status_text}</strong>
+        <div class="sync-result">
+            <table>
+                <tr><td>Синхронизировано</td><td><strong>{synced}</strong> товаров</td></tr>
+                <tr><td>Пропущено</td><td>{skipped} товаров</td></tr>
+                <tr><td>Ошибок</td><td>{failed} товаров</td></tr>
+            </table>
+            {errors_html}
+        </div>
+    </div>
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +424,11 @@ def onboarding_evotor_stores(session_id: str):
         </div>
         """)
 
-    return HTMLResponse(_layout("Выбор магазина Эвотор", "".join(parts)))
+    return HTMLResponse(_layout(
+        "Выбор магазина Эвотор",
+        "".join(parts),
+        back_url="/onboarding/evotor/connect",
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +455,11 @@ def onboarding_ms_token_form(session_id: str, store_id: str):
         <button type="submit">Загрузить данные МойСклад →</button>
     </form>
     """
-    return HTMLResponse(_layout("Подключение МойСклад", body))
+    return HTMLResponse(_layout(
+        "Подключение МойСклад",
+        body,
+        back_url=f"/onboarding/evotor/sessions/{session_id}/stores",
+    ))
 
 
 @router.post(
@@ -344,7 +486,11 @@ def onboarding_ms_token_submit(
         else:
             msg = f"Ошибка API МойСклад: {status}"
         body = f'<div class="error">{html.escape(msg)}</div>'
-        return HTMLResponse(_layout("Ошибка подключения МойСклад", body), status_code=502)
+        return HTMLResponse(_layout(
+            "Ошибка подключения МойСклад",
+            body,
+            back_url=f"/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token",
+        ), status_code=502)
     except Exception as e:
         log.exception("Failed to fetch MoySklad data")
         body = f'<div class="error">Не удалось получить данные МойСклад: {html.escape(str(e))}</div>'
@@ -442,11 +588,15 @@ def onboarding_ms_token_submit(
         <button type="submit">Создать профиль магазина →</button>
     </form>
     """
-    return HTMLResponse(_layout("Настройка профиля магазина", body))
+    return HTMLResponse(_layout(
+        "Настройка профиля магазина",
+        body,
+        back_url=f"/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token",
+    ))
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — сохранение профиля
+# Step 4 — сохранение профиля + автосинхронизация
 # ---------------------------------------------------------------------------
 
 @router.post("/onboarding/store-profile", response_class=HTMLResponse)
@@ -497,8 +647,12 @@ def onboarding_store_profile_submit(
         existing = cur.fetchone()
         if existing:
             body = (
-                f'<div class="error">Профиль для этого магазина уже существует: '
-                f'<code>{html.escape(existing["id"])}</code></div>'
+                f'<div class="error">'
+                f'Профиль для этого магазина уже существует: '
+                f'<code>{html.escape(existing["id"])}</code>'
+                f'</div>'
+                f'<a href="/onboarding/evotor/connect" class="btn-secondary">'
+                f'Начать сначала →</a>'
             )
             return HTMLResponse(_layout("Профиль уже существует", body), status_code=409)
 
@@ -544,12 +698,22 @@ def onboarding_store_profile_submit(
     finally:
         conn.close()
 
+    # Запускаем первичную синхронизацию автоматически
+    log.info("Starting auto initial sync for tenant_id=%s", tenant_id)
+    sync_result = _run_initial_sync(tenant_id)
+    sync_html = _render_sync_result(sync_result)
+
     body = f"""
     <div class="success">
-        <strong>Профиль магазина успешно создан!</strong><br><br>
+        <strong>Профиль магазина успешно создан!</strong>
     </div>
-    <p style="color:#5b6475; font-size:14px;">
-        Следующий шаг — выполните первичную синхронизацию товаров<br>
+
+    <div class="section-title">Первичная синхронизация товаров</div>
+    {sync_html}
+
+    <hr>
+    <p style="color:#5b6475; font-size:13px; margin-top:16px;">
+        Tenant ID: <code>{html.escape(tenant_id)}</code>
     </p>
     """
     return HTMLResponse(_layout("Профиль создан", body))
