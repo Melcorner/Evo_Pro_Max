@@ -61,14 +61,6 @@ def _ms_fetch(path: str, token: str, params: dict | None = None) -> dict:
 
 
 def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
-<<<<<<< HEAD
-=======
-    """
-    Возвращает (organizations, stores, agents).
-    Каждый элемент — {"id": "...", "name": "..."}.
-    """
-
->>>>>>> 60e8cc4 (Alerts)
     def extract(data: dict) -> list[dict]:
         return [
             {"id": row["id"], "name": row.get("name") or row.get("description") or row["id"]}
@@ -86,16 +78,11 @@ def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
 # HTML layout
 # ---------------------------------------------------------------------------
 
-<<<<<<< HEAD
 def _layout(title: str, body: str, back_url: str | None = None) -> str:
     back_btn = ""
     if back_url:
         back_btn = f'<a href="{html.escape(back_url)}" class="back-btn">← Назад</a>'
 
-=======
-
-def _layout(title: str, body: str) -> str:
->>>>>>> 60e8cc4 (Alerts)
     return f"""
 <!DOCTYPE html>
 <html lang="ru">
@@ -292,10 +279,6 @@ def _layout(title: str, body: str) -> str:
 
 
 def _select(name: str, items: list[dict]) -> str:
-<<<<<<< HEAD
-=======
-    """Рендерит <select>, где option value=id, текст=name."""
->>>>>>> 60e8cc4 (Alerts)
     options = "\n".join(
         f'<option value="{html.escape(item["id"])}">{html.escape(item["name"])}</option>'
         for item in items
@@ -697,17 +680,12 @@ def onboarding_ms_token_submit(
         else:
             msg = f"Ошибка API МойСклад: {status}"
         body = f'<div class="error">{html.escape(msg)}</div>'
-<<<<<<< HEAD
         return HTMLResponse(_layout(
             "Ошибка подключения МойСклад",
             body,
             back_url=f"/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token",
         ), status_code=502)
     except Exception as e:
-=======
-        return HTMLResponse(_layout("Ошибка подключения МойСклад", body), status_code=502)
-    except Exception as exc:
->>>>>>> 60e8cc4 (Alerts)
         log.exception("Failed to fetch MoySklad data")
         body = f'<div class="error">Не удалось получить данные МойСклад: {html.escape(str(exc))}</div>'
         return HTMLResponse(_layout("Ошибка", body), status_code=502)
@@ -955,7 +933,6 @@ def onboarding_store_profile_submit(
 
     body = f"""
     <div class="success">
-<<<<<<< HEAD
         <strong>Профиль магазина успешно создан!</strong>
     </div>
 
@@ -965,18 +942,6 @@ def onboarding_store_profile_submit(
     <hr>
     <p style="color:#5b6475; font-size:13px; margin-top:16px;">
         Tenant ID: <code>{html.escape(tenant_id)}</code>
-=======
-        <strong>Профиль магазина успешно создан!</strong><br><br>
-        tenant_id: <code>{html.escape(tenant_id)}</code>
-    </div>
-    <p style="color:#5b6475; font-size:14px;">
-        Следующий шаг — выполните первичную синхронизацию товаров.
-    </p>
-    <p style="color:#5b6475; font-size:14px;">
-        Telegram пока не подключен.
-        <a href="/onboarding/tenants/{html.escape(tenant_id)}/telegram">Открыть страницу подключения Telegram</a>
-        и привязать чат через бота.
->>>>>>> 60e8cc4 (Alerts)
     </p>
     """
     return HTMLResponse(_layout("Профиль создан", body))
