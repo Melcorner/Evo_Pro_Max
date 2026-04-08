@@ -455,6 +455,12 @@ def _render_telegram_link_page(
             <button type="submit">{connect_label}</button>
         </form>
         """
+         f"""
+        <hr>
+        <a href="/onboarding/tenants/{html.escape(tenant["id"])}/token" class="btn-secondary">
+            Обновить токен МойСклад →
+        </a>
+        """
     )
 
     body = "".join(parts)
@@ -1069,3 +1075,109 @@ def telegram_link_webhook(update: dict = Body(...)):
         f"Telegram успешно подключен. Уведомления для tenant {token_row['tenant_id']} теперь будут приходить в этот чат.",
     )
     return {"ok": True}
+
+# ---------------------------------------------------------------------------
+# Обновление токена МойСклад
+# ---------------------------------------------------------------------------
+
+@router.get("/onboarding/tenants/{tenant_id}/token", response_class=HTMLResponse)
+def onboarding_tenant_token_form(tenant_id: str):
+    tenant = _load_tenant(tenant_id)
+
+    body = f"""
+    <div class="field">
+        <label>Tenant</label>
+        <div><strong>{html.escape(tenant["name"])}</strong></div>
+    </div>
+
+    <div class="success">
+        Токен МойСклад активен. Обновите его если он был сброшен или истёк.
+    </div>
+
+    <form method="post" action="/onboarding/tenants/{html.escape(tenant_id)}/token">
+        <div class="field">
+            <label>Новый токен МойСклад</label>
+            <input name="moysklad_token" required
+                   placeholder="Токен из раздела «Безопасность» → «Токены» в МойСклад" />
+            <span class="hint">После обновления токена система проверит подключение к МойСклад.</span>
+        </div>
+        <button type="submit">Обновить токен →</button>
+    </form>
+    """
+    return HTMLResponse(_layout(
+        "Обновление токена МойСклад",
+        body,
+        back_url=f"/onboarding/tenants/{tenant_id}/telegram",
+    ))
+
+
+@router.post("/onboarding/tenants/{tenant_id}/token", response_class=HTMLResponse)
+def onboarding_tenant_token_submit(
+    tenant_id: str,
+    moysklad_token: str = Form(...),
+):
+    tenant = _load_tenant(tenant_id)
+    moysklad_token = moysklad_token.strip()
+
+    if not moysklad_token:
+        body = '<div class="error">Токен обязателен.</div>'
+        return HTMLResponse(_layout("Ошибка", body), status_code=400)
+
+    # Проверяем токен — пробуем получить организации
+    try:
+        orgs, _, _ = _ms_fetch_all(moysklad_token)
+        if not orgs:
+            raise ValueError("Нет доступных организаций")
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        if status == 401:
+            msg = "Неверный токен — проверьте правильность и повторите."
+        else:
+            msg = f"Ошибка API МойСклад: {status}"
+        body = f'<div class="error">{html.escape(msg)}</div>'
+        return HTMLResponse(_layout(
+            "Ошибка обновления токена",
+            body,
+            back_url=f"/onboarding/tenants/{tenant_id}/token",
+        ), status_code=502)
+    except Exception as e:
+        body = f'<div class="error">Не удалось проверить токен: {html.escape(str(e))}</div>'
+        return HTMLResponse(_layout(
+            "Ошибка обновления токена",
+            body,
+            back_url=f"/onboarding/tenants/{tenant_id}/token",
+        ), status_code=502)
+
+    # Сохраняем новый токен
+    now = int(time.time())
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("UPDATE tenants SET moysklad_token = ?, updated_at = ? WHERE id = ?"),
+            (moysklad_token, now, tenant_id),
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        log.exception("Failed to update moysklad token tenant_id=%s", tenant_id)
+        body = f'<div class="error">Не удалось сохранить токен: {html.escape(str(e))}</div>'
+        return HTMLResponse(_layout("Ошибка", body), status_code=500)
+    finally:
+        conn.close()
+
+    log.info("moysklad token updated tenant_id=%s", tenant_id)
+
+    body = f"""
+    <div class="success">
+        <strong>Токен МойСклад успешно обновлён!</strong><br>
+        Найдено организаций: {len(orgs)}
+    </div>
+    <p style="color:#5b6475; font-size:13px; margin-top:16px;">
+        Tenant ID: <code>{html.escape(tenant_id)}</code>
+    </p>
+    <a href="/onboarding/tenants/{html.escape(tenant_id)}/telegram" class="btn-secondary">
+        ← Вернуться к настройкам
+    </a>
+    """
+    return HTMLResponse(_layout("Токен обновлён", body))
