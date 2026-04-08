@@ -28,6 +28,16 @@ def test_health_is_public(monkeypatch):
     assert response.json()["status"] == "ok"
 
 
+def test_protected_is_open_when_admin_token_not_set(monkeypatch):
+    monkeypatch.delenv("ADMIN_API_TOKEN", raising=False)
+    client = TestClient(build_app())
+
+    response = client.get("/protected")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
 def test_protected_requires_auth_when_token_is_set(monkeypatch):
     monkeypatch.setenv("ADMIN_API_TOKEN", "secret-token")
     client = TestClient(build_app())
@@ -59,16 +69,6 @@ def test_protected_accepts_valid_token(monkeypatch):
         "/protected",
         headers={"Authorization": "Bearer secret-token"},
     )
-
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
-
-
-def test_protected_is_open_when_admin_token_not_set(monkeypatch):
-    monkeypatch.delenv("ADMIN_API_TOKEN", raising=False)
-    client = TestClient(build_app())
-
-    response = client.get("/protected")
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"

@@ -108,7 +108,8 @@ def _upsert_stock_status(
     cur = conn.cursor()
     try:
         cur.execute(
-            """
+            aq(
+                """
             INSERT INTO stock_sync_status (
                 tenant_id,
                 status,
@@ -128,7 +129,8 @@ def _upsert_stock_status(
                 last_error = EXCLUDED.last_error,
                 synced_items_count = EXCLUDED.synced_items_count,
                 total_items_count = EXCLUDED.total_items_count
-            """,
+            """
+            ),
             (
                 tenant_id,
                 status,
@@ -686,12 +688,21 @@ def initial_sync(tenant_id: str):
         raise HTTPException(status_code=502, detail=f"Failed to fetch Evotor products: {e}")
 
     if not products:
+        now = _now()
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(aq("UPDATE tenants SET sync_completed_at = ? WHERE id = ?"), (now, tenant_id))
+        conn.commit()
+        conn.close()
+        log.info("Initial sync completed for empty Evotor catalog tenant_id=%s", tenant_id)
         return {
             "status": "ok",
             "synced": 0,
             "skipped": 0,
             "failed": 0,
+            "errors": [],
             "message": "No products found in Evotor",
+            "sync_mode": "moysklad",
         }
 
     store = MappingStore()
@@ -743,13 +754,20 @@ def initial_sync(tenant_id: str):
             log.warning("Mapping conflict evotor_id=%s ms_id=%s", evotor_id, ms_id)
             failed += 1
 
-    if failed == 0 and synced > 0:
+    should_complete = failed == 0 and (synced + skipped) > 0
+
+    if should_complete:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute(aq("UPDATE tenants SET sync_completed_at = ? WHERE id = ?"), (_now(), tenant_id))
         conn.commit()
         conn.close()
-        log.info("Initial sync completed tenant_id=%s synced=%s", tenant_id, synced)
+        log.info(
+            "Initial sync completed tenant_id=%s synced=%s skipped=%s",
+            tenant_id,
+            synced,
+            skipped,
+        )
 
     return {
         "status": "ok" if failed == 0 else "partial",
@@ -757,7 +775,7 @@ def initial_sync(tenant_id: str):
         "skipped": skipped,
         "failed": failed,
         "errors": errors,
-        "sync_mode": "moysklad" if failed == 0 else "evotor",
+        "sync_mode": "moysklad" if should_complete else "evotor",
     }
 
 

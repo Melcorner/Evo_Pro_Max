@@ -38,6 +38,10 @@ class TenantPublic(BaseModel):
     ms_organization_id: Optional[str] = None
     ms_store_id: Optional[str] = None
     ms_agent_id: Optional[str] = None
+    alert_email: Optional[str] = None
+    alerts_email_enabled: bool
+    telegram_chat_id: Optional[str] = None
+    alerts_telegram_enabled: bool
     sync_completed_at: Optional[int] = None
     sync_mode: str
     has_evotor_api_key: bool
@@ -221,6 +225,8 @@ def list_tenants():
             id, name, created_at,
             evotor_user_id, evotor_store_id,
             ms_organization_id, ms_store_id, ms_agent_id,
+            alert_email, alerts_email_enabled,
+            telegram_chat_id, alerts_telegram_enabled,
             sync_completed_at,
             evotor_api_key, moysklad_token, evotor_token,
             fiscal_token, fiscal_client_uid, fiscal_device_uid
@@ -254,6 +260,10 @@ def list_tenants():
                 "ms_organization_id": r["ms_organization_id"],
                 "ms_store_id": r["ms_store_id"],
                 "ms_agent_id": r["ms_agent_id"],
+                "alert_email": r["alert_email"],
+                "alerts_email_enabled": bool(r["alerts_email_enabled"]),
+                "telegram_chat_id": r["telegram_chat_id"],
+                "alerts_telegram_enabled": bool(r["alerts_telegram_enabled"]),
                 "sync_completed_at": r["sync_completed_at"],
                 "sync_mode": sync_mode,
                 "has_evotor_api_key": bool(r["evotor_api_key"]),
@@ -287,6 +297,12 @@ def delete_tenant(tenant_id: str):
         cur.execute(aq("DELETE FROM stock_sync_status WHERE tenant_id = ?"), (tenant_id,))
         deleted_stock_sync_status = cur.rowcount
 
+        cur.execute(aq("DELETE FROM notification_log WHERE tenant_id = ?"), (tenant_id,))
+        deleted_notification_log = cur.rowcount
+
+        cur.execute(aq("DELETE FROM telegram_link_tokens WHERE tenant_id = ?"), (tenant_id,))
+        deleted_telegram_link_tokens = cur.rowcount
+
         cur.execute(aq("DELETE FROM fiscalization_checks WHERE tenant_id = ?"), (tenant_id,))
         deleted_fiscalization_checks = cur.rowcount
 
@@ -316,6 +332,8 @@ def delete_tenant(tenant_id: str):
             "mappings": deleted_mappings,
             "errors": deleted_errors,
             "stock_sync_status": deleted_stock_sync_status,
+            "notification_log": deleted_notification_log,
+            "telegram_link_tokens": deleted_telegram_link_tokens,
             "fiscalization_checks": deleted_fiscalization_checks,
             "processed_events": deleted_processed_events,
             "event_store": deleted_event_store,

@@ -66,6 +66,7 @@
 - создаёт товары в МойСклад (с НДС и типом маркировки)
 - сохраняет `mappings`
 - переводит tenant в режим `МойСклад → Эвотор`
+- корректно завершает initial sync даже если каталог Эвотор пуст или товары уже были обработаны без ошибок
 
 #### Синхронизация одного товара
 
@@ -115,9 +116,11 @@ Webhook от МойСклад обновляет остатки в Эвотор 
 Сценарий:
 
 1. МойСклад отправляет webhook
-2. система определяет затронутые товары
-3. получает актуальные остатки через `/report/stock/all`
-4. обновляет остатки в Эвотор
+2. система проверяет подпись webhook
+3. определяет затронутые товары
+4. получает актуальные остатки через `/report/stock/all`
+5. обновляет остатки в Эвотор
+6. обновляет `stock_sync_status`, чтобы автоматическая синхронизация была видна в статусах и мониторинге
 
 ---
 
@@ -212,6 +215,37 @@ PATCH /tenants/{tenant_id}/fiscal
 
 Поддерживаются два канала доставки: Telegram и email.
 
+На первом этапе контакты для пользовательских уведомлений сохраняются в профиле tenant через onboarding:
+
+- email для уведомлений
+- признак включения email-уведомлений
+- `telegram_chat_id` и признак включения Telegram-уведомлений в tenant
+
+На четвёртом этапе Telegram больше не вводится вручную в onboarding:
+
+- после создания tenant пользователь открывает страницу статуса Telegram
+- система создаёт одноразовый `telegram_link_token`
+- deep link вида `https://t.me/<BOT_USERNAME>?start=tglink_<token>` открывает бот
+- после `/start` webhook сохраняет `telegram_chat_id` в tenant и включает `alerts_telegram_enabled`
+
+Для этого используются:
+
+- `GET /onboarding/tenants/{tenant_id}/telegram`
+- `POST /onboarding/tenants/{tenant_id}/telegram/link`
+- публичный `POST /webhooks/telegram`
+
+На втором этапе `alert_worker.py` использует эти контакты для tenant-aware уведомлений:
+
+- system/admin alerts остаются глобальными и уходят в каналы из `.env`
+- tenant alerts по `FAILED`, `RETRY` и ошибкам `stock_sync_status` отправляются по контактам конкретного tenant
+- если у tenant канал не заполнен или выключен, он просто пропускается без падения worker
+
+На третьем этапе доставка уведомлений журналируется в `notification_log`:
+
+- успешные отправки пишутся со статусом `sent`
+- ошибки доставки пишутся со статусом `failed`
+- для tenant alerts статус `skipped` пишется только в практичных случаях, когда канал включён, но контакт не заполнен
+
 Реализованы четыре типа сигналов:
 
 - `worker stale` или отсутствие heartbeat
@@ -284,11 +318,30 @@ EVOTOR_WEBHOOK_SECRET=your_secret
 
 Если секрет не задан — проверка пропускается (локальная разработка).
 
+### Верификация webhook МойСклад
+
+```http
+X-Lognex-Signature: <hex_hmac_sha256>
+```
+
+```env
+MS_WEBHOOK_SECRET=your_secret
+```
+
+Подпись проверяется по raw body через HMAC-SHA256.
+
+Если секрет не задан — проверка пропускается (локальная разработка).
+
 ### Admin API auth
 
 ```env
 ADMIN_API_TOKEN=token
 ```
+
+Логика работы:
+
+- если `ADMIN_API_TOKEN` не задан, internal/admin auth отключён
+- если `ADMIN_API_TOKEN` задан, для protected endpoints нужен заголовок `Authorization: Bearer <ADMIN_API_TOKEN>`
 
 #### Защищённые ручки
 
@@ -296,7 +349,7 @@ ADMIN_API_TOKEN=token
 
 #### Публичные ручки
 
-- `/health`, `/metrics`, `/webhooks/evotor/{tenant_id}`, `/webhooks/moysklad/{tenant_id}`, `/api/v1/user/token`, `/onboarding`
+- `/health`, `/metrics`, `/webhooks/evotor/{tenant_id}`, `/webhooks/moysklad/{tenant_id}`, `/webhooks/telegram`, `/api/v1/user/token`, `/onboarding`
 
 ---
 
@@ -336,7 +389,9 @@ logs/*.log → Promtail → Loki → Grafana
 ### Alerts
 
 ```text
-service_heartbeats / event_store / stock_sync_status → alert_worker.py → Telegram / Email
+service_heartbeats → alert_worker.py → global Telegram / Email
+event_store / stock_sync_status → alert_worker.py → tenant Telegram / Email
+alert_worker.py → notification_log
 ```
 
 ---
@@ -353,6 +408,8 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → Tel
 | `stock_sync_status` | Статус последней синхронизации остатков |
 | `fiscalization_checks` | Отправленные чеки и их статусы |
 | `service_heartbeats` | Heartbeat фоновых сервисов |
+| `notification_log` | Журнал отправки уведомлений по email и Telegram |
+| `telegram_link_tokens` | Одноразовые токены привязки Telegram-чата к tenant |
 
 ---
 
@@ -385,7 +442,9 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → Tel
 | POST | `/onboarding/evotor/connect` | Получить магазины по Evotor token |
 | GET | `/onboarding/evotor/sessions/{session_id}/stores` | Выбор магазина Эвотор |
 | POST | `/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token` | Загрузить данные МойСклад |
-| POST | `/onboarding/store-profile` | Создать профиль магазина |
+| POST | `/onboarding/store-profile` | Создать профиль магазина и сохранить email-канал уведомлений |
+| GET | `/onboarding/tenants/{tenant_id}/telegram` | Страница статуса и подключения Telegram |
+| POST | `/onboarding/tenants/{tenant_id}/telegram/link` | Создать или обновить deep link для подключения Telegram |
 
 ### Tenants
 
@@ -405,6 +464,7 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → Tel
 |---|---|---|
 | POST | `/webhooks/evotor/{tenant_id}` | Принять webhook от Эвотор |
 | POST | `/webhooks/moysklad/{tenant_id}` | Принять webhook от МойСклад |
+| POST | `/webhooks/telegram` | Принять update от Telegram-бота для linking flow |
 | POST | `/api/v1/user/token` | Сохранить токен Эвотор |
 
 ### Sync API
@@ -449,6 +509,7 @@ service_heartbeats / event_store / stock_sync_status → alert_worker.py → Tel
 | Метод | URL | Описание |
 |---|---|---|
 | GET | `/monitoring/dashboard` | JSON snapshot состояния integration bus |
+| GET | `/monitoring/notifications` | Журнал уведомлений (`tenant_id`, `limit`, `offset`) |
 | GET | `/dashboard` | HTML dashboard мониторинга |
 
 ---
@@ -487,6 +548,7 @@ DATABASE_URL=postgresql://user:password@localhost:5432/evotor_ms
 
 # Безопасность
 EVOTOR_WEBHOOK_SECRET=your_secret
+MS_WEBHOOK_SECRET=your_secret
 ADMIN_API_TOKEN=token
 
 # Observability (опционально)
@@ -498,10 +560,16 @@ WORKER_METRICS_PORT=8001
 FISCAL_POLLER_METRICS_PORT=8002
 
 # Telegram alerts (опционально)
+# TELEGRAM_CHAT_ID используется для глобальных system/admin alerts
+# tenant Telegram уведомления используют тот же bot token, но chat_id берут из tenant profile
+# TELEGRAM_BOT_USERNAME нужен для deep link в onboarding Telegram linking flow
 TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_BOT_USERNAME=your_bot_username
 TELEGRAM_CHAT_ID=your_chat_id
 
 # Email alerts (опционально)
+# ALERT_EMAIL_TO используется для глобальных system/admin alerts
+# tenant email уведомления используют тот же SMTP transport, но адрес получателя берут из tenant profile
 SMTP_HOST=smtp.mail.ru
 SMTP_PORT=465
 SMTP_USERNAME=your_mail_login@mail.ru
@@ -514,6 +582,19 @@ SMTP_USE_TLS=false
 # Worker
 ALERT_POLL_INTERVAL_SEC=30
 WORKER_STALE_AFTER_SEC=30
+```
+
+Минимально для локальной разработки обычно достаточно:
+
+```env
+EVOTOR_WEBHOOK_SECRET=your_evotor_secret
+MS_WEBHOOK_SECRET=your_moysklad_secret
+```
+
+Если нужно закрыть internal/admin endpoints, задайте `ADMIN_API_TOKEN`:
+
+```env
+ADMIN_API_TOKEN=your_admin_token
 ```
 
 ### 4. Создать базу данных PostgreSQL
@@ -596,8 +677,9 @@ docker compose -f docker-compose.observability.yml up -d
 3. Выбрать магазин
 4. Ввести MoySklad token — система автоматически загрузит организации, склады и контрагентов
 5. Выбрать организацию, склад и контрагента по умолчанию из списков
-6. Создать профиль магазина
-7. Выполнить `POST /sync/{tenant_id}/initial`
+6. Создать профиль магазина, при необходимости указать email для уведомлений
+7. Открыть `/onboarding/tenants/{tenant_id}/telegram`, создать deep link и нажать `/start` в Telegram-боте
+8. Выполнить `POST /sync/{tenant_id}/initial`
 
 ### Через API вручную
 
@@ -615,7 +697,7 @@ docker compose -f docker-compose.observability.yml up -d
 ### Получить demand
 
 ```bash
-curl -H "Authorization: Bearer token" \
+curl -H "Authorization: Bearer <ADMIN_API_TOKEN>" \
   "http://127.0.0.1:8000/sync/{tenant_id}/demands"
 ```
 
@@ -623,21 +705,21 @@ curl -H "Authorization: Bearer token" \
 
 ```bash
 curl -X POST \
-  -H "Authorization: Bearer token" \
+  -H "Authorization: Bearer <ADMIN_API_TOKEN>" \
   "http://127.0.0.1:8000/sync/{tenant_id}/fiscalize/{ms_demand_id}"
 ```
 
 ### Получить события
 
 ```bash
-curl -H "Authorization: Bearer token" \
+curl -H "Authorization: Bearer <ADMIN_API_TOKEN>" \
   "http://127.0.0.1:8000/events"
 ```
 
 ### Получить dashboard snapshot
 
 ```bash
-curl -H "Authorization: Bearer token" \
+curl -H "Authorization: Bearer <ADMIN_API_TOKEN>" \
   "http://127.0.0.1:8000/monitoring/dashboard"
 ```
 

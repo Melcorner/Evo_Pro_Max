@@ -1,9 +1,15 @@
+import hashlib
+import hmac
+import json
 import logging
+import os
+import time
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
+from app.api.sync import _upsert_stock_status
 from app.db import get_connection, adapt_query as aq
 from app.stores.mapping_store import MappingStore
 from app.clients.moysklad_client import MoySkladClient
@@ -72,6 +78,28 @@ def _extract_ms_id_from_href(href: str) -> Optional[str]:
         return None
     parts = href.rstrip("/").split("/")
     return parts[-1] if parts else None
+
+
+def _get_ms_webhook_secret() -> str:
+    return os.getenv("MS_WEBHOOK_SECRET", "").strip()
+
+
+def _verify_signature(body: bytes, signature: str | None) -> bool:
+    secret = _get_ms_webhook_secret()
+    if not secret:
+        log.warning("MS_WEBHOOK_SECRET not set - skipping signature verification")
+        return True
+
+    if not signature:
+        return False
+
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature)
 
 
 def _get_document_positions(ms_client: MoySkladClient, doc_type: str, doc_id: str) -> List[str]:
@@ -182,91 +210,194 @@ STOCK_TRIGGER_TYPES = {
 
 
 @router.post("/webhooks/moysklad/{tenant_id}")
-async def moysklad_webhook(tenant_id: str, body: MoySkladWebhook):
+async def moysklad_webhook(
+    tenant_id: str,
+    request: Request,
+    x_lognex_signature: str | None = Header(default=None),
+):
     """
     Принимает webhook от МойСклад при изменении документов.
 
     При создании/изменении отгрузки, приёмки, инвентаризации, списания или оприходования —
     автоматически синхронизирует остатки затронутых товаров в Эвотор.
     """
+    raw_body = await request.body()
+
+    if not _verify_signature(raw_body, x_lognex_signature):
+        raise HTTPException(status_code=401, detail="Invalid MoySklad webhook signature")
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+        body = MoySkladWebhook.model_validate(payload)
+    except Exception as e:
+        log.error("Invalid webhook body tenant_id=%s err=%s", tenant_id, e)
+        raise HTTPException(status_code=400, detail=f"Invalid webhook body: {e}")
+
     tenant = _load_tenant(tenant_id)
 
     if not tenant.get("sync_completed_at"):
         log.warning("MoySklad webhook received but sync not completed tenant_id=%s", tenant_id)
         return {"status": "skipped", "reason": "initial sync not completed"}
 
+    started_at: int | None = None
+    stock_sync_started = False
     total_synced = 0
     total_skipped = 0
     total_failed = 0
+    total_products = 0
     processed_docs = []
 
     ms_client = MoySkladClient(tenant_id)
 
-    for event in body.events:
-        href = event.meta.href
-        doc_type = event.meta.type or _extract_doc_type_from_href(href)
-        doc_id = _extract_ms_id_from_href(href)
+    try:
+        for event in body.events:
+            href = event.meta.href
+            doc_type = event.meta.type or _extract_doc_type_from_href(href)
+            doc_id = _extract_ms_id_from_href(href)
 
-        if not doc_type or doc_type not in STOCK_TRIGGER_TYPES:
-            log.info("Skipping non-stock doc_type=%s href=%s", doc_type, href)
-            continue
+            if not doc_type or doc_type not in STOCK_TRIGGER_TYPES:
+                log.info("Skipping non-stock doc_type=%s href=%s", doc_type, href)
+                continue
 
-        if not doc_id:
-            log.warning("Cannot extract doc_id from href=%s", href)
-            continue
+            if not stock_sync_started:
+                started_at = int(time.time())
+                _upsert_stock_status(
+                    tenant_id=tenant_id,
+                    status="in_progress",
+                    started_at=started_at,
+                    last_error=None,
+                    synced_items_count=0,
+                    total_items_count=0,
+                )
+                stock_sync_started = True
 
-        log.info(
-            "Processing MoySklad webhook doc_type=%s doc_id=%s tenant_id=%s",
-            doc_type, doc_id, tenant_id,
-        )
+            if not doc_id:
+                log.warning("Cannot extract doc_id from href=%s", href)
+                total_failed += 1
+                processed_docs.append({
+                    "doc_type": doc_type,
+                    "doc_id": None,
+                    "products": 0,
+                    "synced": 0,
+                    "skipped": 0,
+                    "failed": 1,
+                    "error": "cannot extract doc_id",
+                })
+                continue
 
-        try:
-            ms_product_ids = _get_document_positions(ms_client, doc_type, doc_id)
-        except Exception as e:
-            log.error(
-                "Cannot fetch positions doc_type=%s doc_id=%s tenant_id=%s err=%s",
-                doc_type, doc_id, tenant_id, e,
+            log.info(
+                "Processing MoySklad webhook doc_type=%s doc_id=%s tenant_id=%s",
+                doc_type, doc_id, tenant_id,
             )
-            total_failed += 1
+
+            try:
+                ms_product_ids = _get_document_positions(ms_client, doc_type, doc_id)
+            except Exception as e:
+                log.error(
+                    "Cannot fetch positions doc_type=%s doc_id=%s tenant_id=%s err=%s",
+                    doc_type, doc_id, tenant_id, e,
+                )
+                total_failed += 1
+                processed_docs.append({
+                    "doc_type": doc_type,
+                    "doc_id": doc_id,
+                    "products": 0,
+                    "synced": 0,
+                    "skipped": 0,
+                    "failed": 1,
+                    "error": str(e),
+                })
+                continue
+
+            if not ms_product_ids:
+                processed_docs.append({
+                    "doc_type": doc_type,
+                    "doc_id": doc_id,
+                    "products": 0,
+                    "synced": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "error": None,
+                })
+                log.info("No products found in doc_type=%s doc_id=%s", doc_type, doc_id)
+                continue
+
+            total_products += len(ms_product_ids)
+
+            result = _sync_stock_for_products(tenant_id, ms_product_ids)
+
+            total_synced += result["synced"]
+            total_skipped += result["skipped"]
+            total_failed += result["failed"]
+
+            doc_error = None
+            if result["errors"]:
+                doc_error = "; ".join(err.get("error", "unknown error") for err in result["errors"][:3])
+
             processed_docs.append({
                 "doc_type": doc_type,
                 "doc_id": doc_id,
-                "error": str(e),
-                "synced": 0,
-                "failed": 0,
+                "products": len(ms_product_ids),
+                "synced": result["synced"],
+                "skipped": result["skipped"],
+                "failed": result["failed"],
+                "error": doc_error,
             })
-            continue
 
-        if not ms_product_ids:
-            log.info("No products found in doc_type=%s doc_id=%s", doc_type, doc_id)
-            continue
+        if not stock_sync_started:
+            log.info("MoySklad webhook contains no stock-trigger documents tenant_id=%s", tenant_id)
+            return {
+                "status": "ok",
+                "docs_processed": 0,
+                "products_total": 0,
+                "synced": 0,
+                "skipped": 0,
+                "failed": 0,
+                "details": [],
+            }
 
-        result = _sync_stock_for_products(tenant_id, ms_product_ids)
+        final_status = "ok" if total_failed == 0 else "error"
+        final_error = None
+        if total_failed > 0:
+            final_error = f"Webhook stock sync failed: failed={total_failed}, synced={total_synced}"
 
-        total_synced += result["synced"]
-        total_skipped += result["skipped"]
-        total_failed += result["failed"]
-        processed_docs.append({
-            "doc_type": doc_type,
-            "doc_id": doc_id,
-            "products": len(ms_product_ids),
-            "synced": result["synced"],
-            "failed": result["failed"],
-        })
+        _upsert_stock_status(
+            tenant_id=tenant_id,
+            status=final_status,
+            started_at=started_at,
+            last_sync_at=int(time.time()) if total_synced > 0 else None,
+            last_error=final_error,
+            synced_items_count=total_synced,
+            total_items_count=total_products,
+        )
 
-    log.info(
-        "MoySklad webhook processed tenant_id=%s docs=%s synced=%s failed=%s",
-        tenant_id, len(processed_docs), total_synced, total_failed,
-    )
+        log.info(
+            "MoySklad webhook processed tenant_id=%s docs=%s synced=%s skipped=%s failed=%s",
+            tenant_id, len(processed_docs), total_synced, total_skipped, total_failed,
+        )
 
-    return {
-        "status": "ok" if total_failed == 0 else "partial",
-        "docs_processed": len(processed_docs),
-        "synced": total_synced,
-        "skipped": total_skipped,
-        "failed": total_failed,
-        "details": processed_docs,
-    }
+        return {
+            "status": "ok" if total_failed == 0 else "partial",
+            "docs_processed": len(processed_docs),
+            "products_total": total_products,
+            "synced": total_synced,
+            "skipped": total_skipped,
+            "failed": total_failed,
+            "details": processed_docs,
+        }
+
+    except Exception as e:
+        if stock_sync_started:
+            _upsert_stock_status(
+                tenant_id=tenant_id,
+                status="error",
+                started_at=started_at,
+                last_sync_at=int(time.time()) if total_synced > 0 else None,
+                last_error=f"Webhook stock sync exception: {type(e).__name__}: {e}",
+                synced_items_count=total_synced,
+                total_items_count=total_products,
+            )
+        raise
 
 
 def _extract_doc_type_from_href(href: str) -> Optional[str]:

@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
 from app.db import get_connection, adapt_query as aq
+from app.stores.notification_log_store import list_notification_log
 
 router = APIRouter(tags=["Monitoring"])
 
@@ -16,6 +17,12 @@ WORKER_STALE_AFTER_SEC = int(os.getenv("WORKER_STALE_AFTER_SEC", "30"))
 PROBLEM_EVENTS_LIMIT = 10
 ERRORS_LIMIT = 10
 LATENCY_SAMPLE_SIZE = 20
+
+
+def _normalize_pagination(limit: int, offset: int) -> tuple[int, int]:
+    safe_limit = max(1, min(int(limit), 200))
+    safe_offset = max(0, int(offset))
+    return safe_limit, safe_offset
 
 
 def _format_ts(ts: int | None) -> str:
@@ -204,6 +211,21 @@ def _render_table(headers: list[str], rows: list[list[str]]) -> str:
 @router.get("/monitoring/dashboard")
 def monitoring_dashboard():
     return _load_dashboard_snapshot()
+
+
+@router.get("/monitoring/notifications")
+def monitoring_notifications(tenant_id: str | None = None, limit: int = 50, offset: int = 0):
+    safe_limit, safe_offset = _normalize_pagination(limit, offset)
+    conn = get_connection()
+    try:
+        return list_notification_log(
+            conn,
+            tenant_id=tenant_id,
+            limit=safe_limit,
+            offset=safe_offset,
+        )
+    finally:
+        conn.close()
 
 
 @router.get("/dashboard", response_class=HTMLResponse)

@@ -371,6 +371,13 @@ def poll_cycle() -> int:
     return len(checks)
 
 
+def runtime_db_smoke_check() -> dict:
+    checks = _load_pending_checks()
+    return {
+        "pending_checks": len(checks),
+    }
+
+
 def main_loop() -> None:
     _start_metrics_exporter()
     log.info(

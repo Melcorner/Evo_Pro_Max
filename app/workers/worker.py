@@ -446,6 +446,32 @@ def process_one_event():
         conn.close()
 
 
+def runtime_db_smoke_check() -> dict:
+    heartbeat_worker()
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'NEW' THEN 1 ELSE 0 END) AS new_count,
+                SUM(CASE WHEN status = 'RETRY' THEN 1 ELSE 0 END) AS retry_count,
+                SUM(CASE WHEN status = 'PROCESSING' THEN 1 ELSE 0 END) AS processing_count
+            FROM event_store
+            """
+        )
+        row = cur.fetchone() or {}
+        return {
+            "heartbeat_written": True,
+            "new_count": int(row["new_count"] or 0),
+            "retry_count": int(row["retry_count"] or 0),
+            "processing_count": int(row["processing_count"] or 0),
+        }
+    finally:
+        conn.close()
+
+
 def main_loop():
     _start_metrics_exporter()
     log.info("Worker started")

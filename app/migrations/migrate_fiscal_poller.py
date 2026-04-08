@@ -8,7 +8,7 @@ migrate_fiscal_poller.py — добавляет колонки для fiscal_pol
 """
 
 import logging
-from app.db import get_connection
+from app.db import adapt_query as aq, db_backend, get_connection
 from app.logger import setup_logging
 
 setup_logging()
@@ -22,12 +22,34 @@ COLUMNS_TO_ADD = [
 ]
 
 
+def _existing_columns(conn, table: str) -> set[str]:
+    cur = conn.cursor()
+    backend = db_backend()
+
+    if backend == "sqlite":
+        cur.execute(f"PRAGMA table_info({table})")
+        return {row["name"] for row in cur.fetchall()}
+
+    cur.execute(
+        aq(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = ?
+            """
+        ),
+        (table,),
+    )
+    return {row["column_name"] for row in cur.fetchall()}
+
+
 def run() -> None:
     conn = get_connection()
     cur = conn.cursor()
+    backend = db_backend()
+    log.info("Running fiscal poller migration backend=%s", backend)
 
-    cur.execute("PRAGMA table_info(fiscalization_checks)")
-    existing_cols = {row["name"] for row in cur.fetchall()}
+    existing_cols = _existing_columns(conn, "fiscalization_checks")
 
     added = []
     for col_name, col_def in COLUMNS_TO_ADD:

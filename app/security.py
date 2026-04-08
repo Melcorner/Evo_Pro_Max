@@ -23,13 +23,12 @@ def require_admin_api_token(
 
     Логика:
     - если ADMIN_API_TOKEN не задан, защита отключается
-      (удобно для локальной разработки)
     - если токен задан, нужен Bearer token
     """
     expected = _get_admin_api_token()
 
     if not expected:
-        log.debug("ADMIN_API_TOKEN not set — admin API auth is disabled")
+        log.debug("ADMIN_API_TOKEN not set - admin API auth is disabled")
         return
 
     if credentials is None:

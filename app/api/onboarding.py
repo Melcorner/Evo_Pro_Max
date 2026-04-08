@@ -1,25 +1,49 @@
 import html
 import json
 import logging
+import os
 import time
 import uuid
 
 import requests
-from fastapi import APIRouter, Form, HTTPException
+from fastapi import APIRouter, Body, Form, HTTPException
 from fastapi.responses import HTMLResponse
 
-from app.db import get_connection, adapt_query as aq
 from app.clients.evotor_client import fetch_stores_by_token
+from app.clients.telegram_client import TelegramClient
+from app.db import get_connection, adapt_query as aq
+from app.stores.telegram_link_token_store import (
+    create_telegram_link_token,
+    get_active_telegram_link_token,
+    get_telegram_link_token_by_value,
+    mark_telegram_link_token_linked,
+)
 
 router = APIRouter(tags=["Onboarding"])
 log = logging.getLogger("api.onboarding")
 
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
+TELEGRAM_LINK_TOKEN_TTL_SEC = 60 * 60
+
+
+def _extract_telegram_link_token_from_text(text: str) -> str | None:
+    parts = (text or "").strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return None
+
+    command, payload = parts
+    if not command.startswith("/start"):
+        return None
+    if not payload.startswith("tglink_"):
+        return None
+
+    return payload[len("tglink_") :].strip() or None
 
 
 # ---------------------------------------------------------------------------
 # MoySklad helpers
 # ---------------------------------------------------------------------------
+
 
 def _ms_headers(token: str) -> dict:
     return {
@@ -31,12 +55,20 @@ def _ms_headers(token: str) -> dict:
 
 def _ms_fetch(path: str, token: str, params: dict | None = None) -> dict:
     url = f"{MS_BASE}{path}"
-    r = requests.get(url, headers=_ms_headers(token), params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    response = requests.get(url, headers=_ms_headers(token), params=params, timeout=20)
+    response.raise_for_status()
+    return response.json()
 
 
 def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
+<<<<<<< HEAD
+=======
+    """
+    Возвращает (organizations, stores, agents).
+    Каждый элемент — {"id": "...", "name": "..."}.
+    """
+
+>>>>>>> 60e8cc4 (Alerts)
     def extract(data: dict) -> list[dict]:
         return [
             {"id": row["id"], "name": row.get("name") or row.get("description") or row["id"]}
@@ -44,7 +76,7 @@ def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
             if row.get("id")
         ]
 
-    orgs   = extract(_ms_fetch("/entity/organization", token))
+    orgs = extract(_ms_fetch("/entity/organization", token))
     stores = extract(_ms_fetch("/entity/store", token))
     agents = extract(_ms_fetch("/entity/counterparty", token, params={"limit": 100}))
     return orgs, stores, agents
@@ -54,11 +86,16 @@ def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
 # HTML layout
 # ---------------------------------------------------------------------------
 
+<<<<<<< HEAD
 def _layout(title: str, body: str, back_url: str | None = None) -> str:
     back_btn = ""
     if back_url:
         back_btn = f'<a href="{html.escape(back_url)}" class="back-btn">← Назад</a>'
 
+=======
+
+def _layout(title: str, body: str) -> str:
+>>>>>>> 60e8cc4 (Alerts)
     return f"""
 <!DOCTYPE html>
 <html lang="ru">
@@ -105,7 +142,25 @@ def _layout(title: str, body: str, back_url: str | None = None) -> str:
             background: #fff;
             width: 100%;
         }}
+        input[type="checkbox"] {{
+            width: auto;
+            padding: 0;
+            margin: 0;
+        }}
         select {{ cursor: pointer; }}
+        .checkbox {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 12px;
+        }}
+        .checkbox label {{
+            margin: 0;
+            font-size: 14px;
+            font-weight: 400;
+            color: #172033;
+            cursor: pointer;
+        }}
         .hint {{ font-size: 12px; color: #8793a8; }}
         button {{
             background: #2458d3;
@@ -237,6 +292,10 @@ def _layout(title: str, body: str, back_url: str | None = None) -> str:
 
 
 def _select(name: str, items: list[dict]) -> str:
+<<<<<<< HEAD
+=======
+    """Рендерит <select>, где option value=id, текст=name."""
+>>>>>>> 60e8cc4 (Alerts)
     options = "\n".join(
         f'<option value="{html.escape(item["id"])}">{html.escape(item["name"])}</option>'
         for item in items
@@ -247,6 +306,7 @@ def _select(name: str, items: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 # Session helpers
 # ---------------------------------------------------------------------------
+
 
 def _load_session(session_id: str) -> dict:
     conn = get_connection()
@@ -263,15 +323,159 @@ def _load_session(session_id: str) -> dict:
 
 
 def _extract_store_id(store: dict) -> str:
-    return str(
-        store.get("id") or store.get("uuid") or store.get("storeId") or ""
-    ).strip()
+    return str(store.get("id") or store.get("uuid") or store.get("storeId") or "").strip()
 
 
 def _extract_store_name(store: dict, fallback_id: str) -> str:
-    return str(
-        store.get("name") or store.get("title") or store.get("storeName") or f"Store {fallback_id}"
-    ).strip()
+    return str(store.get("name") or store.get("title") or store.get("storeName") or f"Store {fallback_id}").strip()
+
+
+def _load_tenant(tenant_id: str) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        aq(
+            """
+            SELECT
+                id,
+                name,
+                alert_email,
+                alerts_email_enabled,
+                telegram_chat_id,
+                alerts_telegram_enabled
+            FROM tenants
+            WHERE id = ?
+            """
+        ),
+        (tenant_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    return dict(row)
+
+
+def _get_telegram_bot_username() -> str:
+    return os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
+
+
+def _get_telegram_bot_token() -> str:
+    return os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+
+def _build_telegram_deep_link(link_token: str) -> str | None:
+    bot_username = _get_telegram_bot_username()
+    if not bot_username:
+        return None
+    return f"https://t.me/{bot_username}?start=tglink_{link_token}"
+
+
+def _format_ts(ts: int | None) -> str:
+    if ts is None:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+
+
+def _reply_in_telegram(chat_id: str | int | None, text: str) -> None:
+    bot_token = _get_telegram_bot_token()
+    if not bot_token or chat_id is None:
+        return
+
+    try:
+        TelegramClient(bot_token=bot_token, chat_id=str(chat_id)).send_message(text)
+    except Exception:
+        log.exception("Failed to reply in Telegram chat_id=%s", chat_id)
+
+
+def _render_telegram_link_page(
+    tenant: dict,
+    *,
+    info_message: str | None = None,
+    error_message: str | None = None,
+) -> HTMLResponse:
+    conn = get_connection()
+    try:
+        token_row = get_active_telegram_link_token(conn, tenant["id"])
+        conn.commit()
+    finally:
+        conn.close()
+
+    is_connected = bool(tenant.get("telegram_chat_id")) and bool(tenant.get("alerts_telegram_enabled"))
+    deep_link = _build_telegram_deep_link(token_row["link_token"]) if token_row else None
+    bot_username = _get_telegram_bot_username()
+    connect_label = "Переподключить Telegram" if is_connected else "Подключить Telegram"
+
+    parts: list[str] = []
+    if info_message:
+        parts.append(f'<div class="success">{html.escape(info_message)}</div>')
+    if error_message:
+        parts.append(f'<div class="error">{html.escape(error_message)}</div>')
+
+    if is_connected:
+        parts.append(
+            f"""
+            <div class="success">
+                Telegram подключен для tenant <code>{html.escape(tenant["id"])}</code><br>
+                chat_id: <code>{html.escape(str(tenant["telegram_chat_id"]))}</code>
+            </div>
+            """
+        )
+    else:
+        parts.append(
+            f"""
+            <div class="error">
+                Telegram пока не подключен для tenant <code>{html.escape(tenant["id"])}</code>.
+            </div>
+            """
+        )
+
+    parts.append(
+        f"""
+        <div class="field">
+            <label>Tenant</label>
+            <div><strong>{html.escape(tenant["name"])}</strong></div>
+        </div>
+        """
+    )
+
+    if token_row and deep_link:
+        parts.append(
+            f"""
+            <div class="field">
+                <label>Ссылка для подключения</label>
+                <a href="{html.escape(deep_link)}">{html.escape(deep_link)}</a>
+                <span class="hint">Токен действует до {_format_ts(token_row["expires_at"])}. После команды /start вернитесь на эту страницу и обновите её.</span>
+            </div>
+            """
+        )
+    elif token_row and not deep_link:
+        parts.append(
+            """
+            <div class="error">
+                TELEGRAM_BOT_USERNAME не настроен, поэтому deep link для подключения пока недоступен.
+            </div>
+            """
+        )
+    elif not bot_username:
+        parts.append(
+            """
+            <div class="error">
+                TELEGRAM_BOT_USERNAME не настроен, поэтому Telegram linking сейчас недоступен.
+            </div>
+            """
+        )
+
+    parts.append(
+        f"""
+        <form method="post" action="/onboarding/tenants/{html.escape(tenant["id"])}/telegram/link">
+            <button type="submit">{connect_label}</button>
+        </form>
+        """
+    )
+
+    body = "".join(parts)
+    return HTMLResponse(_layout("Подключение Telegram", body))
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +543,7 @@ def _render_sync_result(result: dict) -> str:
 # Step 1 — Evotor token
 # ---------------------------------------------------------------------------
 
+
 @router.get("/onboarding/evotor/connect", response_class=HTMLResponse)
 def onboarding_token_form():
     body = """
@@ -362,9 +567,9 @@ def onboarding_token_submit(evotor_token: str = Form(...)):
 
     try:
         stores = fetch_stores_by_token(evotor_token)
-    except Exception as e:
+    except Exception as exc:
         log.exception("Failed to fetch stores by Evotor token")
-        body = f'<div class="error">Не удалось получить магазины по token: {html.escape(str(e))}</div>'
+        body = f'<div class="error">Не удалось получить магазины по token: {html.escape(str(exc))}</div>'
         return HTMLResponse(_layout("Ошибка подключения", body), status_code=502)
 
     if not stores:
@@ -378,10 +583,12 @@ def onboarding_token_submit(evotor_token: str = Form(...)):
     try:
         cur = conn.cursor()
         cur.execute(
-            aq("""
-            INSERT INTO evotor_onboarding_sessions (id, evotor_token, stores_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            """),
+            aq(
+                """
+                INSERT INTO evotor_onboarding_sessions (id, evotor_token, stores_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """
+            ),
             (session_id, evotor_token, json.dumps(stores, ensure_ascii=False), now, now),
         )
         conn.commit()
@@ -400,6 +607,7 @@ def onboarding_token_submit(evotor_token: str = Form(...)):
 # Step 2 — выбор магазина Эвотор
 # ---------------------------------------------------------------------------
 
+
 @router.get("/onboarding/evotor/sessions/{session_id}/stores", response_class=HTMLResponse)
 def onboarding_evotor_stores(session_id: str):
     session = _load_session(session_id)
@@ -416,13 +624,15 @@ def onboarding_evotor_stores(session_id: str):
             continue
         store_name = _extract_store_name(store, store_id)
         link = f"/onboarding/evotor/sessions/{html.escape(session_id)}/stores/{html.escape(store_id)}/ms-token"
-        parts.append(f"""
-        <div class="store">
-            <p><strong>{html.escape(store_name)}</strong></p>
-            <p style="margin:4px 0 12px; color:#5b6475; font-size:13px;">ID: <code>{html.escape(store_id)}</code></p>
-            <a href="{link}">Создать профиль для этого магазина →</a>
-        </div>
-        """)
+        parts.append(
+            f"""
+            <div class="store">
+                <p><strong>{html.escape(store_name)}</strong></p>
+                <p style="margin:4px 0 12px; color:#5b6475; font-size:13px;">ID: <code>{html.escape(store_id)}</code></p>
+                <a href="{link}">Создать профиль для этого магазина →</a>
+            </div>
+            """
+        )
 
     return HTMLResponse(_layout(
         "Выбор магазина Эвотор",
@@ -434,6 +644,7 @@ def onboarding_evotor_stores(session_id: str):
 # ---------------------------------------------------------------------------
 # Step 3 — ввод MS токена и автозагрузка данных
 # ---------------------------------------------------------------------------
+
 
 @router.get(
     "/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token",
@@ -478,22 +689,27 @@ def onboarding_ms_token_submit(
 
     try:
         orgs, ms_stores, agents = _ms_fetch_all(moysklad_token)
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "?"
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
         log.warning("MoySklad API error %s", status)
         if status == 401:
             msg = "Неверный MoySklad token — проверьте правильность и повторите."
         else:
             msg = f"Ошибка API МойСклад: {status}"
         body = f'<div class="error">{html.escape(msg)}</div>'
+<<<<<<< HEAD
         return HTMLResponse(_layout(
             "Ошибка подключения МойСклад",
             body,
             back_url=f"/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token",
         ), status_code=502)
     except Exception as e:
+=======
+        return HTMLResponse(_layout("Ошибка подключения МойСклад", body), status_code=502)
+    except Exception as exc:
+>>>>>>> 60e8cc4 (Alerts)
         log.exception("Failed to fetch MoySklad data")
-        body = f'<div class="error">Не удалось получить данные МойСклад: {html.escape(str(e))}</div>'
+        body = f'<div class="error">Не удалось получить данные МойСклад: {html.escape(str(exc))}</div>'
         return HTMLResponse(_layout("Ошибка", body), status_code=502)
 
     if not orgs:
@@ -511,19 +727,18 @@ def onboarding_ms_token_submit(
     try:
         cur = conn.cursor()
         cur.execute(
-            aq("""
-            UPDATE evotor_onboarding_sessions
-            SET moysklad_token  = ?,
-                ms_data_json    = ?,
-                updated_at      = ?
-            WHERE id = ?
-            """),
+            aq(
+                """
+                UPDATE evotor_onboarding_sessions
+                SET moysklad_token  = ?,
+                    ms_data_json    = ?,
+                    updated_at      = ?
+                WHERE id = ?
+                """
+            ),
             (
                 moysklad_token,
-                json.dumps(
-                    {"orgs": orgs, "stores": ms_stores, "agents": agents},
-                    ensure_ascii=False,
-                ),
+                json.dumps({"orgs": orgs, "stores": ms_stores, "agents": agents}, ensure_ascii=False),
                 now,
                 session_id,
             ),
@@ -532,7 +747,7 @@ def onboarding_ms_token_submit(
     finally:
         conn.close()
 
-    org_select   = _select("ms_organization_id", orgs)
+    org_select = _select("ms_organization_id", orgs)
     store_select = _select("ms_store_id", ms_stores)
     agent_select = _select("ms_agent_id", agents)
 
@@ -540,7 +755,7 @@ def onboarding_ms_token_submit(
     <div class="success">Данные МойСклад успешно загружены.</div>
 
     <form method="post" action="/onboarding/store-profile">
-        <input type="hidden" name="session_id"      value="{html.escape(session_id)}" />
+        <input type="hidden" name="session_id" value="{html.escape(session_id)}" />
         <input type="hidden" name="evotor_store_id" value="{html.escape(store_id)}" />
 
         <div class="field">
@@ -565,6 +780,27 @@ def onboarding_ms_token_submit(
             <label>Контрагент по умолчанию</label>
             {agent_select}
             <span class="hint">Используется как покупатель, если данные клиента в чеке отсутствуют.</span>
+        </div>
+
+        <hr>
+        <div class="section-title">Уведомления (необязательно)</div>
+
+        <div class="field">
+            <label>Email для уведомлений</label>
+            <input type="email" name="alert_email" placeholder="owner@example.com" />
+        </div>
+
+        <div class="checkbox">
+            <input id="alerts_email_enabled" type="checkbox" name="alerts_email_enabled" checked />
+            <label for="alerts_email_enabled">Включить email-уведомления</label>
+        </div>
+
+        <div class="field">
+            <label>Telegram-уведомления</label>
+            <div class="hint">
+                Telegram теперь подключается через бота после создания профиля магазина.
+                После сохранения tenant откройте страницу подключения Telegram и перейдите по deep link.
+            </div>
         </div>
 
         <hr>
@@ -599,6 +835,7 @@ def onboarding_ms_token_submit(
 # Step 4 — сохранение профиля + автосинхронизация
 # ---------------------------------------------------------------------------
 
+
 @router.post("/onboarding/store-profile", response_class=HTMLResponse)
 def onboarding_store_profile_submit(
     session_id: str = Form(...),
@@ -607,6 +844,8 @@ def onboarding_store_profile_submit(
     ms_organization_id: str = Form(...),
     ms_store_id: str = Form(...),
     ms_agent_id: str = Form(...),
+    alert_email: str = Form(""),
+    alerts_email_enabled: bool = Form(False),
     fiscal_token: str = Form(""),
     fiscal_client_uid: str = Form(""),
     fiscal_device_uid: str = Form(""),
@@ -619,7 +858,7 @@ def onboarding_store_profile_submit(
         return HTMLResponse(_layout("Ошибка", body), status_code=400)
 
     ms_data = json.loads(session.get("ms_data_json") or "{}")
-    valid_org_ids   = {item["id"] for item in ms_data.get("orgs",   [])}
+    valid_org_ids = {item["id"] for item in ms_data.get("orgs", [])}
     valid_store_ids = {item["id"] for item in ms_data.get("stores", [])}
     valid_agent_ids = {item["id"] for item in ms_data.get("agents", [])}
 
@@ -633,6 +872,8 @@ def onboarding_store_profile_submit(
         body = '<div class="error">Выбран неверный контрагент.</div>'
         return HTMLResponse(_layout("Ошибка", body), status_code=400)
 
+    alert_email_value = alert_email.strip() or None
+    alerts_email_enabled_value = 1 if alerts_email_enabled and alert_email_value else 0
     tenant_id = str(uuid.uuid4())
     now = int(time.time())
 
@@ -657,13 +898,17 @@ def onboarding_store_profile_submit(
             return HTMLResponse(_layout("Профиль уже существует", body), status_code=409)
 
         cur.execute(
-            aq("""
-            INSERT INTO tenants (
-                id, name, evotor_api_key, moysklad_token, created_at,
-                evotor_token, evotor_store_id,
-                ms_organization_id, ms_store_id, ms_agent_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """),
+            aq(
+                """
+                INSERT INTO tenants (
+                    id, name, evotor_api_key, moysklad_token, created_at,
+                    evotor_token, evotor_store_id,
+                    ms_organization_id, ms_store_id, ms_agent_id,
+                    alert_email, alerts_email_enabled,
+                    telegram_chat_id, alerts_telegram_enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+            ),
             (
                 tenant_id,
                 name.strip(),
@@ -675,25 +920,30 @@ def onboarding_store_profile_submit(
                 ms_organization_id.strip(),
                 ms_store_id.strip(),
                 ms_agent_id.strip(),
+                alert_email_value,
+                alerts_email_enabled_value,
+                None,
+                0,
             ),
         )
 
         if fiscal_token.strip() and fiscal_client_uid.strip() and fiscal_device_uid.strip():
             cur.execute(
-                aq("""
-                UPDATE tenants
-                SET fiscal_token = ?, fiscal_client_uid = ?, fiscal_device_uid = ?
-                WHERE id = ?
-                """),
+                aq(
+                    """
+                    UPDATE tenants
+                    SET fiscal_token = ?, fiscal_client_uid = ?, fiscal_device_uid = ?
+                    WHERE id = ?
+                    """
+                ),
                 (fiscal_token.strip(), fiscal_client_uid.strip(), fiscal_device_uid.strip(), tenant_id),
             )
 
         conn.commit()
-
-    except Exception as e:
+    except Exception as exc:
         conn.rollback()
         log.exception("Failed to create store profile")
-        body = f'<div class="error">Не удалось создать профиль магазина: {html.escape(str(e))}</div>'
+        body = f'<div class="error">Не удалось создать профиль магазина: {html.escape(str(exc))}</div>'
         return HTMLResponse(_layout("Ошибка создания профиля", body), status_code=500)
     finally:
         conn.close()
@@ -705,6 +955,7 @@ def onboarding_store_profile_submit(
 
     body = f"""
     <div class="success">
+<<<<<<< HEAD
         <strong>Профиль магазина успешно создан!</strong>
     </div>
 
@@ -714,6 +965,133 @@ def onboarding_store_profile_submit(
     <hr>
     <p style="color:#5b6475; font-size:13px; margin-top:16px;">
         Tenant ID: <code>{html.escape(tenant_id)}</code>
+=======
+        <strong>Профиль магазина успешно создан!</strong><br><br>
+        tenant_id: <code>{html.escape(tenant_id)}</code>
+    </div>
+    <p style="color:#5b6475; font-size:14px;">
+        Следующий шаг — выполните первичную синхронизацию товаров.
+    </p>
+    <p style="color:#5b6475; font-size:14px;">
+        Telegram пока не подключен.
+        <a href="/onboarding/tenants/{html.escape(tenant_id)}/telegram">Открыть страницу подключения Telegram</a>
+        и привязать чат через бота.
+>>>>>>> 60e8cc4 (Alerts)
     </p>
     """
     return HTMLResponse(_layout("Профиль создан", body))
+
+
+@router.get("/onboarding/tenants/{tenant_id}/telegram", response_class=HTMLResponse)
+def onboarding_tenant_telegram_status(tenant_id: str):
+    tenant = _load_tenant(tenant_id)
+    return _render_telegram_link_page(tenant)
+
+
+@router.post("/onboarding/tenants/{tenant_id}/telegram/link", response_class=HTMLResponse)
+def onboarding_tenant_telegram_link(tenant_id: str):
+    tenant = _load_tenant(tenant_id)
+
+    if not _get_telegram_bot_username():
+        return _render_telegram_link_page(
+            tenant,
+            error_message="TELEGRAM_BOT_USERNAME не настроен, поэтому deep link для подключения пока недоступен.",
+        )
+
+    conn = get_connection()
+    try:
+        create_telegram_link_token(
+            conn,
+            tenant_id=tenant_id,
+            ttl_sec=TELEGRAM_LINK_TOKEN_TTL_SEC,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return _render_telegram_link_page(
+        tenant,
+        info_message="Ссылка для подключения Telegram создана. Перейдите по deep link и нажмите /start в боте.",
+    )
+
+
+@router.post("/webhooks/telegram")
+def telegram_link_webhook(update: dict = Body(...)):
+    message = update.get("message") or update.get("edited_message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    text = (message.get("text") or "").strip()
+
+    if chat_id is None or not text:
+        return {"ok": True}
+
+    link_token = _extract_telegram_link_token_from_text(text)
+    if not link_token:
+        if text.startswith("/start"):
+            _reply_in_telegram(chat_id, "Используйте ссылку подключения из onboarding, чтобы привязать Telegram к магазину.")
+        return {"ok": True}
+
+    now = int(time.time())
+    conn = get_connection()
+    try:
+        token_row = get_telegram_link_token_by_value(conn, link_token, now_ts=now)
+        if not token_row:
+            _reply_in_telegram(chat_id, "Ссылка подключения Telegram не найдена или уже недействительна.")
+            conn.commit()
+            return {"ok": True}
+
+        if token_row["status"] == "expired":
+            _reply_in_telegram(chat_id, "Срок действия ссылки истёк. Создайте новую ссылку на странице подключения Telegram.")
+            conn.commit()
+            return {"ok": True}
+
+        if token_row["status"] == "linked":
+            _reply_in_telegram(chat_id, "Эта ссылка уже использована. При необходимости создайте новую ссылку и переподключите Telegram.")
+            conn.commit()
+            return {"ok": True}
+
+        if int(token_row["expires_at"]) <= now:
+            conn.cursor().execute(
+                aq(
+                    """
+                    UPDATE telegram_link_tokens
+                    SET status = 'expired'
+                    WHERE id = ?
+                    """
+                ),
+                (token_row["id"],),
+            )
+            conn.commit()
+            _reply_in_telegram(chat_id, "Срок действия ссылки истёк. Создайте новую ссылку на странице подключения Telegram.")
+            return {"ok": True}
+
+        conn.cursor().execute(
+            aq(
+                """
+                UPDATE tenants
+                SET telegram_chat_id = ?, alerts_telegram_enabled = 1
+                WHERE id = ?
+                """
+            ),
+            (str(chat_id), token_row["tenant_id"]),
+        )
+        mark_telegram_link_token_linked(
+            conn,
+            token_id=token_row["id"],
+            linked_chat_id=str(chat_id),
+            linked_at=now,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.exception("Failed to process Telegram link webhook chat_id=%s", chat_id)
+        _reply_in_telegram(chat_id, "Не удалось завершить подключение Telegram. Попробуйте создать новую ссылку и повторить.")
+        return {"ok": True}
+    finally:
+        conn.close()
+
+    _reply_in_telegram(
+        chat_id,
+        f"Telegram успешно подключен. Уведомления для tenant {token_row['tenant_id']} теперь будут приходить в этот чат.",
+    )
+    return {"ok": True}

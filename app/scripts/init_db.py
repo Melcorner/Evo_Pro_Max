@@ -15,6 +15,95 @@ log = logging.getLogger("init_db")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
+SCHEMA_TABLES = (
+    "tenants",
+    "evotor_connections",
+    "evotor_onboarding_sessions",
+    "event_store",
+    "processed_events",
+    "mappings",
+    "errors",
+    "stock_sync_status",
+    "fiscalization_checks",
+    "service_heartbeats",
+    "notification_log",
+    "telegram_link_tokens",
+)
+
+INDEX_DEFINITIONS = [
+    (
+        "idx_event_unique",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_unique ON event_store(tenant_id, event_key)",
+    ),
+    (
+        "idx_event_status_retry",
+        "CREATE INDEX IF NOT EXISTS idx_event_status_retry ON event_store(status, next_retry_at)",
+    ),
+    (
+        "idx_fisc_tenant_demand",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fisc_tenant_demand ON fiscalization_checks(tenant_id, ms_demand_id)",
+    ),
+    (
+        "idx_fisc_tenant",
+        "CREATE INDEX IF NOT EXISTS idx_fisc_tenant ON fiscalization_checks(tenant_id)",
+    ),
+    (
+        "idx_fisc_demand",
+        "CREATE INDEX IF NOT EXISTS idx_fisc_demand ON fiscalization_checks(ms_demand_id)",
+    ),
+    (
+        "idx_fiscal_checks_pending",
+        "CREATE INDEX IF NOT EXISTS idx_fiscal_checks_pending ON fiscalization_checks(status, next_poll_at, updated_at)",
+    ),
+    (
+        "idx_errors_event_id",
+        "CREATE INDEX IF NOT EXISTS idx_errors_event_id ON errors(event_id)",
+    ),
+    (
+        "idx_errors_tenant_id",
+        "CREATE INDEX IF NOT EXISTS idx_errors_tenant_id ON errors(tenant_id)",
+    ),
+    (
+        "idx_errors_created_at",
+        "CREATE INDEX IF NOT EXISTS idx_errors_created_at ON errors(created_at)",
+    ),
+    (
+        "idx_mappings_evotor",
+        "CREATE INDEX IF NOT EXISTS idx_mappings_evotor ON mappings(tenant_id, entity_type, evotor_id)",
+    ),
+    (
+        "idx_mappings_ms",
+        "CREATE INDEX IF NOT EXISTS idx_mappings_ms ON mappings(tenant_id, entity_type, ms_id)",
+    ),
+    (
+        "idx_tenants_evotor_user_id_lookup",
+        "CREATE INDEX IF NOT EXISTS idx_tenants_evotor_user_id_lookup ON tenants(evotor_user_id)",
+    ),
+    (
+        "idx_tenants_evotor_store_id_unique",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_evotor_store_id_unique "
+        "ON tenants(evotor_store_id) "
+        "WHERE evotor_store_id IS NOT NULL AND TRIM(evotor_store_id) <> ''",
+    ),
+    (
+        "idx_notification_log_tenant_created_at",
+        "CREATE INDEX IF NOT EXISTS idx_notification_log_tenant_created_at ON notification_log(tenant_id, created_at)",
+    ),
+    (
+        "idx_notification_log_created_at",
+        "CREATE INDEX IF NOT EXISTS idx_notification_log_created_at ON notification_log(created_at)",
+    ),
+    (
+        "idx_telegram_link_tokens_tenant_created_at",
+        "CREATE INDEX IF NOT EXISTS idx_telegram_link_tokens_tenant_created_at ON telegram_link_tokens(tenant_id, created_at)",
+    ),
+    (
+        "idx_telegram_link_tokens_status_expires_at",
+        "CREATE INDEX IF NOT EXISTS idx_telegram_link_tokens_status_expires_at ON telegram_link_tokens(status, expires_at)",
+    ),
+]
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -104,6 +193,10 @@ def init_db():
             fiscal_token        TEXT,
             fiscal_client_uid   TEXT,
             fiscal_device_uid   TEXT,
+            alert_email         TEXT,
+            alerts_email_enabled INTEGER NOT NULL DEFAULT 1,
+            telegram_chat_id    TEXT,
+            alerts_telegram_enabled INTEGER NOT NULL DEFAULT 0,
             ms_account_id       TEXT,
             ms_status           TEXT DEFAULT 'active',
             updated_at          INTEGER
@@ -281,64 +374,49 @@ def init_db():
     )
 
     # ------------------------------------------------------------------
+    # notification_log
+    # ------------------------------------------------------------------
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notification_log (
+            id              TEXT PRIMARY KEY,
+            tenant_id       TEXT,
+            channel_type    TEXT NOT NULL CHECK (channel_type IN ('email','telegram')),
+            destination     TEXT NOT NULL,
+            event_type      TEXT NOT NULL,
+            message         TEXT NOT NULL,
+            status          TEXT NOT NULL CHECK (status IN ('sent','failed','skipped')),
+            error_message   TEXT,
+            created_at      INTEGER NOT NULL,
+            sent_at         INTEGER,
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        )
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # telegram_link_tokens
+    # ------------------------------------------------------------------
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telegram_link_tokens (
+            id              TEXT PRIMARY KEY,
+            tenant_id       TEXT NOT NULL,
+            link_token      TEXT NOT NULL UNIQUE,
+            status          TEXT NOT NULL CHECK (status IN ('pending','linked','expired')),
+            created_at      INTEGER NOT NULL,
+            expires_at      INTEGER NOT NULL,
+            linked_chat_id  TEXT,
+            linked_at       INTEGER,
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        )
+        """
+    )
+
+    # ------------------------------------------------------------------
     # Индексы
     # ------------------------------------------------------------------
-    indexes = [
-        (
-            "idx_event_unique",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_unique ON event_store(tenant_id, event_key)",
-        ),
-        (
-            "idx_event_status_retry",
-            "CREATE INDEX IF NOT EXISTS idx_event_status_retry ON event_store(status, next_retry_at)",
-        ),
-        (
-            "idx_fisc_tenant_demand",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fisc_tenant_demand ON fiscalization_checks(tenant_id, ms_demand_id)",
-        ),
-        (
-            "idx_fisc_tenant",
-            "CREATE INDEX IF NOT EXISTS idx_fisc_tenant ON fiscalization_checks(tenant_id)",
-        ),
-        (
-            "idx_fisc_demand",
-            "CREATE INDEX IF NOT EXISTS idx_fisc_demand ON fiscalization_checks(ms_demand_id)",
-        ),
-        (
-            "idx_fiscal_checks_pending",
-            "CREATE INDEX IF NOT EXISTS idx_fiscal_checks_pending ON fiscalization_checks(status, next_poll_at, updated_at)",
-        ),
-        (
-            "idx_errors_event_id",
-            "CREATE INDEX IF NOT EXISTS idx_errors_event_id ON errors(event_id)",
-        ),
-        (
-            "idx_errors_tenant_id",
-            "CREATE INDEX IF NOT EXISTS idx_errors_tenant_id ON errors(tenant_id)",
-        ),
-        (
-            "idx_errors_created_at",
-            "CREATE INDEX IF NOT EXISTS idx_errors_created_at ON errors(created_at)",
-        ),
-        (
-            "idx_mappings_evotor",
-            "CREATE INDEX IF NOT EXISTS idx_mappings_evotor ON mappings(tenant_id, entity_type, evotor_id)",
-        ),
-        (
-            "idx_mappings_ms",
-            "CREATE INDEX IF NOT EXISTS idx_mappings_ms ON mappings(tenant_id, entity_type, ms_id)",
-        ),
-        (
-            "idx_tenants_evotor_user_id",
-            "CREATE INDEX IF NOT EXISTS idx_tenants_evotor_user_id ON tenants(evotor_user_id)",
-        ),
-        (
-            "idx_tenants_evotor_store_id",
-            "CREATE INDEX IF NOT EXISTS idx_tenants_evotor_store_id ON tenants(evotor_store_id)",
-        ),
-    ]
-
-    for index_name, ddl in indexes:
+    for index_name, ddl in INDEX_DEFINITIONS:
         _create_index(conn, ddl, index_name)
 
     # ------------------------------------------------------------------
@@ -360,6 +438,10 @@ def init_db():
         ("tenants", "fiscal_token", "TEXT"),
         ("tenants", "fiscal_client_uid", "TEXT"),
         ("tenants", "fiscal_device_uid", "TEXT"),
+        ("tenants", "alert_email", "TEXT"),
+        ("tenants", "alerts_email_enabled", "INTEGER NOT NULL DEFAULT 1"),
+        ("tenants", "telegram_chat_id", "TEXT"),
+        ("tenants", "alerts_telegram_enabled", "INTEGER NOT NULL DEFAULT 0"),
         # stock_sync_status
         ("stock_sync_status", "started_at", "INTEGER"),
         ("stock_sync_status", "updated_at", "INTEGER NOT NULL DEFAULT 0"),
