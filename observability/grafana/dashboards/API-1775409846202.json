@@ -80,7 +80,7 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "sum(rate(integration_api_requests_total{job=\"integration-api\",path!=\"/metrics\",path!=\"/favicon.ico\",path!=\"/openapi.json\"}[1m]))",
+          "expr": "sum(rate(integration_api_requests_total{job=\"integration-api\",path!=\"/metrics\",path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"}[1m]))",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -144,7 +144,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(\r\n  rate(integration_api_requests_total{\r\n    job=\"integration-api\",\r\n    status=~\"4..|5..\",\r\n    path!=\"/metrics\",\r\n    path!=\"/favicon.ico\",\r\n    path!=\"/openapi.json\"\r\n  }[5m])\r\n) or vector(0)",
+          "expr": "sum(\r\n  rate(integration_api_requests_total{\r\n    job=\"integration-api\",\r\n    status=~\"4..|5..\",\r\n    path!=\"/metrics\",\r\n    path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",\r\n    path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"\r\n  }[5m])\r\n) or vector(0)",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -234,7 +234,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (status) (\r\n  rate(integration_api_requests_total{\r\n    job=\"integration-api\",\r\n    status=~\"4..|5..\",\r\n    path!=\"/metrics\",\r\n    path!=\"/favicon.ico\",\r\n    path!=\"/openapi.json\"\r\n  }[5m])\r\n) or vector(0)",
+          "expr": "sum by (status) (\r\n  rate(integration_api_requests_total{\r\n    job=\"integration-api\",\r\n    status=~\"4..|5..\",\r\n    path!=\"/metrics\",\r\n    path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",\r\n    path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"\r\n  }[5m])\r\n) or vector(0)",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -328,7 +328,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (method, path) (\r\n  rate(integration_api_requests_total{\r\n    job=\"integration-api\",\r\n    path!=\"/metrics\",\r\n    path!=\"/favicon.ico\",\r\n    path!=\"/openapi.json\"\r\n  }[1m])\r\n)",
+          "expr": "sum by (method, path) (\r\n  rate(integration_api_requests_total{\r\n    job=\"integration-api\",\r\n    path!=\"/metrics\",\r\n    path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",\r\n    path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"\r\n  }[1m])\r\n)",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -422,7 +422,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(\r\n  0.95,\r\n  sum by (le, method, path) (\r\n    rate(integration_api_request_duration_seconds_bucket{\r\n      job=\"integration-api\",\r\n      path!=\"/metrics\",\r\n      path!=\"/favicon.ico\",\r\n      path!=\"/openapi.json\"\r\n    }[5m])\r\n  )\r\n)",
+          "expr": "histogram_quantile(\r\n  0.95,\r\n  sum by (le, method, path) (\r\n    rate(integration_api_request_duration_seconds_bucket{\r\n      job=\"integration-api\",\r\n      path!=\"/metrics\",\r\n      path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",\r\n      path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"\r\n    }[5m])\r\n  )\r\n)",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -486,7 +486,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(\r\n  0.95,\r\n  sum by (le) (\r\n    rate(integration_api_request_duration_seconds_bucket{\r\n      job=\"integration-api\",\r\n      path!=\"/metrics\",\r\n      path!=\"/favicon.ico\",\r\n      path!=\"/openapi.json\"\r\n    }[5m])\r\n  )\r\n)",
+          "expr": "histogram_quantile(\r\n  0.95,\r\n  sum by (le) (\r\n    rate(integration_api_request_duration_seconds_bucket{\r\n      job=\"integration-api\",\r\n      path!=\"/metrics\",\r\n      path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",\r\n      path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"\r\n    }[5m])\r\n  )\r\n)",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
