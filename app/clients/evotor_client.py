@@ -1,7 +1,7 @@
 import logging
 import requests
 
-from app.db import get_connection
+from app.db import get_connection, adapt_query as aq
 
 log = logging.getLogger("evotor_client")
 
@@ -18,10 +18,10 @@ class EvotorClient:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute(
-            """
+            aq("""
             SELECT evotor_token, evotor_store_id
             FROM tenants WHERE id = ?
-            """,
+            """),
             (self.tenant_id,),
         )
         row = cur.fetchone()

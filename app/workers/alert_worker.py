@@ -16,6 +16,25 @@ from app.services.alert_logic import build_alert_messages, build_alert_snapshot
 setup_logging()
 log = logging.getLogger("alert_worker")
 
+
+def _alert_extra(
+    *,
+    component: str,
+    operation: str,
+    status: str | None = None,
+    exception_type: str | None = None,
+) -> dict:
+    payload = {
+        "component": component,
+        "operation": operation,
+    }
+    if status is not None:
+        payload["status"] = status
+    if exception_type is not None:
+        payload["exception_type"] = exception_type
+    return payload
+
+
 SERVICE_NAME = "integration-bus"
 WORKER_HEARTBEAT_NAME = "worker"
 WORKER_STALE_AFTER_SEC = int(os.getenv("WORKER_STALE_AFTER_SEC", "30"))
@@ -166,16 +185,26 @@ def _collect_snapshot():
 
 def main_loop():
     log.info(
-        "Alert worker started poll_interval=%s stale_after=%s",
-        ALERT_POLL_INTERVAL_SEC,
-        WORKER_STALE_AFTER_SEC,
+        "alert worker started",
+        extra=_alert_extra(
+            component="alert_worker",
+            operation="alert_worker.main_loop",
+            status="started",
+        ),
     )
 
     telegram_client = _build_telegram_client()
     email_client = _build_email_client()
 
     if telegram_client is None and email_client is None:
-        log.error("Alert worker has no delivery channels configured")
+        log.error(
+            "alert worker has no delivery channels configured",
+            extra=_alert_extra(
+                component="alert_worker",
+                operation="alert_worker.main_loop",
+                status="no_channels",
+            ),
+        )
         return
 
     previous_snapshot = None
@@ -187,14 +216,12 @@ def main_loop():
             if previous_snapshot is None:
                 previous_snapshot = current_snapshot
                 log.info(
-                    "Alert baseline set worker_problem=%s failed_events_present=%s failed_events_count=%s retry_events_present=%s retry_events_count=%s stock_sync_errors_present=%s stock_sync_errors_count=%s",
-                    current_snapshot.worker_problem,
-                    current_snapshot.failed_events_present,
-                    current_snapshot.failed_events_count,
-                    current_snapshot.retry_events_present,
-                    current_snapshot.retry_events_count,
-                    current_snapshot.stock_sync_errors_present,
-                    current_snapshot.stock_sync_errors_count,
+                    "alert baseline set",
+                    extra=_alert_extra(
+                        component="alert_worker",
+                        operation="alert_worker.main_loop",
+                        status="baseline_set",
+                    ),
                 )
             else:
                 messages = build_alert_messages(previous_snapshot, current_snapshot)
@@ -212,17 +239,45 @@ def main_loop():
                             try:
                                 telegram_client.send_message(message)
                                 message_delivered = True
-                                log.info("Telegram alert sent message=%s", message)
+                                log.info(
+                                    "telegram alert sent",
+                                    extra=_alert_extra(
+                                        component="telegram",
+                                        operation="alert_worker.deliver",
+                                        status="sent",
+                                    ),
+                                )
                             except Exception:
-                                log.exception("Failed to send Telegram alert message=%s", message)
+                                log.exception(
+                                    "telegram alert failed",
+                                    extra=_alert_extra(
+                                        component="telegram",
+                                        operation="alert_worker.deliver",
+                                        status="failed",
+                                                                            ),
+                                )
 
                         if email_client is not None:
                             try:
                                 email_client.send_message(subject=subject, text=message)
                                 message_delivered = True
-                                log.info("Email alert sent subject=%s", subject)
+                                log.info(
+                                    "email alert sent",
+                                    extra=_alert_extra(
+                                        component="email",
+                                        operation="alert_worker.deliver",
+                                        status="sent",
+                                    ),
+                                )
                             except Exception:
-                                log.exception("Failed to send email alert message=%s", message)
+                                log.exception(
+                                    "email alert failed",
+                                    extra=_alert_extra(
+                                        component="email",
+                                        operation="alert_worker.deliver",
+                                        status="failed",
+                                                                            ),
+                                )
 
                         if not message_delivered:
                             all_messages_delivered = False
@@ -231,18 +286,37 @@ def main_loop():
                         previous_snapshot = current_snapshot
                     else:
                         log.warning(
-                            "Alert state not advanced because at least one alert message was not delivered by any channel"
+                            "alert state not advanced",
+                            extra=_alert_extra(
+                                component="alert_worker",
+                                operation="alert_worker.main_loop",
+                                status="delivery_incomplete",
+                            ),
                         )
 
         except Exception:
-            log.exception("Alert worker cycle failed")
+            log.exception(
+                "alert worker cycle failed",
+                extra=_alert_extra(
+                    component="alert_worker",
+                    operation="alert_worker.main_loop",
+                    status="failed",
+                ),
+            )
 
         if _shutdown:
             break
 
         time.sleep(ALERT_POLL_INTERVAL_SEC)
 
-    log.info("Alert worker stopped gracefully")
+    log.info(
+        "alert worker stopped gracefully",
+        extra=_alert_extra(
+            component="alert_worker",
+            operation="alert_worker.main_loop",
+            status="stopped",
+        ),
+    )
 
 
 if __name__ == "__main__":

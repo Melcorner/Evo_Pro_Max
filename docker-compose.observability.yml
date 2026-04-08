@@ -1,0 +1,90 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: integration-prometheus
+    command:
+      - "--config.file=/etc/prometheus-config/prometheus.yml"
+    ports:
+      - "9090:9090"
+    volumes:
+      - type: bind
+        source: ./observability/prometheus
+        target: /etc/prometheus-config
+        read_only: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:2.9.8
+    container_name: integration-loki
+    command:
+      - "-config.file=/etc/loki/config.yml"
+    ports:
+      - "3100:3100"
+    volumes:
+      - type: bind
+        source: ./observability/loki
+        target: /etc/loki
+        read_only: true
+      - type: volume
+        source: loki-data
+        target: /loki
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:2.9.8
+    container_name: integration-promtail
+    command:
+      - "-config.file=/etc/promtail/config.yml"
+    ports:
+      - "9080:9080"
+    volumes:
+      - type: bind
+        source: ./observability/promtail
+        target: /etc/promtail
+        read_only: true
+      - type: bind
+        source: ./logs
+        target: /var/log/integration
+        read_only: true
+      - type: volume
+        source: promtail-data
+        target: /var/lib/promtail
+    restart: unless-stopped
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:12.4.2
+    container_name: integration-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - type: bind
+        source: ./observability/grafana/provisioning/datasources
+        target: /etc/grafana/provisioning/datasources
+        read_only: true
+      - type: bind
+        source: ./observability/grafana/provisioning/dashboards
+        target: /etc/grafana/provisioning/dashboards
+        read_only: true
+      - type: bind
+        source: ./observability/grafana/dashboards
+        target: /var/lib/grafana/dashboards
+        read_only: true
+      - type: volume
+        source: grafana-data
+        target: /var/lib/grafana
+    restart: unless-stopped
+    environment:
+      - GF_SERVER_ROOT_URL=https://a2.v.fomin.fvds.ru/grafana
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+    depends_on:
+      - prometheus
+      - loki
+
+volumes:
+  loki-data:
+  promtail-data:
+  grafana-data:

@@ -139,65 +139,105 @@ def _normalize_receipt_created(body_dict: dict) -> tuple[str, str, dict] | tuple
     has_any_result_sum = False
 
     for item in data.get("items", []):
-        quantity  = _safe_float(item.get("quantity")) or 0.0
-        price     = _safe_float(item.get("price")) or 0.0
-        line_sum  = _safe_float(item.get("sumPrice"))
-        if line_sum is None:
+        product_id = item.get("id") or item.get("productId") or item.get("product_id")
+        if not product_id:
+            log.warning("Skipping receipt item without product_id: %s", item)
+            continue
+
+        quantity = _safe_float(item.get("quantity"))
+        price = _safe_float(item.get("price"))
+        line_sum = _safe_float(item.get("sumPrice"))
+        result_price = _safe_float(item.get("resultPrice", item.get("result_price")))
+        result_sum = _safe_float(item.get("resultSum", item.get("result_sum")))
+        raw_discount = _safe_float(item.get("discount"))
+
+        # если нет количества или оно некорректное — позиция невалидна
+        if quantity is None or quantity <= 0:
+            log.warning(
+                "Skipping receipt item with invalid quantity product_id=%s quantity=%s raw=%s",
+                product_id,
+                quantity,
+                item,
+            )
+            continue
+
+        # если sumPrice не передан, пробуем вычислить
+        if line_sum is None and price is not None:
             line_sum = quantity * price
 
-        result_price = _safe_float(item.get("resultPrice", item.get("result_price")))
-        result_sum   = _safe_float(item.get("resultSum",   item.get("result_sum")))
-
-        raw_discount = _safe_float(item.get("discount"))
-        if result_sum is None and raw_discount is not None:
+        # если result_sum не передан, пробуем вычислить через discount
+        if result_sum is None and raw_discount is not None and line_sum is not None:
             result_sum = max(0.0, line_sum - raw_discount)
 
+        # если result_price не передан, пробуем вычислить из result_sum
         if result_price is None and result_sum is not None and quantity > 0:
             result_price = result_sum / quantity
+
+        # если нет ни одной осмысленной денежной величины — позиция невалидна
+        if (
+            (price is None or price <= 0)
+            and (line_sum is None or line_sum <= 0)
+            and (result_sum is None or result_sum <= 0)
+        ):
+            log.warning(
+                "Skipping receipt item with no valid price/sum product_id=%s raw=%s",
+                product_id,
+                item,
+            )
+            continue
 
         if result_sum is not None:
             computed_total_sum += result_sum
             has_any_result_sum = True
-        else:
+        elif line_sum is not None:
             computed_total_sum += line_sum
 
         positions.append({
-            "product_id":               item.get("id") or item.get("productId") or item.get("product_id"),
-            "product_name":             item.get("name"),
-            "quantity":                 quantity,
-            "price":                    price,
-            "sum":                      line_sum,
-            "result_price":             result_price,
-            "result_sum":               result_sum,
-            "position_discount":        item.get("positionDiscount",        item.get("position_discount")),
-            "doc_distributed_discount": item.get("docDistributedDiscount",  item.get("doc_distributed_discount")),
-            "discount":                 raw_discount,
-            "tax":                      item.get("tax"),
-            "tax_percent":              item.get("taxPercent", item.get("tax_percent")),
-            "raw":                      item,
+            "product_id": product_id,
+            "product_name": item.get("name"),
+            "quantity": quantity,
+            "price": price or 0.0,
+            "sum": line_sum or 0.0,
+            "result_price": result_price,
+            "result_sum": result_sum,
+            "position_discount": item.get("positionDiscount", item.get("position_discount")),
+            "doc_distributed_discount": item.get("docDistributedDiscount", item.get("doc_distributed_discount")),
+            "discount": raw_discount,
+            "tax": item.get("tax"),
+            "tax_percent": item.get("taxPercent", item.get("tax_percent")),
+            "raw": item,
         })
+
+    # если после фильтрации валидных позиций не осталось — событие пропускаем
+    if not positions:
+        log.warning(
+            "Skipping ReceiptCreated because no valid positions found receipt_id=%s source_type=%s",
+            body_dict.get("id") or data.get("id"),
+            body_dict.get("type"),
+        )
+        return None, None, None
 
     document_sum = computed_total_sum if positions else None
     if not has_any_result_sum:
         total_amount = _safe_float(data.get("totalAmount"))
-        if total_amount is not None:
+        if total_amount is not None and total_amount > 0:
             document_sum = total_amount
 
     normalized_payload = {
-        "id":       body_dict.get("id") or data.get("id") or str(uuid.uuid4()),
-        "type":     "SELL",
+        "id": body_dict.get("id") or data.get("id") or str(uuid.uuid4()),
+        "type": "SELL",
         "store_id": body_dict.get("store_id") or body_dict.get("storeId") or data.get("storeId"),
-        "device_id":body_dict.get("device_id") or body_dict.get("deviceId") or data.get("deviceId"),
+        "device_id": body_dict.get("device_id") or body_dict.get("deviceId") or data.get("deviceId"),
         "customer": _extract_customer(data),
         "body": {
-            "positions":      positions,
-            "sum":            document_sum,
-            "doc_discounts":  data.get("docDiscounts", data.get("doc_discounts", [])) or [],
+            "positions": positions,
+            "sum": document_sum,
+            "doc_discounts": data.get("docDiscounts", data.get("doc_discounts", [])) or [],
             "total_discount": _safe_float(data.get("totalDiscount")),
-            "total_tax":      _safe_float(data.get("totalTax")),
+            "total_tax": _safe_float(data.get("totalTax")),
         },
         "source_event_type": body_dict.get("type"),
-        "source_data":       data,
+        "source_data": data,
     }
 
     return "sale", normalized_payload["id"], normalized_payload
@@ -351,10 +391,11 @@ async def evotor_webhook(raw_body: EvotorWebhook, request: Request, tenant_id: s
 
         if not event_type:
             log.warning(
-                "Unsupported ReceiptCreated subtype tenant_id=%s raw_type=%s",
-                tenant_id, event_type_raw,
+                "Skipping ReceiptCreated tenant_id=%s raw_type=%s reason=no valid sale payload",
+                tenant_id,
+                event_type_raw,
             )
-            return {"status": "skipped", "reason": "unsupported receipt subtype"}
+            return {"status": "skipped", "reason": "no valid sale positions"}
 
         payload_to_store = normalized_payload
     else:
