@@ -81,7 +81,7 @@
           },
           "editorMode": "code",
           "expr": "sum(rate(integration_api_requests_total{job=\"integration-api\",path!=\"/metrics\",path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"}[1m]))",
-          "legendFormat": "__auto",
+          "legendFormat": "requests/sec",
           "range": true,
           "refId": "A"
         }
@@ -145,7 +145,7 @@
         {
           "editorMode": "code",
           "expr": "sum(\r\n  rate(integration_api_requests_total{\r\n    job=\"integration-api\",\r\n    status=~\"4..|5..\",\r\n    path!=\"/metrics\",\r\n    path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",\r\n    path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"\r\n  }[5m])\r\n) or vector(0)",
-          "legendFormat": "__auto",
+          "legendFormat": "errors/sec",
           "range": true,
           "refId": "A"
         }
@@ -235,7 +235,7 @@
         {
           "editorMode": "code",
           "expr": "sum by (status) (\r\n  rate(integration_api_requests_total{\r\n    job=\"integration-api\",\r\n    status=~\"4..|5..\",\r\n    path!=\"/metrics\",\r\n    path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",\r\n    path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"\r\n  }[5m])\r\n) or vector(0)",
-          "legendFormat": "__auto",
+          "legendFormat": "HTTP {{status}}",
           "range": true,
           "refId": "A"
         }
@@ -329,7 +329,7 @@
         {
           "editorMode": "code",
           "expr": "sum by (method, path) (\r\n  rate(integration_api_requests_total{\r\n    job=\"integration-api\",\r\n    path!=\"/metrics\",\r\n    path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",\r\n    path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"\r\n  }[1m])\r\n)",
-          "legendFormat": "__auto",
+          "legendFormat": "{{method}} {{path}}",
           "range": true,
           "refId": "A"
         }
@@ -423,7 +423,7 @@
         {
           "editorMode": "code",
           "expr": "histogram_quantile(\r\n  0.95,\r\n  sum by (le, method, path) (\r\n    rate(integration_api_request_duration_seconds_bucket{\r\n      job=\"integration-api\",\r\n      path!=\"/metrics\",\r\n      path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",\r\n      path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"\r\n    }[5m])\r\n  )\r\n)",
-          "legendFormat": "__auto",
+          "legendFormat": "{{method}} {{path}}",
           "range": true,
           "refId": "A"
         }
@@ -487,7 +487,7 @@
         {
           "editorMode": "code",
           "expr": "histogram_quantile(\r\n  0.95,\r\n  sum by (le) (\r\n    rate(integration_api_request_duration_seconds_bucket{\r\n      job=\"integration-api\",\r\n      path!=\"/metrics\",\r\n      path!=\"/favicon.ico\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\",\r\n      path!=\"/openapi.json\",path=~\"(/health|/metrics|/tenants|/sync|/webhooks|/events|/errors|/mappings|/monitoring|/dashboard|/onboarding|/vendor|/docs).*\"\r\n    }[5m])\r\n  )\r\n)",
-          "legendFormat": "__auto",
+          "legendFormat": "p95 latency",
           "range": true,
           "refId": "A"
         }
