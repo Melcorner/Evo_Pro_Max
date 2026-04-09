@@ -299,7 +299,36 @@ def _map_ms_tracking_type_to_evotor_type(ms_product: dict, current_type: str | N
         return current_type or "NORMAL"
 
     mapping = {
-        "MILK": "DAIRY_MARKED",
+        "MILK":           "DAIRY_MARKED",
+        "TOBACCO":        "TOBACCO_MARKED",
+        "SHOES":          "SHOES_MARKED",
+        "LP_CLOTHES":     "CLOTHES_MARKED",
+        "LP_LINENS":      "LINENS_MARKED",
+        "PERFUMERY":      "PERFUMERY_MARKED",
+        "ELECTRONICS":    "ELECTRONICS_MARKED",
+        "TIRES":          "TIRES_MARKED",
+        "CAMERA_PHOTO":   "CAMERA_MARKED",
+        "WATER":          "WATER_MARKED",
+        "OTP":            "OTP_MARKED",
+        "BICYCLE":        "BICYCLE_MARKED",
+        "WHEELCHAIRS":    "WHEELCHAIRS_MARKED",
+        "ALCOHOL":        "ALCOHOL_MARKED",
+        "MEDICINE":       "MEDICINE_MARKED",
+        "NABEER":         "NABEER_MARKED",
+        "NICOTINE":        "NICOTINE_MARKED",
+        "FOOD_SUPPLEMENT": "FOOD_SUPPLEMENT_MARKED",
+        "ANTISEPTIC":      "ANTISEPTIC_MARKED",
+        "MEDICAL_DEVICES": "WHEELCHAIRS_MARKED",
+        "SOFT_DRINKS":     "SOFT_DRINKS_MARKED",
+        "VETPHARMA":       "VETPHARMA_MARKED",
+        "SEAFOOD":         "SEAFOOD_MARKED",
+        "VEGETABLE_OIL":   "VEGETABLE_OIL_MARKED",
+        "ANIMAL_FOOD":     "ANIMAL_FOOD_MARKED",
+        "MOTOR_OIL":       "MOTOR_OIL_MARKED",
+        "GROCERIES":       "GROCERIES_MARKED",
+        "COSMETICS":       "COSMETICS_MARKED",
+        "FUR":             "FUR_MARKED",
+        "NOT_TRACKED":    "NORMAL",
     }
 
     evotor_type = mapping.get(str(tracking_type).upper())
@@ -1812,3 +1841,53 @@ def get_fiscal_clients(tenant_id: str):
         raise HTTPException(status_code=502, detail=f"Failed to get clients: {e}")
 
     return {"count": len(clients), "clients": clients}
+
+@router.post("/sync/{tenant_id}/ms-to-evotor")
+def sync_all_ms_products_to_evotor(tenant_id: str):
+    """
+    Синхронизирует все товары из МойСклад в Эвотор.
+    Новые товары (без маппинга) создаются в Эвотор.
+    Существующие — обновляются.
+    """
+    tenant = _load_tenant(tenant_id)
+    if not tenant.get("moysklad_token"):
+        raise HTTPException(status_code=400, detail="moysklad_token not configured")
+    if not tenant.get("evotor_token"):
+        raise HTTPException(status_code=400, detail="evotor_token not configured")
+
+    try:
+        data = _search_ms_products(tenant["moysklad_token"])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch MoySklad products: {e}")
+
+    ms_products = data.get("rows", [])
+    synced = 0
+    skipped = 0
+    failed = 0
+    errors = []
+
+    for row in ms_products:
+        ms_id = row.get("id")
+        if not ms_id:
+            skipped += 1
+            continue
+        try:
+            sync_product_to_evotor(tenant_id, ms_id)
+            synced += 1
+        except HTTPException as e:
+            if e.status_code == 409:
+                # initial sync not completed — останавливаемся
+                raise
+            failed += 1
+            errors.append(f"{ms_id}: {e.detail}")
+        except Exception as e:
+            failed += 1
+            errors.append(f"{ms_id}: {e}")
+
+    return {
+        "status": "ok" if failed == 0 else "partial",
+        "synced": synced,
+        "skipped": skipped,
+        "failed": failed,
+        "errors": errors[:10],
+    }
