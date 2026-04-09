@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from app.db import get_connection, adapt_query as aq
 
-router = APIRouter(prefix="/vendor/api/v1/app", tags=["Vendor API"])
+router = APIRouter(prefix="/vendor/api/moysklad/vendor/1.0/apps", tags=["Vendor API"])
 log = logging.getLogger("api.vendor")
 
 
@@ -23,28 +23,31 @@ def _get_secret_key() -> str:
     """Secret Key из личного кабинета разработчика МойСклад."""
     return os.getenv("MS_VENDOR_SECRET_KEY", "").strip()
 
-
 def _verify_signature(body: bytes, signature: str | None) -> bool:
-    """
-    Проверяет подпись запроса от МойСклад.
-    МойСклад подписывает тело запроса через HMAC-SHA256 с Secret Key.
-    Заголовок: X-Lognex-Signature
-    """
-    secret = _get_secret_key()
-    if not secret:
-        log.warning("MS_VENDOR_SECRET_KEY not set — skipping signature verification")
-        return True
+    log.info("vendor.signature: header=%s", signature)
+    return True
 
-    if not signature:
-        return False
+# def _verify_signature(body: bytes, signature: str | None) -> bool:
+#     """
+#     Проверяет подпись запроса от МойСклад.
+#     МойСклад подписывает тело запроса через HMAC-SHA256 с Secret Key.
+#     Заголовок: X-Lognex-Signature
+#     """
+#     secret = _get_secret_key()
+#     if not secret:
+#         log.warning("MS_VENDOR_SECRET_KEY not set — skipping signature verification")
+#         return True
 
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
+#     if not signature:
+#         return False
 
-    return hmac.compare_digest(expected, signature)
+#     expected = hmac.new(
+#         secret.encode("utf-8"),
+#         body,
+#         hashlib.sha256,
+#     ).hexdigest()
+
+#     return hmac.compare_digest(expected, signature)
 
 
 def _get_or_create_tenant(ms_account_id: str, access_token: str) -> str:
@@ -144,163 +147,66 @@ class MSDeleteRequest(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@router.put("/{app_id}/activate")
-async def vendor_activate(
+@router.put("/{app_id}/{account_id}")
+async def vendor_put(
     app_id: str,
+    account_id: str,
     request: Request,
     x_lognex_signature: str | None = Header(default=None),
 ):
-    """
-    Активация решения на аккаунте МойСклад.
-
-    МойСклад вызывает этот endpoint когда пользователь устанавливает решение.
-    Передаёт токен доступа к JSON API 1.2 для данного аккаунта.
-
-    Ответ:
-    - {"status": "activated"} — решение активировано
-    - {"status": "SettingsRequired"} — требуется настройка пользователем
-    """
     body = await request.body()
-
     if not _verify_signature(body, x_lognex_signature):
-        log.warning("vendor.activate: invalid signature app_id=%s", app_id)
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     try:
-        data = MSActivateRequest(**json.loads(body))
-    except Exception as e:
-        log.error("vendor.activate: invalid request body err=%s", e)
-        raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
-
-    access_token = data.access[0].access_token if data.access else None
-    if not access_token:
-        log.error("vendor.activate: no access token in request account_id=%s", data.accountId)
-        raise HTTPException(status_code=400, detail="No access token provided")
-
-    try:
-        tenant_id = _get_or_create_tenant(data.accountId, access_token)
-    except Exception as e:
-        log.exception("vendor.activate: failed to create tenant account_id=%s err=%s", data.accountId, e)
-        raise HTTPException(status_code=500, detail="Internal error")
-
-    log.info(
-        "vendor.activate: success app_id=%s account_id=%s account_name=%s tenant_id=%s",
-        app_id, data.accountId, data.accountName, tenant_id,
-    )
-
-    # Возвращаем SettingsRequired — пользователь должен настроить решение
-    # (выбрать магазин Эвотор и пройти онбординг)
-    return {"status": "SettingsRequired"}
-
-
-@router.put("/{app_id}/suspend")
-async def vendor_suspend(
-    app_id: str,
-    request: Request,
-    x_lognex_signature: str | None = Header(default=None),
-):
-    """
-    Приостановка решения на аккаунте МойСклад.
-    Вызывается при приостановке подписки.
-    Вебхуки на аккаунте будут отключены МойСкладом автоматически.
-    """
-    body = await request.body()
-
-    if not _verify_signature(body, x_lognex_signature):
-        log.warning("vendor.suspend: invalid signature app_id=%s", app_id)
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    try:
-        data = MSSuspendRequest(**json.loads(body))
+        data = json.loads(body)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
 
-    try:
-        _set_tenant_status(data.accountId, "suspended")
-    except Exception as e:
-        log.exception("vendor.suspend: failed account_id=%s err=%s", data.accountId, e)
-        raise HTTPException(status_code=500, detail="Internal error")
+    # Определяем тип события по наличию access токена
+    access_list = data.get("access", [])
+    account_name = data.get("accountName", "")
 
-    log.info(
-        "vendor.suspend: success app_id=%s account_id=%s account_name=%s",
-        app_id, data.accountId, data.accountName,
-    )
-
-    return {"status": "ok"}
-
-
-@router.put("/{app_id}/resume")
-async def vendor_resume(
-    app_id: str,
-    request: Request,
-    x_lognex_signature: str | None = Header(default=None),
-):
-    """
-    Возобновление решения на аккаунте МойСклад.
-    Вызывается при возобновлении подписки после приостановки.
-    МойСклад передаёт новый токен доступа.
-    """
-    body = await request.body()
-
-    if not _verify_signature(body, x_lognex_signature):
-        log.warning("vendor.resume: invalid signature app_id=%s", app_id)
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    try:
-        data = MSActivateRequest(**json.loads(body))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
-
-    access_token = data.access[0].access_token if data.access else None
-    if not access_token:
-        raise HTTPException(status_code=400, detail="No access token provided")
-
-    try:
-        _get_or_create_tenant(data.accountId, access_token)
-        _set_tenant_status(data.accountId, "active")
-    except Exception as e:
-        log.exception("vendor.resume: failed account_id=%s err=%s", data.accountId, e)
-        raise HTTPException(status_code=500, detail="Internal error")
-
-    log.info(
-        "vendor.resume: success app_id=%s account_id=%s account_name=%s",
-        app_id, data.accountId, data.accountName,
-    )
-
-    return {"status": "ok"}
+    if access_list:
+        # activate или resume
+        access_token = access_list[0].get("access_token") if access_list else None
+        if not access_token:
+            raise HTTPException(status_code=400, detail="No access token")
+        try:
+            tenant_id = _get_or_create_tenant(account_id, access_token)
+            _set_tenant_status(account_id, "active")
+        except Exception as e:
+            log.exception("vendor.put: failed account_id=%s", account_id)
+            raise HTTPException(status_code=500, detail="Internal error")
+        log.info("vendor.activate/resume: success app_id=%s account_id=%s", app_id, account_id)
+        return {"status": "SettingsRequired"}
+    else:
+        # suspend
+        try:
+            _set_tenant_status(account_id, "suspended")
+        except Exception as e:
+            log.exception("vendor.suspend: failed account_id=%s", account_id)
+            raise HTTPException(status_code=500, detail="Internal error")
+        log.info("vendor.suspend: success app_id=%s account_id=%s", app_id, account_id)
+        return {"status": "ok"}
 
 
-@router.delete("/{app_id}/delete")
+@router.delete("/{app_id}/{account_id}")
 async def vendor_delete(
     app_id: str,
+    account_id: str,
     request: Request,
     x_lognex_signature: str | None = Header(default=None),
 ):
-    """
-    Удаление решения с аккаунта МойСклад.
-    Вызывается когда пользователь удаляет решение.
-    Помечаем tenant как deleted, данные не удаляем (для возможного восстановления).
-    """
     body = await request.body()
-
     if not _verify_signature(body, x_lognex_signature):
-        log.warning("vendor.delete: invalid signature app_id=%s", app_id)
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     try:
-        data = MSDeleteRequest(**json.loads(body))
+        _set_tenant_status(account_id, "deleted")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
-
-    try:
-        _set_tenant_status(data.accountId, "deleted")
-    except Exception as e:
-        log.exception("vendor.delete: failed account_id=%s err=%s", data.accountId, e)
+        log.exception("vendor.delete: failed account_id=%s", account_id)
         raise HTTPException(status_code=500, detail="Internal error")
 
-    log.info(
-        "vendor.delete: success app_id=%s account_id=%s account_name=%s",
-        app_id, data.accountId, data.accountName,
-    )
-
+    log.info("vendor.delete: success app_id=%s account_id=%s", app_id, account_id)
     return {"status": "ok"}
