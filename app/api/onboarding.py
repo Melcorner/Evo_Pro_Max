@@ -7,7 +7,7 @@ import time
 import uuid
 
 import requests
-from fastapi import APIRouter, Body, Form, HTTPException
+from fastapi import APIRouter, Body, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.clients.evotor_client import fetch_stores_by_token
@@ -25,6 +25,24 @@ log = logging.getLogger("api.onboarding")
 
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 TELEGRAM_LINK_TOKEN_TTL_SEC = 60 * 60
+
+MS_APP_ID = os.getenv("MS_APP_ID", "").strip()
+MS_VENDOR_API_BASE = "https://apps-api.moysklad.ru/api/vendor/1.0"
+
+
+def _get_ms_context(context_key: str) -> dict | None:
+    secret = os.getenv("MS_VENDOR_SECRET_KEY", "").strip()
+    if not MS_APP_ID or not secret:
+        return None
+    try:
+        url = f"{MS_VENDOR_API_BASE}/apps/{MS_APP_ID}/context"
+        r = requests.get(url, params={"contextKey": context_key},
+                         headers={"Authorization": f"Bearer {secret}"}, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.exception("Failed to get MS context err=%s", e)
+        return None
 
 
 def _extract_telegram_link_token_from_text(text: str) -> str | None:
@@ -44,11 +62,7 @@ def _extract_telegram_link_token_from_text(text: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _ms_headers(token: str) -> dict:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept-Encoding": "gzip",
-        "Content-Type": "application/json",
-    }
+    return {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip", "Content-Type": "application/json"}
 
 
 def _ms_fetch(path: str, token: str, params: dict | None = None) -> dict:
@@ -62,8 +76,7 @@ def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
     def extract(data: dict) -> list[dict]:
         return [
             {"id": row["id"], "name": row.get("name") or row.get("description") or row["id"]}
-            for row in data.get("rows", [])
-            if row.get("id")
+            for row in data.get("rows", []) if row.get("id")
         ]
     orgs = extract(_ms_fetch("/entity/organization", token))
     stores = extract(_ms_fetch("/entity/store", token))
@@ -137,7 +150,6 @@ def _reply_in_telegram(chat_id: str | int | None, text: str) -> None:
 
 
 def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None]:
-    """Возвращает (tenant, event_counts, mappings_count, stock_row)."""
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -146,23 +158,13 @@ def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None]:
         if not row:
             raise HTTPException(status_code=404, detail="Tenant not found")
         tenant = dict(row)
-
-        cur.execute(
-            aq("SELECT COUNT(*) as cnt FROM mappings WHERE tenant_id = ? AND entity_type = 'product'"),
-            (tenant_id,),
-        )
+        cur.execute(aq("SELECT COUNT(*) as cnt FROM mappings WHERE tenant_id = ? AND entity_type = 'product'"), (tenant_id,))
         mappings_count = cur.fetchone()["cnt"]
-
         cur.execute(aq("SELECT * FROM stock_sync_status WHERE tenant_id = ?"), (tenant_id,))
         stock = cur.fetchone()
         stock_row = dict(stock) if stock else None
-
-        cur.execute(
-            aq("SELECT status, COUNT(*) as cnt FROM event_store WHERE tenant_id = ? GROUP BY status"),
-            (tenant_id,),
-        )
+        cur.execute(aq("SELECT status, COUNT(*) as cnt FROM event_store WHERE tenant_id = ? GROUP BY status"), (tenant_id,))
         event_counts = {r["status"]: r["cnt"] for r in cur.fetchall()}
-
         return tenant, event_counts, mappings_count, stock_row
     finally:
         conn.close()
@@ -263,25 +265,21 @@ def _lk_layout(tenant: dict, active_tab: str, content: str,
                 info_message: str | None = None, error_message: str | None = None) -> HTMLResponse:
     tenant_id = tenant["id"]
     name = html.escape(tenant.get("name", ""))
-
     tabs = [
-        ("overview",      f"/onboarding/tenants/{tenant_id}",              "Обзор"),
-        ("integration",   f"/onboarding/tenants/{tenant_id}/integration",  "Интеграция"),
-        ("notifications", f"/onboarding/tenants/{tenant_id}/notifications","Уведомления"),
-        ("actions",       f"/onboarding/tenants/{tenant_id}/actions",      "Действия"),
+        ("overview",      f"/onboarding/tenants/{tenant_id}",               "Обзор"),
+        ("integration",   f"/onboarding/tenants/{tenant_id}/integration",   "Интеграция"),
+        ("notifications", f"/onboarding/tenants/{tenant_id}/notifications", "Уведомления"),
+        ("actions",       f"/onboarding/tenants/{tenant_id}/actions",       "Действия"),
     ]
-
     tabs_html = "\n".join(
         f'<a href="{url}" class="lk-tab {"active" if key == active_tab else ""}">{label}</a>'
         for key, url, label in tabs
     )
-
     alerts = ""
     if info_message:
         alerts += f'<div class="alert-box alert-success">{html.escape(info_message)}</div>'
     if error_message:
         alerts += f'<div class="alert-box alert-error">{html.escape(error_message)}</div>'
-
     page = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -298,8 +296,8 @@ def _lk_layout(tenant: dict, active_tab: str, content: str,
         </div>
     </header>
     <div class="lk-container">
-        <div class="lk-page-title">Личный кабинет</div\n>
-        <div class="field"><label></label></div>
+        <div class="lk-page-title">Личный кабинет</div>
+        <div class="lk-page-subtitle"></code></div>
         <div class="lk-tabs">{tabs_html}</div>
         {alerts}
         {content}
@@ -313,10 +311,6 @@ def _badge(ok: bool, ok_text: str, fail_text: str) -> str:
     cls = "badge-ok" if ok else "badge-err"
     return f'<span class="{cls}">{ok_text if ok else fail_text}</span>'
 
-
-# ---------------------------------------------------------------------------
-# Onboarding layout (простой, для шагов 1-4)
-# ---------------------------------------------------------------------------
 
 def _ob_layout(title: str, body: str, back_url: str | None = None) -> str:
     back_btn = f'<a href="{html.escape(back_url)}" class="back-btn">← Назад</a>' if back_url else ""
@@ -365,16 +359,13 @@ def _render_sync_result(result: dict) -> str:
     synced = result.get("synced", 0)
     failed = result.get("failed", 0)
     skipped = result.get("skipped", 0)
-
     if status == "error":
         return f'<div class="ob-error"><strong>Синхронизация не выполнена.</strong><br>{html.escape(str(result.get("error", "")))}</div>'
-
     cls = "ob-success" if status == "ok" else "ob-error"
     errors_html = ""
     if result.get("errors"):
         items = "".join(f'<li>{html.escape(str(e))}</li>' for e in result["errors"][:5])
         errors_html = f'<ul style="margin:8px 0 0;padding-left:18px;font-size:12px;">{items}</ul>'
-
     return f"""
     <div class="{cls}">
         <strong>{"Синхронизация выполнена успешно" if status == "ok" else "Выполнена частично"}</strong>
@@ -390,7 +381,7 @@ def _render_sync_result(result: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1
+# Step 1 — Evotor token (ручной онбординг)
 # ---------------------------------------------------------------------------
 
 @router.get("/onboarding/evotor/connect", response_class=HTMLResponse)
@@ -411,16 +402,13 @@ def onboarding_token_submit(evotor_token: str = Form(...)):
     evotor_token = evotor_token.strip()
     if not evotor_token:
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Evotor token обязателен.</div>'), status_code=400)
-
     try:
         stores = fetch_stores_by_token(evotor_token)
     except Exception as exc:
         log.exception("Failed to fetch stores")
         return HTMLResponse(_ob_layout("Ошибка", f'<div class="ob-error">Не удалось получить магазины: {html.escape(str(exc))}</div>'), status_code=502)
-
     if not stores:
         return HTMLResponse(_ob_layout("Магазины не найдены", '<div class="ob-error">По этому token не найдено магазинов.</div>'), status_code=400)
-
     session_id = str(uuid.uuid4())
     now = int(time.time())
     conn = get_connection()
@@ -433,7 +421,6 @@ def onboarding_token_submit(evotor_token: str = Form(...)):
         conn.commit()
     finally:
         conn.close()
-
     link = f"/onboarding/evotor/sessions/{session_id}/stores"
     body = f'<div class="ob-success">Магазины получены — {len(stores)} шт.</div><p><a href="{html.escape(link)}">Перейти к выбору магазина →</a></p>'
     return HTMLResponse(_ob_layout("Подключение Эвотор", body))
@@ -449,7 +436,6 @@ def onboarding_evotor_stores(session_id: str):
     stores = json.loads(session["stores_json"] or "[]")
     if not stores:
         return HTMLResponse(_ob_layout("Выбор магазина", '<div class="ob-error">Магазины не найдены.</div>'), status_code=400)
-
     parts = []
     for store in stores:
         store_id = _extract_store_id(store)
@@ -463,7 +449,6 @@ def onboarding_evotor_stores(session_id: str):
             <p style="margin:4px 0 12px;color:#5b6475;font-size:13px;">ID: <code>{html.escape(store_id)}</code></p>
             <a href="{link}">Создать профиль →</a>
         </div>""")
-
     return HTMLResponse(_ob_layout("Выбор магазина", "".join(parts), back_url="/onboarding/evotor/connect"))
 
 
@@ -491,7 +476,6 @@ def onboarding_ms_token_submit(session_id: str, store_id: str, moysklad_token: s
     moysklad_token = moysklad_token.strip()
     if not moysklad_token:
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Токен обязателен.</div>'), status_code=400)
-
     try:
         orgs, ms_stores, agents = _ms_fetch_all(moysklad_token)
     except requests.HTTPError as exc:
@@ -502,11 +486,9 @@ def onboarding_ms_token_submit(session_id: str, store_id: str, moysklad_token: s
     except Exception as exc:
         log.exception("Failed to fetch MoySklad data")
         return HTMLResponse(_ob_layout("Ошибка", f'<div class="ob-error">{html.escape(str(exc))}</div>'), status_code=502)
-
     for check, msg in [(orgs, "организаций"), (ms_stores, "складов"), (agents, "контрагентов")]:
         if not check:
             return HTMLResponse(_ob_layout("Ошибка", f'<div class="ob-error">Не найдено {msg}.</div>'), status_code=400)
-
     now = int(time.time())
     conn = get_connection()
     try:
@@ -518,7 +500,6 @@ def onboarding_ms_token_submit(session_id: str, store_id: str, moysklad_token: s
         conn.commit()
     finally:
         conn.close()
-
     body = f"""
     <div class="ob-success">Данные МойСклад загружены.</div>
     <form method="post" action="/onboarding/store-profile">
@@ -567,7 +548,6 @@ def onboarding_store_profile_submit(
     moysklad_token = session.get("moysklad_token", "").strip()
     if not moysklad_token:
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Сессия истекла. Начните заново.</div>'), status_code=400)
-
     ms_data = json.loads(session.get("ms_data_json") or "{}")
     if ms_organization_id not in {i["id"] for i in ms_data.get("orgs", [])}:
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Неверная организация.</div>'), status_code=400)
@@ -575,12 +555,10 @@ def onboarding_store_profile_submit(
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Неверный склад.</div>'), status_code=400)
     if ms_agent_id not in {i["id"] for i in ms_data.get("agents", [])}:
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Неверный контрагент.</div>'), status_code=400)
-
     alert_email_value = alert_email.strip() or None
     alerts_email_enabled_value = 1 if alerts_email_enabled and alert_email_value else 0
     tenant_id = str(uuid.uuid4())
     now = int(time.time())
-
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -588,11 +566,10 @@ def onboarding_store_profile_submit(
         existing = cur.fetchone()
         if existing:
             body = (
-                f'<div class="ob-error">Профиль для этого магазина уже существует: <code>{html.escape(existing["id"])}</code></div>'
+                f'<div class="ob-error">Профиль уже существует: <code>{html.escape(existing["id"])}</code></div>'
                 f'<p style="margin-top:16px;"><a href="/onboarding/evotor/connect">← Начать сначала</a></p>'
             )
             return HTMLResponse(_ob_layout("Профиль уже существует", body), status_code=409)
-
         cur.execute(
             aq("""INSERT INTO tenants (id, name, evotor_api_key, moysklad_token, created_at,
                 evotor_token, evotor_store_id, ms_organization_id, ms_store_id, ms_agent_id,
@@ -615,22 +592,271 @@ def onboarding_store_profile_submit(
         return HTMLResponse(_ob_layout("Ошибка", f'<div class="ob-error">{html.escape(str(exc))}</div>'), status_code=500)
     finally:
         conn.close()
-
     log.info("Starting auto initial sync for tenant_id=%s", tenant_id)
     sync_result = _run_initial_sync(tenant_id)
     sync_html = _render_sync_result(sync_result)
-
     body = f"""
     <div class="ob-success"><strong>Профиль создан!</strong></div>
     <div class="section-title">Первичная синхронизация</div>
     {sync_html}
     <hr>
-    <p style="color:#5b6475;font-size:13px;margin-bottom:16px;">Перейдите в личный кабинет чтобы подключить Telegram и настроить уведомления.</p>
     <a href="/onboarding/tenants/{html.escape(tenant_id)}" class="ob-btn" style="display:inline-block;text-decoration:none;">
         Перейти в личный кабинет →
     </a>
     <p style="color:#8793a8;font-size:12px;margin-top:16px;">Tenant ID: <code>{html.escape(tenant_id)}</code></p>"""
     return HTMLResponse(_ob_layout("Профиль создан", body))
+
+
+# ---------------------------------------------------------------------------
+# Точка входа из iframe МойСклад
+# ---------------------------------------------------------------------------
+
+@router.get("/onboarding/ms", response_class=HTMLResponse)
+def onboarding_ms_entry(request: Request, contextKey: str | None = None):
+    params = dict(request.query_params)
+    log.info("onboarding_ms_entry params=%s", params)
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(aq("""
+            SELECT id, name, evotor_token, evotor_store_id, ms_organization_id, ms_store_id
+            FROM tenants
+            WHERE ms_status = 'active' OR ms_status IS NULL
+            ORDER BY created_at DESC
+        """))
+        tenants = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not tenants:
+        return HTMLResponse(_ob_layout("Настройка решения", """
+            <div class="ob-error">
+                <strong>Профиль не найден.</strong><br>
+                Попробуйте переустановить решение из каталога МойСклад.
+            </div>
+        """))
+
+    if len(tenants) == 1:
+        tenant = tenants[0]
+        evotor_ready = bool(tenant["evotor_token"] and tenant["evotor_store_id"])
+        ms_ready = bool(tenant["ms_organization_id"] and tenant["ms_store_id"])
+        if not evotor_ready or not ms_ready:
+            return RedirectResponse(url=f"/onboarding/tenants/{tenant['id']}/evotor", status_code=302)
+        return RedirectResponse(url=f"/onboarding/tenants/{tenant['id']}", status_code=302)
+
+    # Несколько tenant'ов
+    items = "".join(
+        f"""<div class="store">
+            <p><strong>{html.escape(t["name"])}</strong></p>
+            <a href="/onboarding/tenants/{html.escape(t['id'])}">Открыть →</a>
+        </div>"""
+        for t in tenants
+    )
+    return HTMLResponse(_ob_layout("Выбор магазина", f"""
+        <p style="color:#5b6475;margin-bottom:16px;font-size:14px;">Выберите профиль:</p>
+        {items}
+    """))
+
+
+# ---------------------------------------------------------------------------
+# Подключение Эвотор к существующему tenant'у (из МойСклад)
+# ---------------------------------------------------------------------------
+
+@router.get("/onboarding/tenants/{tenant_id}/evotor", response_class=HTMLResponse)
+def onboarding_tenant_evotor_form(tenant_id: str):
+    tenant = _load_tenant(tenant_id)
+    evotor_ok = bool(tenant.get("evotor_token") and tenant.get("evotor_store_id"))
+    ms_configured = bool(tenant.get("ms_organization_id") and tenant.get("ms_store_id"))
+
+    # Загружаем данные МойСклад если не заполнены
+    ms_selects_html = ""
+    if tenant.get("moysklad_token") and not ms_configured:
+        try:
+            orgs, ms_stores, agents = _ms_fetch_all(tenant["moysklad_token"])
+            ms_selects_html = f"""
+            <hr>
+            <div class="section-title">Настройки МойСклад</div>
+            <div class="field"><label>Организация</label>{_select("ms_organization_id", orgs)}</div>
+            <div class="field"><label>Склад</label>{_select("ms_store_id", ms_stores)}</div>
+            <div class="field">
+                <label>Контрагент по умолчанию</label>
+                {_select("ms_agent_id", agents)}
+                <span class="hint">Используется если данные клиента в чеке отсутствуют.</span>
+            </div>"""
+        except Exception as e:
+            log.warning("Failed to fetch MS data tenant_id=%s err=%s", tenant_id, e)
+
+    status_html = '<div class="ob-success">Эвотор уже подключён. Можно обновить токен.</div>' if evotor_ok else \
+                  '<div class="ob-error" style="margin-bottom:16px;">Подключите кассу Эвотор для завершения настройки.</div>'
+
+    body = f"""
+    {status_html}
+    <form method="post" action="/onboarding/tenants/{html.escape(tenant_id)}/evotor">
+        <div class="field">
+            <label>Evotor token</label>
+            <input type="text" name="evotor_token" required placeholder="Токен из личного кабинета Эвотор" />
+            <span class="hint">Найдите в evotor.ru → Настройки → API</span>
+        </div>
+        {ms_selects_html}
+        <hr>
+        <div class="section-title">Фискализация (необязательно)</div>
+        <div class="field"><label>Fiscal token</label><input type="text" name="fiscal_token" placeholder="Оставьте пустым если не нужна" /></div>
+        <div class="field"><label>Fiscal client UID</label><input type="text" name="fiscal_client_uid" /></div>
+        <div class="field"><label>Fiscal device UID</label><input type="text" name="fiscal_device_uid" /></div>
+        <button type="submit" class="ob-btn" style="margin-top:8px;">Подключить →</button>
+    </form>"""
+
+    return HTMLResponse(_ob_layout("Подключение Эвотор", body, back_url=f"/onboarding/tenants/{tenant_id}"))
+
+
+@router.post("/onboarding/tenants/{tenant_id}/evotor", response_class=HTMLResponse)
+def onboarding_tenant_evotor_submit(
+    tenant_id: str,
+    evotor_token: str = Form(...),
+    ms_organization_id: str = Form(""),
+    ms_store_id: str = Form(""),
+    ms_agent_id: str = Form(""),
+    fiscal_token: str = Form(""),
+    fiscal_client_uid: str = Form(""),
+    fiscal_device_uid: str = Form(""),
+):
+    tenant = _load_tenant(tenant_id)
+    evotor_token = evotor_token.strip()
+    if not evotor_token:
+        return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Токен обязателен.</div>'))
+
+    try:
+        stores = fetch_stores_by_token(evotor_token)
+    except Exception as exc:
+        log.exception("Failed to fetch Evotor stores")
+        return HTMLResponse(_ob_layout("Ошибка",
+            f'<div class="ob-error">Не удалось получить магазины: {html.escape(str(exc))}</div>',
+            back_url=f"/onboarding/tenants/{tenant_id}/evotor"))
+
+    if not stores:
+        return HTMLResponse(_ob_layout("Ошибка",
+            '<div class="ob-error">По этому токену не найдено магазинов.</div>',
+            back_url=f"/onboarding/tenants/{tenant_id}/evotor"))
+
+    if len(stores) == 1:
+        store = stores[0]
+        store_id = _extract_store_id(store)
+        store_name = _extract_store_name(store, store_id)
+        return _save_evotor_and_sync(tenant_id, tenant, evotor_token, store_id, store_name,
+                                      ms_organization_id=ms_organization_id,
+                                      ms_store_id=ms_store_id,
+                                      ms_agent_id=ms_agent_id)
+
+    # Несколько магазинов — выбор
+    parts = []
+    for store in stores:
+        store_id = _extract_store_id(store)
+        if not store_id:
+            continue
+        store_name = _extract_store_name(store, store_id)
+        parts.append(f"""
+        <div class="store">
+            <p><strong>{html.escape(store_name)}</strong></p>
+            <p style="margin:4px 0 12px;color:#5b6475;font-size:13px;">ID: <code>{html.escape(store_id)}</code></p>
+            <form method="post" action="/onboarding/tenants/{html.escape(tenant_id)}/evotor/store">
+                <input type="hidden" name="evotor_token" value="{html.escape(evotor_token)}" />
+                <input type="hidden" name="store_id" value="{html.escape(store_id)}" />
+                <input type="hidden" name="store_name" value="{html.escape(store_name)}" />
+                <input type="hidden" name="ms_organization_id" value="{html.escape(ms_organization_id)}" />
+                <input type="hidden" name="ms_store_id" value="{html.escape(ms_store_id)}" />
+                <input type="hidden" name="ms_agent_id" value="{html.escape(ms_agent_id)}" />
+                <button type="submit" class="ob-btn">Выбрать →</button>
+            </form>
+        </div>""")
+
+    return HTMLResponse(_ob_layout("Выберите магазин Эвотор", "".join(parts),
+        back_url=f"/onboarding/tenants/{tenant_id}/evotor"))
+
+
+@router.post("/onboarding/tenants/{tenant_id}/evotor/store", response_class=HTMLResponse)
+def onboarding_tenant_evotor_store_submit(
+    tenant_id: str,
+    evotor_token: str = Form(...),
+    store_id: str = Form(...),
+    store_name: str = Form(...),
+    ms_organization_id: str = Form(""),
+    ms_store_id: str = Form(""),
+    ms_agent_id: str = Form(""),
+):
+    tenant = _load_tenant(tenant_id)
+    return _save_evotor_and_sync(tenant_id, tenant, evotor_token, store_id, store_name,
+                                  ms_organization_id=ms_organization_id,
+                                  ms_store_id=ms_store_id,
+                                  ms_agent_id=ms_agent_id)
+
+
+def _save_evotor_and_sync(
+    tenant_id: str,
+    tenant: dict,
+    evotor_token: str,
+    store_id: str,
+    store_name: str,
+    ms_organization_id: str = "",
+    ms_store_id: str = "",
+    ms_agent_id: str = "",
+    fiscal_token: str = "",
+    fiscal_client_uid: str = "",
+    fiscal_device_uid: str = "",
+) -> HTMLResponse:
+    now = int(time.time())
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(aq("SELECT id FROM tenants WHERE evotor_store_id = ? AND id != ?"), (store_id, tenant_id))
+        conflict = cur.fetchone()
+        if conflict:
+            return HTMLResponse(_ob_layout("Конфликт",
+                f'<div class="ob-error">Этот магазин уже подключён к другому профилю: <code>{html.escape(conflict["id"])}</code></div>',
+                back_url=f"/onboarding/tenants/{tenant_id}/evotor"))
+
+        update_fields = "evotor_token = ?, evotor_store_id = ?, updated_at = ?"
+        update_values: list = [evotor_token, store_id, now]
+
+        if ms_organization_id.strip():
+            update_fields += ", ms_organization_id = ?"
+            update_values.append(ms_organization_id.strip())
+        if ms_store_id.strip():
+            update_fields += ", ms_store_id = ?"
+            update_values.append(ms_store_id.strip())
+        if ms_agent_id.strip():
+            update_fields += ", ms_agent_id = ?"
+            update_values.append(ms_agent_id.strip())
+        if fiscal_token.strip() and fiscal_client_uid.strip() and fiscal_device_uid.strip():
+            update_fields += ", fiscal_token = ?, fiscal_client_uid = ?, fiscal_device_uid = ?"
+            update_values.extend([fiscal_token.strip(), fiscal_client_uid.strip(), fiscal_device_uid.strip()])
+
+        update_values.append(tenant_id)
+        cur.execute(aq(f"UPDATE tenants SET {update_fields} WHERE id = ?"), update_values)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        log.exception("Failed to save evotor token tenant_id=%s", tenant_id)
+        return HTMLResponse(_ob_layout("Ошибка",
+            f'<div class="ob-error">Не удалось сохранить: {html.escape(str(exc))}</div>'))
+    finally:
+        conn.close()
+
+    log.info("Evotor connected tenant_id=%s store_id=%s", tenant_id, store_id)
+    sync_result = _run_initial_sync(tenant_id)
+    sync_html = _render_sync_result(sync_result)
+
+    body = f"""
+    <div class="ob-success"><strong>Эвотор успешно подключён!</strong><br>
+    Магазин: {html.escape(store_name)}</div>
+    <div class="section-title">Первичная синхронизация</div>
+    {sync_html}
+    <hr>
+    <a href="/onboarding/tenants/{html.escape(tenant_id)}"
+       class="ob-btn" style="display:inline-block;text-decoration:none;margin-top:8px;">
+        Перейти в личный кабинет →
+    </a>"""
+    return HTMLResponse(_ob_layout("Подключение завершено", body))
 
 
 # ---------------------------------------------------------------------------
@@ -640,23 +866,19 @@ def onboarding_store_profile_submit(
 @router.get("/onboarding/tenants/{tenant_id}", response_class=HTMLResponse)
 def lk_overview(tenant_id: str):
     tenant, event_counts, mappings_count, stock_row = _get_lk_data(tenant_id)
-
     ms_ok = bool(tenant.get("moysklad_token"))
     evotor_ok = bool(tenant.get("evotor_token"))
     sync_ok = bool(tenant.get("sync_completed_at"))
     tg_ok = bool(tenant.get("telegram_chat_id") and tenant.get("alerts_telegram_enabled"))
     email_ok = bool(tenant.get("alert_email") and tenant.get("alerts_email_enabled"))
-
     stock_badge = ""
     if stock_row:
         ok = stock_row["status"] == "ok"
         stock_badge = f'<div class="lk-row"><span class="lk-row-label">Синхронизация остатков</span><span class="{"badge-ok" if ok else "badge-err"}">{stock_row["status"].upper()}</span></div>'
-
     failed = event_counts.get("FAILED", 0)
     retry = event_counts.get("RETRY", 0)
     done = event_counts.get("DONE", 0)
     new_ev = event_counts.get("NEW", 0)
-
     content = f"""
     <div class="lk-card">
         <div class="lk-card-title">Статус</div>
@@ -677,7 +899,6 @@ def lk_overview(tenant_id: str):
             <div class="stat-card"><div class="stat-value" style="color:{'#dc2626' if failed > 0 else '#1a1d2e'};">{failed}</div><div class="stat-label">Ошибки</div></div>
         </div>
     </div>"""
-
     return _lk_layout(tenant, "overview", content)
 
 
@@ -691,24 +912,18 @@ def lk_integration(tenant_id: str):
     ms_ok = bool(tenant.get("moysklad_token"))
     evotor_ok = bool(tenant.get("evotor_token"))
     sync_ok = bool(tenant.get("sync_completed_at"))
-
     content = f"""
-    <div class="lk-card">
-        <div class="lk-card-title">МойСклад</div>
-        <div class="lk-row"><span class="lk-row-label">Токен</span>{_badge(ms_ok, "Активен", "Не задан")}</div>
-        <div style="margin-top:16px;">
-            <a href="/onboarding/tenants/{html.escape(tenant_id)}/token" class="btn btn-outline">Обновить токен</a>
-        </div>
-    </div>
     <div class="lk-card">
         <div class="lk-card-title">Эвотор</div>
         <div class="lk-row"><span class="lk-row-label">Токен</span>{_badge(evotor_ok, "Активен", "Не задан")}</div>
-         </div>
+        <div style="margin-top:16px;">
+            <a href="/onboarding/tenants/{html.escape(tenant_id)}/evotor" class="btn btn-outline">Обновить токен Эвотор</a>
+        </div>
+    </div>
     <div class="lk-card">
         <div class="lk-card-title">Синхронизация</div>
         <div class="lk-row"><span class="lk-row-label">Первичная синхронизация</span>{_badge(sync_ok, f"Выполнена {_format_ts(tenant.get('sync_completed_at'))}", "Не выполнена")}</div>
     </div>"""
-
     return _lk_layout(tenant, "integration", content)
 
 
@@ -729,38 +944,27 @@ def lk_notifications(
         token_row = get_active_telegram_link_token(conn, tenant_id)
     finally:
         conn.close()
-
     tg_ok = bool(tenant.get("telegram_chat_id") and tenant.get("alerts_telegram_enabled"))
     deep_link = _build_telegram_deep_link(token_row["link_token"]) if token_row else None
-
     deep_link_html = ""
     if deep_link:
         deep_link_label = "Ссылка для переподключения" if tg_ok else "Ссылка для подключения"
         deep_link_html = f"""
         <div class="deep-link-box">
             <div class="deep-link-label">{html.escape(deep_link_label)}</div>
-            <div class="deep-link-url">
-                <a href="{html.escape(deep_link)}" target="_blank" rel="noopener noreferrer">
-                    {html.escape(deep_link)}
-                </a>
-            </div>
+            <div class="deep-link-url"><a href="{html.escape(deep_link)}" target="_blank">{html.escape(deep_link)}</a></div>
             <div class="deep-link-exp">Действует до {_format_ts(token_row["expires_at"])}</div>
         </div>"""
-
     tg_label = "Переподключить Telegram" if tg_ok else "Подключить Telegram"
-
     email_value = (tenant.get("alert_email") or "").strip()
     email_enabled = bool(tenant.get("alerts_email_enabled"))
-
     if email_value and email_enabled:
         email_badge = '<span class="badge-ok">Активен</span>'
     elif email_value and not email_enabled:
         email_badge = '<span class="badge-warn">Выключен</span>'
     else:
         email_badge = '<span class="badge-err">Не настроен</span>'
-
     email_action_label = "Заменить Email" if email_value else "Указать Email"
-
     if edit_email:
         checked_attr = "checked" if email_enabled or not email_value else ""
         email_form_html = f"""
@@ -768,22 +972,15 @@ def lk_notifications(
             <form method="post" action="/onboarding/tenants/{html.escape(tenant_id)}/notifications/email">
                 <div class="form-field">
                     <label class="form-label">Email для уведомлений</label>
-                    <input
-                        class="form-input"
-                        type="email"
-                        name="alert_email"
-                        value="{html.escape(email_value)}"
-                        required
-                        placeholder="owner@example.com"
-                    />
-                    <span class="form-hint">На этот адрес будут приходить уведомления об ошибках и важных событиях интеграции.</span>
+                    <input class="form-input" type="email" name="alert_email" value="{html.escape(email_value)}" required placeholder="owner@example.com" />
+                    <span class="form-hint">На этот адрес будут приходить уведомления об ошибках.</span>
                 </div>
                 <div class="checkbox">
                     <input id="alerts_email_enabled_lk" type="checkbox" name="alerts_email_enabled" {checked_attr} />
                     <label for="alerts_email_enabled_lk">Включить email-уведомления</label>
                 </div>
-                <div style="display:flex; gap:10px; margin-top:14px; flex-wrap:wrap;">
-                    <button type="submit" class="btn btn-primary">Сохранить Email</button>
+                <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;">
+                    <button type="submit" class="btn btn-primary">Сохранить</button>
                     <a href="/onboarding/tenants/{html.escape(tenant_id)}/notifications" class="btn btn-outline">Отмена</a>
                 </div>
             </form>
@@ -791,11 +988,8 @@ def lk_notifications(
     else:
         email_form_html = f"""
         <div style="margin-top:16px;">
-            <a href="/onboarding/tenants/{html.escape(tenant_id)}/notifications?edit_email=1" class="btn btn-outline">
-                {email_action_label}
-            </a>
+            <a href="/onboarding/tenants/{html.escape(tenant_id)}/notifications?edit_email=1" class="btn btn-outline">{email_action_label}</a>
         </div>"""
-
     content = f"""
     <div class="lk-card">
         <div class="lk-card-title">Telegram</div>
@@ -807,28 +1001,14 @@ def lk_notifications(
         </div>
         {deep_link_html}
     </div>
-
     <div class="lk-card">
         <div class="lk-card-title">Email</div>
-        <div class="lk-row">
-            <span class="lk-row-label">Адрес</span>
-            <span class="lk-row-value">{html.escape(email_value or "—")}</span>
-        </div>
-        <div class="lk-row">
-            <span class="lk-row-label">Статус</span>
-            {email_badge}
-        </div>
+        <div class="lk-row"><span class="lk-row-label">Адрес</span><span class="lk-row-value">{html.escape(email_value or "—")}</span></div>
+        <div class="lk-row"><span class="lk-row-label">Статус</span>{email_badge}</div>
         {email_form_html}
     </div>"""
-
     info_message = "Email для уведомлений обновлён." if email_status == "updated" else None
-    return _lk_layout(
-        tenant,
-        "notifications",
-        content,
-        info_message=info_message,
-        error_message=email_error,
-    )
+    return _lk_layout(tenant, "notifications", content, info_message=info_message, error_message=email_error)
 
 
 @router.post("/onboarding/tenants/{tenant_id}/notifications/email", response_class=HTMLResponse)
@@ -839,50 +1019,25 @@ def onboarding_tenant_email_update(
 ):
     _load_tenant(tenant_id)
     alert_email = alert_email.strip()
-
     if not alert_email:
-        return lk_notifications(
-            tenant_id,
-            edit_email=1,
-            email_error="Укажите email для уведомлений.",
-        )
-
+        return lk_notifications(tenant_id, edit_email=1, email_error="Укажите email.")
     if not _is_valid_email(alert_email):
-        return lk_notifications(
-            tenant_id,
-            edit_email=1,
-            email_error="Укажите корректный email-адрес.",
-        )
-
+        return lk_notifications(tenant_id, edit_email=1, email_error="Укажите корректный email.")
     now = int(time.time())
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
             aq("UPDATE tenants SET alert_email=?, alerts_email_enabled=?, updated_at=? WHERE id=?"),
-            (
-                alert_email,
-                1 if alerts_email_enabled else 0,
-                now,
-                tenant_id,
-            ),
+            (alert_email, 1 if alerts_email_enabled else 0, now, tenant_id),
         )
         conn.commit()
     except Exception as e:
         conn.rollback()
-        log.exception("Failed to update alert email tenant_id=%s", tenant_id)
-        return lk_notifications(
-            tenant_id,
-            edit_email=1,
-            email_error=f"Не удалось сохранить email: {e}",
-        )
+        return lk_notifications(tenant_id, edit_email=1, email_error=f"Не удалось сохранить: {e}")
     finally:
         conn.close()
-
-    return RedirectResponse(
-        url=f"/onboarding/tenants/{tenant_id}/notifications?email_status=updated",
-        status_code=303,
-    )
+    return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/notifications?email_status=updated", status_code=303)
 
 
 # ---------------------------------------------------------------------------
@@ -893,26 +1048,21 @@ def onboarding_tenant_email_update(
 def lk_actions(tenant_id: str):
     tenant = _load_tenant(tenant_id)
     tid = html.escape(tenant_id)
-
     content = f"""
-    <div class="lk-card">
-        <div class="lk-card-title">Токен</div>
-        <div class="actions-list">
-            <a href="/onboarding/tenants/{tid}/token" class="btn btn-ghost">Обновить токен МойСклад</a>
-        </div>
-    </div>
     <div class="lk-card">
         <div class="lk-card-title">Синхронизация</div>
         <div class="actions-list">
             <form method="post" action="/onboarding/tenants/{tid}/sync">
-                <button type="submit" class="btn btn-ghost">Повторная синхронизация товаров</button>
+                <button type="submit" class="btn btn-ghost">Повторная синхронизация товаров из Эвотор</button>
+            </form>
+            <form method="post" action="/onboarding/tenants/{tid}/sync-ms-to-evotor">
+                <button type="submit" class="btn btn-ghost">Синхронизировать новые товары из МойСклад</button>
             </form>
             <form method="post" action="/onboarding/tenants/{tid}/reconcile">
                 <button type="submit" class="btn btn-ghost">Синхронизировать остатки</button>
             </form>
         </div>
     </div>"""
-
     return _lk_layout(tenant, "actions", content)
 
 
@@ -928,17 +1078,14 @@ def lk_telegram_redirect(tenant_id: str):
 @router.post("/onboarding/tenants/{tenant_id}/telegram/link", response_class=HTMLResponse)
 def onboarding_tenant_telegram_link(tenant_id: str):
     tenant = _load_tenant(tenant_id)
-
     if not _get_telegram_bot_username():
         return _lk_layout(tenant, "notifications", "", error_message="TELEGRAM_BOT_USERNAME не настроен.")
-
     conn = get_connection()
     try:
         create_telegram_link_token(conn, tenant_id=tenant_id, ttl_sec=TELEGRAM_LINK_TOKEN_TTL_SEC)
         conn.commit()
     finally:
         conn.close()
-
     return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/notifications", status_code=303)
 
 
@@ -948,16 +1095,13 @@ def telegram_link_webhook(update: dict = Body(...)):
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     text = (message.get("text") or "").strip()
-
     if chat_id is None or not text:
         return {"ok": True}
-
     link_token = _extract_telegram_link_token_from_text(text)
     if not link_token:
         if text.startswith("/start"):
             _reply_in_telegram(chat_id, "Используйте ссылку из личного кабинета чтобы привязать Telegram.")
         return {"ok": True}
-
     now = int(time.time())
     conn = get_connection()
     try:
@@ -966,19 +1110,16 @@ def telegram_link_webhook(update: dict = Body(...)):
             _reply_in_telegram(chat_id, "Ссылка не найдена или недействительна.")
             conn.commit()
             return {"ok": True}
-
         if token_row["status"] in ("expired", "linked"):
             msg = "Срок ссылки истёк." if token_row["status"] == "expired" else "Ссылка уже использована."
             _reply_in_telegram(chat_id, msg + " Создайте новую в личном кабинете.")
             conn.commit()
             return {"ok": True}
-
         if int(token_row["expires_at"]) <= now:
             conn.cursor().execute(aq("UPDATE telegram_link_tokens SET status='expired' WHERE id=?"), (token_row["id"],))
             conn.commit()
             _reply_in_telegram(chat_id, "Срок ссылки истёк. Создайте новую в личном кабинете.")
             return {"ok": True}
-
         conn.cursor().execute(
             aq("UPDATE tenants SET telegram_chat_id=?, alerts_telegram_enabled=1 WHERE id=?"),
             (str(chat_id), token_row["tenant_id"]),
@@ -992,8 +1133,7 @@ def telegram_link_webhook(update: dict = Body(...)):
         return {"ok": True}
     finally:
         conn.close()
-
-    _reply_in_telegram(chat_id, f"✅ Telegram подключён к магазину. Уведомления будут приходить сюда.")
+    _reply_in_telegram(chat_id, "✅ Telegram подключён. Уведомления будут приходить сюда.")
     return {"ok": True}
 
 
@@ -1013,13 +1153,7 @@ def onboarding_tenant_token_form(tenant_id: str):
         </div>
         <button type="submit" class="btn btn-primary">Обновить токен</button>
     </form>"""
-
-    content = f"""
-    <div class="lk-card">
-        <div class="lk-card-title">Обновление токена МойСклад</div>
-        {body}
-    </div>"""
-
+    content = f'<div class="lk-card"><div class="lk-card-title">Обновление токена МойСклад</div>{body}</div>'
     return _lk_layout(tenant, "integration", content)
 
 
@@ -1027,10 +1161,8 @@ def onboarding_tenant_token_form(tenant_id: str):
 def onboarding_tenant_token_submit(tenant_id: str, moysklad_token: str = Form(...)):
     tenant = _load_tenant(tenant_id)
     moysklad_token = moysklad_token.strip()
-
     if not moysklad_token:
         return _lk_layout(tenant, "integration", "", error_message="Токен обязателен.")
-
     try:
         orgs, _, _ = _ms_fetch_all(moysklad_token)
         if not orgs:
@@ -1041,7 +1173,6 @@ def onboarding_tenant_token_submit(tenant_id: str, moysklad_token: str = Form(..
         return _lk_layout(tenant, "integration", "", error_message=msg)
     except Exception as e:
         return _lk_layout(tenant, "integration", "", error_message=str(e))
-
     now = int(time.time())
     conn = get_connection()
     try:
@@ -1053,8 +1184,6 @@ def onboarding_tenant_token_submit(tenant_id: str, moysklad_token: str = Form(..
         return _lk_layout(tenant, "integration", "", error_message=str(e))
     finally:
         conn.close()
-
-    log.info("moysklad token updated tenant_id=%s", tenant_id)
     tenant = _load_tenant(tenant_id)
     return _lk_layout(tenant, "integration", "", info_message=f"Токен обновлён. Найдено организаций: {len(orgs)}")
 
@@ -1072,12 +1201,11 @@ def onboarding_tenant_sync(tenant_id: str):
         conn.commit()
     finally:
         conn.close()
-
     result = _run_initial_sync(tenant_id)
     tenant = _load_tenant(tenant_id)
     synced = result.get("synced", 0)
     failed = result.get("failed", 0)
-    msg = f"Синхронизация завершена: {synced} товаров синхронизировано, {failed} ошибок."
+    msg = f"Синхронизация завершена: {synced} новых товаров, {failed} ошибок."
     if failed > 0:
         return _lk_layout(tenant, "actions", "", error_message=msg)
     return _lk_layout(tenant, "actions", "", info_message=msg)
@@ -1087,12 +1215,9 @@ def onboarding_tenant_sync(tenant_id: str):
 def onboarding_tenant_reconcile(tenant_id: str):
     from app.clients.evotor_client import EvotorClient
     from app.clients.moysklad_client import MoySkladClient
-
     tenant = _load_tenant(tenant_id)
-
     if not tenant.get("sync_completed_at"):
-        return _lk_layout(tenant, "actions", "", error_message="Сначала выполните первичную синхронизацию товаров.")
-
+        return _lk_layout(tenant, "actions", "", error_message="Сначала выполните первичную синхронизацию.")
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -1100,15 +1225,12 @@ def onboarding_tenant_reconcile(tenant_id: str):
         mappings = cur.fetchall()
     finally:
         conn.close()
-
     if not mappings:
         return _lk_layout(tenant, "actions", "", error_message="Нет маппингов товаров.")
-
     ms_client = MoySkladClient(tenant_id)
     evotor_client = EvotorClient(tenant_id)
     synced = 0
     failed = 0
-
     for row in mappings:
         try:
             quantity = ms_client.get_product_stock(row["ms_id"])
@@ -1117,9 +1239,24 @@ def onboarding_tenant_reconcile(tenant_id: str):
         except Exception as e:
             log.error("reconcile stock failed ms_id=%s err=%s", row["ms_id"], e)
             failed += 1
-
     tenant = _load_tenant(tenant_id)
     msg = f"Остатки синхронизированы: {synced} товаров, {failed} ошибок."
+    if failed > 0:
+        return _lk_layout(tenant, "actions", "", error_message=msg)
+    return _lk_layout(tenant, "actions", "", info_message=msg)
+
+@router.post("/onboarding/tenants/{tenant_id}/sync-ms-to-evotor", response_class=HTMLResponse)
+def onboarding_tenant_sync_ms_to_evotor(tenant_id: str):
+    from app.api.sync import sync_all_ms_products_to_evotor
+    try:
+        result = sync_all_ms_products_to_evotor(tenant_id)
+    except Exception as e:
+        tenant = _load_tenant(tenant_id)
+        return _lk_layout(tenant, "actions", "", error_message=f"Ошибка: {e}")
+    tenant = _load_tenant(tenant_id)
+    synced = result.get("synced", 0)
+    failed = result.get("failed", 0)
+    msg = f"Синхронизация МС→Эвотор: {synced} товаров, {failed} ошибок."
     if failed > 0:
         return _lk_layout(tenant, "actions", "", error_message=msg)
     return _lk_layout(tenant, "actions", "", info_message=msg)
