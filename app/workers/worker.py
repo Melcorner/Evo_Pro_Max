@@ -41,6 +41,7 @@ def _event_extra(
     }
 
     if row is not None:
+        row = dict(row) if not isinstance(row, dict) else row
         if row.get("tenant_id") is not None:
             payload["tenant_id"] = row["tenant_id"]
         if row.get("id") is not None:

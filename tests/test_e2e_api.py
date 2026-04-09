@@ -132,6 +132,8 @@ def _create_schema(db_path: Path) -> None:
             status TEXT NOT NULL,
             retries INTEGER DEFAULT 0,
             next_retry_at INTEGER,
+            last_error_code TEXT,
+            last_error_message TEXT,
             created_at INTEGER,
             updated_at INTEGER
         )
@@ -143,8 +145,9 @@ def _create_schema(db_path: Path) -> None:
         CREATE TABLE processed_events (
             tenant_id TEXT NOT NULL,
             event_key TEXT NOT NULL,
+            result_ref TEXT,
             processed_at INTEGER,
-            UNIQUE(tenant_id, event_key)
+            PRIMARY KEY (tenant_id, event_key)
         )
         """
     )
@@ -324,7 +327,7 @@ class TestSyncStatusE2E:
         seed_mapping(temp_db_path, evotor_id="ev-1", ms_id="ms-1")
         seed_mapping(temp_db_path, evotor_id="ev-2", ms_id="ms-2")
 
-        response = client.get("/sync/tenant-1/status")
+        response = client.get("/sync/tenant-1/status", headers={"Authorization": "Bearer 3kx1coO0KfD7gBzme5gvgnYTOFcbOsyh"})
         assert response.status_code == 200
 
         body = response.json()
@@ -361,7 +364,7 @@ class TestSingleStockSyncE2E:
         monkeypatch.setattr(ms_client_module, "MoySkladClient", FakeMoySkladClient, raising=False)
         monkeypatch.setattr(evotor_client_module, "EvotorClient", FakeEvotorClient, raising=False)
 
-        response = client.post("/sync/tenant-1/stock/ms-1")
+        response = client.post("/sync/tenant-1/stock/ms-1", headers={"Authorization": "Bearer 3kx1coO0KfD7gBzme5gvgnYTOFcbOsyh"})
         assert response.status_code == 200
 
         body = response.json()
@@ -407,7 +410,7 @@ class TestInitialSyncDedupE2E:
         create_mock = MagicMock(return_value="ms-created-should-not-happen")
         monkeypatch.setattr(sync_module, "_create_ms_product", create_mock)
 
-        response = client.post("/sync/tenant-1/initial")
+        response = client.post("/sync/tenant-1/initial", headers={"Authorization": "Bearer 3kx1coO0KfD7gBzme5gvgnYTOFcbOsyh"})
         assert response.status_code == 200
 
         body = response.json()

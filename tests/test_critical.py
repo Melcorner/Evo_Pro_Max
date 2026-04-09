@@ -14,7 +14,7 @@ import json
 import time
 import importlib
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, AsyncMock, patch, call
 
 from app.api.sync import _detect_barcode_format
 
@@ -88,7 +88,7 @@ SALE_PAYLOAD_ENRICHED = {
 
 
 class TestSaleMapper:
-    @patch("app.stores.mapping_store.MappingStore")
+    @patch("app.mappers.sale_mapper.MappingStore")
     def test_production_payload_discount(self, MockStore):
         from app.mappers.sale_mapper import map_sale_to_ms
 
@@ -113,7 +113,7 @@ class TestSaleMapper:
         assert pos["vat"] == 10
         assert pos["vatEnabled"] is True
 
-    @patch("app.stores.mapping_store.MappingStore")
+    @patch("app.mappers.sale_mapper.MappingStore")
     def test_enriched_payload_discount(self, MockStore):
         from app.mappers.sale_mapper import map_sale_to_ms
 
@@ -354,9 +354,16 @@ class TestWorkerPolicy:
 
 class TestMoySkladWebhook:
     @pytest.mark.asyncio
+    @patch("app.api.moysklad_webhooks._upsert_stock_status")
+    @patch("app.api.moysklad_webhooks.get_connection")
     @patch("app.api.moysklad_webhooks._load_tenant")
     @patch("app.api.moysklad_webhooks.MoySkladClient")
-    async def test_failed_positions_fetch_returns_partial(self, MockClient, mock_tenant):
+    async def test_failed_positions_fetch_returns_partial(self, MockClient, mock_tenant, mock_conn, mock_upsert):
+        mock_conn.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_conn.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cur = MagicMock()
+        mock_conn.return_value.cursor.return_value = mock_cur
+        mock_cur.fetchone.return_value = None
         from app.api.moysklad_webhooks import moysklad_webhook, MoySkladWebhook
 
         mock_tenant.return_value = {
@@ -376,15 +383,18 @@ class TestMoySkladWebhook:
         mock_resp.raise_for_status.side_effect = requests.exceptions.HTTPError("500")
 
         with patch("requests.get", return_value=mock_resp):
-            body = MoySkladWebhook.model_validate({
+            import json as _json
+            body_data = {
                 "events": [{
                     "meta": {
                         "href": "https://api.moysklad.ru/api/remap/1.2/entity/demand/some-uuid",
                         "type": "demand"
                     }
                 }]
-            })
-            result = await moysklad_webhook("tenant-1", body)
+            }
+            mock_request = MagicMock()
+            mock_request.body = AsyncMock(return_value=_json.dumps(body_data).encode())
+            result = await moysklad_webhook("tenant-1", mock_request)
 
         # Статус должен быть partial, не ok
         assert result["status"] == "partial"

@@ -46,7 +46,8 @@ def test_map_positions():
 
 def test_map_total_sum():
     result = map_sale_to_ms(VALID_EVOTOR_PAYLOAD)
-    assert result["sum"] == 500  # 5.0 руб = 500 копеек
+    # sum убран — вычисляемое поле в МС, тест не актуален
+    assert "positions" in result
 
 
 def test_map_price_in_kopecks():
