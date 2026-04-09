@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import importlib
 import sqlite3
 import time
@@ -327,7 +328,7 @@ class TestSyncStatusE2E:
         seed_mapping(temp_db_path, evotor_id="ev-1", ms_id="ms-1")
         seed_mapping(temp_db_path, evotor_id="ev-2", ms_id="ms-2")
 
-        response = client.get("/sync/tenant-1/status", headers={"Authorization": "Bearer 3kx1coO0KfD7gBzme5gvgnYTOFcbOsyh"})
+        response = client.get("/sync/tenant-1/status", headers={"Authorization": f"Bearer {os.getenv('ADMIN_API_TOKEN', 'test')}"})
         assert response.status_code == 200
 
         body = response.json()
@@ -364,7 +365,7 @@ class TestSingleStockSyncE2E:
         monkeypatch.setattr(ms_client_module, "MoySkladClient", FakeMoySkladClient, raising=False)
         monkeypatch.setattr(evotor_client_module, "EvotorClient", FakeEvotorClient, raising=False)
 
-        response = client.post("/sync/tenant-1/stock/ms-1", headers={"Authorization": "Bearer 3kx1coO0KfD7gBzme5gvgnYTOFcbOsyh"})
+        response = client.post("/sync/tenant-1/stock/ms-1", headers={"Authorization": f"Bearer {os.getenv('ADMIN_API_TOKEN', 'test')}"})
         assert response.status_code == 200
 
         body = response.json()
@@ -410,7 +411,7 @@ class TestInitialSyncDedupE2E:
         create_mock = MagicMock(return_value="ms-created-should-not-happen")
         monkeypatch.setattr(sync_module, "_create_ms_product", create_mock)
 
-        response = client.post("/sync/tenant-1/initial", headers={"Authorization": "Bearer 3kx1coO0KfD7gBzme5gvgnYTOFcbOsyh"})
+        response = client.post("/sync/tenant-1/initial", headers={"Authorization": f"Bearer {os.getenv('ADMIN_API_TOKEN', 'test')}"})
         assert response.status_code == 200
 
         body = response.json()
