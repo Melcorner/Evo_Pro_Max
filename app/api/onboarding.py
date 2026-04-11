@@ -447,7 +447,7 @@ def onboarding_token_form():
             <input type="text" name="evotor_token" required placeholder="Вставьте токен из личного кабинета Эвотор" />
         </div>
         <div style="margin-bottom:20px;">
-            <a href="/static/help/evotor-token.html" target="_blank"
+            <a href="/static/help/evotor-token.html?back=/onboarding/evotor/connect" target="_blank"
                style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#2458d3;text-decoration:none;">
                 <span style="font-size:16px;">📖</span>
                 Где найти токен Эвотор? Пошаговая инструкция
@@ -752,12 +752,41 @@ def onboarding_tenant_evotor_form(tenant_id: str):
                   '<div class="ob-error" style="margin-bottom:16px;">Подключите кассу Эвотор для завершения настройки.</div>'
 
     body = f"""
+    <style>
+    .help-modal {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5);
+        z-index:1000; align-items:flex-start; justify-content:center; overflow-y:auto; padding:20px; }}
+    .help-modal.visible {{ display:flex; }}
+    .help-modal-box {{ background:#fff; border-radius:14px; width:100%; max-width:700px;
+        margin:auto; overflow:hidden; box-shadow:0 8px 40px rgba(0,0,0,0.2); }}
+    .help-modal-header {{ display:flex; align-items:center; justify-content:space-between;
+        padding:16px 20px; border-bottom:1px solid #e4e8f0; }}
+    .help-modal-title {{ font-size:16px; font-weight:700; color:#1a1d2e; }}
+    .help-modal-close {{ background:none; border:none; font-size:22px; cursor:pointer;
+        color:#9ca3af; line-height:1; padding:0 4px; }}
+    .help-modal-close:hover {{ color:#1a1d2e; }}
+    .help-modal-content {{ padding:20px; max-height:75vh; overflow-y:auto; }}
+    .help-step {{ margin-bottom:24px; }}
+    .help-step-num {{ display:inline-flex; align-items:center; justify-content:center;
+        width:28px; height:28px; border-radius:8px; background:#FF4D00; color:#fff;
+        font-size:13px; font-weight:700; margin-bottom:10px; }}
+    .help-step-title {{ font-size:15px; font-weight:700; color:#1a1d2e; margin-bottom:6px; }}
+    .help-step-desc {{ font-size:13px; color:#6b7280; margin-bottom:10px; line-height:1.5; }}
+    .help-step img {{ width:100%; border-radius:8px; border:1px solid #e4e8f0; }}
+    .help-link {{ display:inline-flex; align-items:center; gap:6px; font-size:13px;
+        color:#2458d3; text-decoration:none; cursor:pointer; background:none; border:none;
+        padding:0; font-family:inherit; margin-top:6px; }}
+    .help-link:hover {{ text-decoration:underline; }}
+    </style>
+
     {status_html}
     <form method="post" action="/onboarding/tenants/{html.escape(tenant_id)}/evotor">
         <div class="field">
             <label>Evotor token</label>
             <input type="text" name="evotor_token" required placeholder="Токен из личного кабинета Эвотор" />
-            <span class="hint">Найдите в evotor.ru → Настройки → API</span>
+            <span class="hint">Найдите в evotor.ru → Мои приложения → Универсальный фискализатор → Настройки</span>
+            <button type="button" class="help-link" onclick="document.getElementById('helpModal').classList.add('visible')">
+                📖 Где найти токен? Пошаговая инструкция
+            </button>
         </div>
         {ms_selects_html}
         <hr>
@@ -766,10 +795,62 @@ def onboarding_tenant_evotor_form(tenant_id: str):
         <div class="field"><label>Fiscal client UID</label><input type="text" name="fiscal_client_uid" /></div>
         <div class="field"><label>Fiscal device UID</label><input type="text" name="fiscal_device_uid" /></div>
         <button type="submit" class="ob-btn" style="margin-top:8px;">Подключить →</button>
-    </form>"""
+    </form>
+
+    <div class="help-modal" id="helpModal">
+        <div class="help-modal-box">
+            <div class="help-modal-header">
+                <div class="help-modal-title">Как найти токен Эвотор</div>
+                <button class="help-modal-close" onclick="document.getElementById('helpModal').classList.remove('visible')">×</button>
+            </div>
+            <div class="help-modal-content">
+                <div class="help-step">
+                    <div class="help-step-num">1</div>
+                    <div class="help-step-title">Войдите в личный кабинет Эвотор</div>
+                    <div class="help-step-desc">Откройте <strong>evotor.ru</strong> и войдите в аккаунт.</div>
+                    <img src="/static/help/img/step1.png" alt="Шаг 1">
+                </div>
+                <div class="help-step">
+                    <div class="help-step-num">2</div>
+                    <div class="help-step-title">Найдите "Универсальный фискализатор"</div>
+                    <div class="help-step-desc">В строке поиска введите <strong>«Универсальный фискализатор»</strong> и перейдите на вкладку <strong>Приложения</strong>.</div>
+                    <img src="/static/help/img/step2.png" alt="Шаг 2">
+                </div>
+                <div class="help-step">
+                    <div class="help-step-num">3</div>
+                    <div class="help-step-title">Откройте страницу приложения</div>
+                    <div class="help-step-desc">Нажмите на приложение и затем кнопку <strong>«Открыть»</strong>.</div>
+                    <img src="/static/help/img/step3.png" alt="Шаг 3">
+                </div>
+                <div class="help-step">
+                    <div class="help-step-num">4</div>
+                    <div class="help-step-title">Установите приложение на кассу</div>
+                    <div class="help-step-desc">На вкладке <strong>«Установка / Удаление»</strong> выберите кассу и нажмите <strong>«Установить»</strong>.</div>
+                    <img src="/static/help/img/step4.png" alt="Шаг 4">
+                </div>
+                <div class="help-step">
+                    <div class="help-step-num">5</div>
+                    <div class="help-step-title">Откройте "Мои приложения"</div>
+                    <div class="help-step-desc">В меню слева нажмите <strong>«Мои приложения»</strong> и откройте <strong>«Универсальный фискализатор»</strong>.</div>
+                    <img src="/static/help/img/step5.png" alt="Шаг 5">
+                </div>
+                <div class="help-step">
+                    <div class="help-step-num" style="background:#10B981;">✓</div>
+                    <div class="help-step-title">Скопируйте токен</div>
+                    <div class="help-step-desc">На вкладке <strong>«Настройки»</strong> нажмите <strong>«Скопировать»</strong> и вставьте токен в поле выше.</div>
+                    <img src="/static/help/img/step6.png" alt="Шаг 6">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    document.getElementById('helpModal').addEventListener('click', function(e) {{
+        if (e.target === this) this.classList.remove('visible');
+    }});
+    </script>"""
 
     return HTMLResponse(_ob_layout("Подключение Эвотор", body, back_url=f"/onboarding/tenants/{tenant_id}"))
-
 
 @router.post("/onboarding/tenants/{tenant_id}/evotor", response_class=HTMLResponse)
 def onboarding_tenant_evotor_submit(
@@ -1298,12 +1379,8 @@ def lk_actions(tenant_id: str):
 
             <div class="action-row">
                 <form method="post" action="/onboarding/tenants/{tid}/sync" id="formResync">
-                    <button type="button" class="btn btn-ghost"
-                            onclick="showConfirm(
-                                'Повторная синхронизация',
-                                'Это действие пересоздаст маппинг всех товаров. Текущие связи будут сброшены. Продолжить?',
-                                document.getElementById(\'formResync\')
-                            )">Повторная синхронизация товаров</button>
+                    <button type="submit" class="btn btn-ghost"
+                            onclick="return confirm('Повторная синхронизация пересоздаст маппинг всех товаров. Текущие связи будут сброшены. Продолжить?')">Повторная синхронизация товаров</button>
                 </form>
                 <div class="tooltip-wrap">
                     <button class="tooltip-btn">?</button>
@@ -1350,6 +1427,7 @@ def lk_actions(tenant_id: str):
     </div>
 
     <script>
+    var _pendingForm = null;
     document.querySelectorAll('.action-row form').forEach(function(form) {{
         form.addEventListener('submit', function(e) {{
             var btn = form.querySelector('button');
@@ -1373,7 +1451,6 @@ def lk_actions(tenant_id: str):
     </div>
 
     <script>
-    var _pendingForm = null;
     function showConfirm(title, desc, form) {{
         document.getElementById('confirmTitle').textContent = title;
         document.getElementById('confirmDesc').textContent = desc;
@@ -1384,16 +1461,28 @@ def lk_actions(tenant_id: str):
         document.getElementById('confirmOverlay').classList.remove('visible');
         _pendingForm = null;
     }}
-    document.getElementById('confirmOkBtn').addEventListener('click', function() {{
-        hideConfirm();
-        if (_pendingForm) {{
-            var overlay = document.getElementById('syncOverlay');
-            if (overlay) overlay.classList.add('visible');
-            _pendingForm.submit();
+    document.addEventListener('DOMContentLoaded', function() {{
+        var okBtn = document.getElementById('confirmOkBtn');
+        if (okBtn) {{
+            okBtn.addEventListener('click', function() {{
+                hideConfirm();
+                if (_pendingForm) {{
+                    var overlay = document.getElementById('syncOverlay');
+                    if (overlay) overlay.classList.add('visible');
+                    var action = _pendingForm.getAttribute('action');
+                    var method = _pendingForm.getAttribute('method') || 'post';
+                    setTimeout(function() {{
+                        _pendingForm.submit();
+                    }}, 50);
+                }}
+            }});
         }}
-    }});
-    document.getElementById('confirmOverlay').addEventListener('click', function(e) {{
-        if (e.target === this) hideConfirm();
+        var overlay = document.getElementById('confirmOverlay');
+        if (overlay) {{
+            overlay.addEventListener('click', function(e) {{
+                if (e.target === this) hideConfirm();
+            }});
+        }}
     }});
     </script>
     </div>"""

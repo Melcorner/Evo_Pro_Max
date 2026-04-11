@@ -524,6 +524,21 @@ def _find_ms_product_by_external_code(ms_token: str, external_code: str) -> str 
         return rows[0].get("id")
     return None
 
+def _find_ms_product_by_name(ms_token: str, name: str) -> str | None:
+    """Ищет товар в МойСклад по названию. Возвращает ms_id или None."""
+    try:
+        url = f"{MS_BASE}/entity/product"
+        params = {"filter": f"name={name}"}
+        r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
+        if not r.ok:
+            return None
+        rows = r.json().get("rows", [])
+        if rows:
+            return rows[0].get("id")
+        return None
+    except Exception as e:
+        log.warning("_find_ms_product_by_name failed name=%s err=%s", name, e)
+        return None
 
 def _detect_barcode_format(value: str) -> str:
     value = str(value).strip()
@@ -784,7 +799,17 @@ def initial_sync(tenant_id: str):
                     ms_id,
                 )
             else:
-                ms_id = _create_ms_product(tenant["moysklad_token"], product)
+                # Ищем по названию — защита от дублей при переустановке
+                ms_id = _find_ms_product_by_name(tenant["moysklad_token"], product.get("name", ""))
+                if ms_id:
+                    log.info(
+                        "Found existing MS product by name evotor_id=%s ms_id=%s name=%s — saving mapping only",
+                        evotor_id,
+                        ms_id,
+                        product.get("name"),
+                    )
+                else:
+                    ms_id = _create_ms_product(tenant["moysklad_token"], product)
                 log.info(
                     "Created MS product evotor_id=%s ms_id=%s name=%s tax=%s type=%s",
                     evotor_id,
