@@ -285,6 +285,30 @@ input[type=checkbox] { width: auto; }
 hr { border: none; border-top: 1px solid #e8edf5; margin: 20px 0; }
 a { color: #2458d3; }
 a:hover { text-decoration: underline; }
+
+@media (max-width: 600px) {
+  .lk-header { padding: 0 16px; }
+  .lk-header-inner { height: 48px; }
+  .lk-logo { font-size: 13px; }
+  .lk-tenant-name { font-size: 11px; max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lk-container { padding: 16px 12px 60px; }
+  .lk-page-title { font-size: 20px; margin-bottom: 2px; }
+  .lk-page-subtitle { font-size: 11px; margin-bottom: 16px; }
+  .lk-tabs { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .lk-tabs::-webkit-scrollbar { display: none; }
+  .lk-tab { padding: 6px 12px; font-size: 12px; }
+  .lk-card { padding: 16px; margin-bottom: 12px; }
+  .lk-card-title { font-size: 11px; margin-bottom: 12px; }
+  .lk-row { flex-wrap: wrap; gap: 4px; padding: 8px 0; }
+  .lk-row-label { font-size: 13px; width: 100%; }
+  .lk-row-value { font-size: 13px; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .stat-value { font-size: 22px; }
+  .stat-card { padding: 12px; }
+  .btn { padding: 8px 14px; font-size: 13px; }
+  .btn-ghost { font-size: 13px; }
+  .deep-link-url { font-size: 12px; }
+}
 </style>
 """
 
@@ -404,8 +428,7 @@ def _render_sync_result(result: dict) -> str:
                 <tr><td>Ошибок</td><td>{failed}</td></tr>
             </table>
             {errors_html}
-        </div>
-    </div>"""
+        </div>"""
 
 
 # ---------------------------------------------------------------------------
@@ -926,9 +949,42 @@ def lk_overview(tenant_id: str):
         diff = ms_products_count - mappings_count
         new_products_banner = f'''<div class="lk-row" style="background:#fffbeb;margin:0 -24px;padding:10px 24px;border-radius:0;">
             <span class="lk-row-label" style="color:#92400e;">⚠️ Новых товаров в МойСклад: {diff}</span>
-            <a href="/onboarding/tenants/{tenant_id}/actions" class="btn btn-outline" style="padding:5px 12px;font-size:12px;">Синхронизировать →</a>
+            <form method="post" action="/onboarding/tenants/{tenant_id}/sync-ms-to-evotor" style="margin:0;"
+                  onsubmit="
+                    var btn = this.querySelector('button');
+                    btn.disabled = true;
+                    btn.textContent = '⏳ Синхронизация...';
+                    document.getElementById('syncOverlay') && document.getElementById('syncOverlay').classList.add('visible');
+                    var lbl = document.getElementById('syncLabel');
+                    if(lbl) lbl.textContent = 'Синхронизируем новые товары...';
+                  ">
+                <button type="submit" class="btn btn-outline" style="padding:5px 12px;font-size:12px;">
+                    Синхронизировать →
+                </button>
+            </form>
         </div>'''
-
+        
+    # Баннер удалённых товаров
+    deleted_products_banner = ""
+    if ms_products_count > 0 and mappings_count > ms_products_count:
+        diff = mappings_count - ms_products_count
+        deleted_products_banner = f'''<div class="lk-row" style="background:#fef2f2;margin:0 -24px;padding:10px 24px;border-radius:0;">
+            <span class="lk-row-label" style="color:#991b1b;">🗑️ Удалённых товаров в маппинге: {diff}</span>
+            <form method="post" action="/onboarding/tenants/{tenant_id}/sync-ms-to-evotor" style="margin:0;"
+                  onsubmit="
+                    var btn = this.querySelector('button');
+                    btn.disabled = true;
+                    btn.textContent = '⏳ Синхронизация...';
+                    document.getElementById('syncOverlay') && document.getElementById('syncOverlay').classList.add('visible');
+                    var lbl = document.getElementById('syncLabel');
+                    if(lbl) lbl.textContent = 'Удаляем устаревшие маппинги...';
+                  ">
+                <button type="submit" class="btn btn-outline" style="padding:5px 12px;font-size:12px;color:#dc2626;border-color:#dc2626;">
+                    Очистить →
+                </button>
+            </form>
+        </div>'''
+        
     # Последнее событие
     last_event_html = ""
     if last_event:
@@ -957,6 +1013,7 @@ def lk_overview(tenant_id: str):
             <span class="lk-row-value">{mappings_count}{"/" + str(ms_products_count) if ms_products_count else ""}</span>
         </div>
         {new_products_banner}
+        {deleted_products_banner}
         {stock_badge}
         {last_event_html}
         <div class="lk-row"><span class="lk-row-label">Telegram</span>{_badge(tg_ok, "Подключён", "Не подключён")}</div>
@@ -969,9 +1026,24 @@ def lk_overview(tenant_id: str):
             <div class="stat-card"><div class="stat-value">{new_ev}</div><div class="stat-label">В очереди</div></div>
             <div class="stat-card"><div class="stat-value" style="color:{'#d97706' if retry > 0 else '#1a1d2e'};">{retry}</div><div class="stat-label">Повтор</div></div>
             <div class="stat-card"><div class="stat-value" style="color:{'#dc2626' if failed > 0 else '#1a1d2e'};">{failed}</div><div class="stat-label">Ошибки</div></div>
+        </div>"""
+    content += """
+        <div class="sync-overlay" id="syncOverlay">
+            <div class="sync-spinner"></div>
+            <div class="sync-label" id="syncLabel">Синхронизация...</div>
+            <div class="sync-sublabel">Это может занять до 30 секунд</div>
         </div>
-    </div>"""
-
+        <style>
+        .sync-overlay { display:none; position:fixed; inset:0; background:rgba(255,255,255,0.8);
+            backdrop-filter:blur(2px); z-index:999; align-items:center; justify-content:center;
+            flex-direction:column; gap:16px; }
+        .sync-overlay.visible { display:flex; }
+        .sync-spinner { width:48px; height:48px; border:4px solid #e4e8f0;
+            border-top-color:#3b6ff5; border-radius:50%; animation:spin 0.8s linear infinite; }
+        @keyframes spin { to { transform:rotate(360deg); } }
+        .sync-label { font-size:15px; font-weight:600; color:#1a1d2e; }
+        .sync-sublabel { font-size:13px; color:#6b7280; }
+        </style>"""
     return _lk_layout(tenant, "overview", content)
 
 
@@ -1205,6 +1277,19 @@ def lk_actions(tenant_id: str):
         font-size: 13px;
         color: #6b7280;
     }}
+    .confirm-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.4);
+        z-index:1000; align-items:center; justify-content:center; }}
+    .confirm-overlay.visible {{ display:flex; }}
+    .confirm-box {{ background:#fff; border-radius:14px; padding:28px 32px; max-width:400px;
+        width:90%; box-shadow:0 8px 40px rgba(0,0,0,0.15); }}
+    .confirm-title {{ font-size:17px; font-weight:700; color:#1a1d2e; margin-bottom:8px; }}
+    .confirm-desc {{ font-size:14px; color:#6b7280; line-height:1.5; margin-bottom:24px; }}
+    .confirm-btns {{ display:flex; gap:10px; justify-content:flex-end; }}
+    .confirm-cancel {{ background:#f3f4f8; color:#1a1d2e; border:none; border-radius:8px;
+        padding:10px 20px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; }}
+    .confirm-ok {{ background:#dc2626; color:#fff; border:none; border-radius:8px;
+        padding:10px 20px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; }}
+    .confirm-ok:hover {{ background:#b91c1c; }}
     </style>
 
     <div class="lk-card">
@@ -1212,8 +1297,13 @@ def lk_actions(tenant_id: str):
         <div class="actions-list">
 
             <div class="action-row">
-                <form method="post" action="/onboarding/tenants/{tid}/sync">
-                    <button type="submit" class="btn btn-ghost">Повторная синхронизация товаров</button>
+                <form method="post" action="/onboarding/tenants/{tid}/sync" id="formResync">
+                    <button type="button" class="btn btn-ghost"
+                            onclick="showConfirm(
+                                'Повторная синхронизация',
+                                'Это действие пересоздаст маппинг всех товаров. Текущие связи будут сброшены. Продолжить?',
+                                document.getElementById(\'formResync\')
+                            )">Повторная синхронизация товаров</button>
                 </form>
                 <div class="tooltip-wrap">
                     <button class="tooltip-btn">?</button>
@@ -1269,6 +1359,41 @@ def lk_actions(tenant_id: str):
             document.getElementById('syncLabel').textContent = label + '...';
             document.getElementById('syncOverlay').classList.add('visible');
         }});
+    }});
+    </script>
+    <div class="confirm-overlay" id="confirmOverlay">
+        <div class="confirm-box">
+            <div class="confirm-title" id="confirmTitle"></div>
+            <div class="confirm-desc" id="confirmDesc"></div>
+            <div class="confirm-btns">
+                <button class="confirm-cancel" onclick="hideConfirm()">Отмена</button>
+                <button class="confirm-ok" id="confirmOkBtn">Продолжить</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    var _pendingForm = null;
+    function showConfirm(title, desc, form) {{
+        document.getElementById('confirmTitle').textContent = title;
+        document.getElementById('confirmDesc').textContent = desc;
+        _pendingForm = form;
+        document.getElementById('confirmOverlay').classList.add('visible');
+    }}
+    function hideConfirm() {{
+        document.getElementById('confirmOverlay').classList.remove('visible');
+        _pendingForm = null;
+    }}
+    document.getElementById('confirmOkBtn').addEventListener('click', function() {{
+        hideConfirm();
+        if (_pendingForm) {{
+            var overlay = document.getElementById('syncOverlay');
+            if (overlay) overlay.classList.add('visible');
+            _pendingForm.submit();
+        }}
+    }});
+    document.getElementById('confirmOverlay').addEventListener('click', function(e) {{
+        if (e.target === this) hideConfirm();
     }});
     </script>
     </div>"""
@@ -1343,7 +1468,15 @@ def telegram_link_webhook(update: dict = Body(...)):
         return {"ok": True}
     finally:
         conn.close()
-    _reply_in_telegram(chat_id, "✅ Telegram подключён. Уведомления будут приходить сюда.")
+    _reply_in_telegram(chat_id, (
+    "✅ Telegram успешно подключён к вашему магазину!\n\n"
+    "Я буду присылать уведомления когда:\n"
+    "• Продажа с кассы не смогла создать отгрузку в МойСклад\n"
+    "• Синхронизация остатков завершилась с ошибкой\n"
+    "• Появились товары требующие внимания\n\n"
+    "Если всё работает штатно — я молчу 🤫\n"
+    "Удачных продаж! 🛒"
+))
     return {"ok": True}
 
 

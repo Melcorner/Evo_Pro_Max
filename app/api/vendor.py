@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import uuid
+import requests
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -104,6 +105,69 @@ def _get_or_create_tenant(ms_account_id: str, access_token: str) -> str:
     finally:
         conn.close()
 
+def _setup_ms_webhooks(tenant_id: str, access_token: str) -> None:
+    """
+    Создаёт webhook'и в МойСклад при активации решения.
+    Сначала удаляет старые webhook'и на наш домен, затем создаёт новые.
+    """
+    import os
+    base_url = os.getenv("APP_BASE_URL", "https://a2.v.fomin.fvds.ru").rstrip("/")
+    webhook_url = f"{base_url}/webhooks/moysklad/{tenant_id}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        # Получаем существующие webhook'и
+        r = requests.get(
+            "https://api.moysklad.ru/api/remap/1.2/entity/webhook",
+            headers=headers,
+            timeout=10,
+        )
+        if r.ok:
+            for wh in r.json().get("rows", []):
+                if base_url in wh.get("url", ""):
+                    wh_id = wh["meta"]["href"].split("/")[-1]
+                    requests.delete(
+                        f"https://api.moysklad.ru/api/remap/1.2/entity/webhook/{wh_id}",
+                        headers=headers,
+                        timeout=10,
+                    )
+                    log.info("vendor.webhooks: deleted old webhook_id=%s", wh_id)
+    except Exception as e:
+        log.warning("vendor.webhooks: failed to cleanup old webhooks err=%s", e)
+
+    # Создаём новые webhook'и
+    webhooks = [
+        {"entityType": "demand",    "action": "CREATE"},
+        {"entityType": "demand",    "action": "UPDATE"},
+        {"entityType": "supply",    "action": "CREATE"},
+        {"entityType": "supply",    "action": "UPDATE"},
+        {"entityType": "inventory", "action": "CREATE"},
+        {"entityType": "inventory", "action": "UPDATE"},
+        {"entityType": "loss",      "action": "CREATE"},
+        {"entityType": "enter",     "action": "CREATE"},
+    ]
+    created = 0
+    for wh in webhooks:
+        try:
+            r = requests.post(
+                "https://api.moysklad.ru/api/remap/1.2/entity/webhook",
+                headers=headers,
+                json={"url": webhook_url, "action": wh["action"], "entityType": wh["entityType"]},
+                timeout=10,
+            )
+            if r.ok:
+                created += 1
+            else:
+                log.warning("vendor.webhooks: failed to create %s %s status=%s body=%s",
+                            wh["entityType"], wh["action"], r.status_code, r.text[:200])
+        except Exception as e:
+            log.warning("vendor.webhooks: error creating %s %s err=%s",
+                        wh["entityType"], wh["action"], e)
+
+    log.info("vendor.webhooks: created=%d/%d tenant_id=%s", created, len(webhooks), tenant_id)
 
 def _set_tenant_status(ms_account_id: str, status: str) -> None:
     """Устанавливает статус tenant'а (active/suspended/deleted)."""
@@ -175,6 +239,7 @@ async def vendor_put(
         try:
             tenant_id = _get_or_create_tenant(account_id, access_token)
             _set_tenant_status(account_id, "active")
+            _setup_ms_webhooks(tenant_id, access_token)
         except Exception as e:
             log.exception("vendor.put: failed account_id=%s", account_id)
             raise HTTPException(status_code=500, detail="Internal error")
