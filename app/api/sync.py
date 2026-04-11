@@ -419,6 +419,29 @@ def _get_evotor_product(tenant: dict, evotor_product_id: str) -> dict:
         r.raise_for_status()
     return r.json() if r.text else {}
 
+def _find_evotor_product_by_external_code(tenant: dict, external_code: str) -> dict | None:
+    """
+    Ищет товар в Эвотор по externalCode (= ms_id).
+    Возвращает dict товара или None если не найден.
+    """
+    try:
+        url = f"{EVOTOR_BASE}/stores/{tenant['evotor_store_id']}/products"
+        r = requests.get(
+            url,
+            headers=_evotor_headers(tenant["evotor_token"]),
+            timeout=20,
+        )
+        if not r.ok:
+            return None
+        data = r.json()
+        items = data.get("items", data) if isinstance(data, dict) else data
+        for item in items:
+            if item.get("externalCode") == external_code:
+                return item
+        return None
+    except Exception as e:
+        log.warning("_find_evotor_product_by_external_code failed code=%s err=%s", external_code, e)
+        return None
 
 def _get_ms_product(ms_token: str, ms_product_id: str) -> dict:
     url = f"{MS_BASE}/entity/product/{ms_product_id}"
@@ -954,6 +977,23 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
                 "evotor_payload": evotor_payload,
             }
 
+        # Проверяем нет ли уже товара в Эвотор по externalCode = ms_product_id
+        existing_by_code = _find_evotor_product_by_external_code(tenant, ms_product_id)
+        if existing_by_code:
+            evotor_id = existing_by_code.get("id")
+            log.info("Found existing Evotor product by externalCode ms_id=%s evotor_id=%s — saving mapping only", ms_product_id, evotor_id)
+            store.upsert(
+                tenant_id=tenant_id,
+                entity_type="product",
+                evotor_id=evotor_id,
+                ms_id=ms_product_id,
+            )
+            return {
+                "status": "mapped",
+                "ms_product_id": ms_product_id,
+                "evotor_product_id": evotor_id,
+            }
+        
         # create new product via POST so Evotor cloud generates identifiers
         evotor_payload = _build_evotor_product_payload(
             ms_product,
@@ -1844,11 +1884,6 @@ def get_fiscal_clients(tenant_id: str):
 
 @router.post("/sync/{tenant_id}/ms-to-evotor")
 def sync_all_ms_products_to_evotor(tenant_id: str):
-    """
-    Синхронизирует все товары из МойСклад в Эвотор.
-    Новые товары (без маппинга) создаются в Эвотор.
-    Существующие — обновляются.
-    """
     tenant = _load_tenant(tenant_id)
     if not tenant.get("moysklad_token"):
         raise HTTPException(status_code=400, detail="moysklad_token not configured")
@@ -1861,11 +1896,16 @@ def sync_all_ms_products_to_evotor(tenant_id: str):
         raise HTTPException(status_code=502, detail=f"Failed to fetch MoySklad products: {e}")
 
     ms_products = data.get("rows", [])
+    ms_ids_in_ms = {row["id"] for row in ms_products if row.get("id")}
+
+    store = MappingStore()
     synced = 0
     skipped = 0
     failed = 0
+    deleted = 0
     errors = []
 
+    # Синхронизируем существующие и новые товары
     for row in ms_products:
         ms_id = row.get("id")
         if not ms_id:
@@ -1876,7 +1916,6 @@ def sync_all_ms_products_to_evotor(tenant_id: str):
             synced += 1
         except HTTPException as e:
             if e.status_code == 409:
-                # initial sync not completed — останавливаемся
                 raise
             failed += 1
             errors.append(f"{ms_id}: {e.detail}")
@@ -1884,10 +1923,34 @@ def sync_all_ms_products_to_evotor(tenant_id: str):
             failed += 1
             errors.append(f"{ms_id}: {e}")
 
+    # Удаляем маппинги товаров которых больше нет в МойСклад
+    all_mappings = store.get_all_ms_ids(tenant_id=tenant_id, entity_type="product")
+    for mapping in all_mappings:
+        ms_id = mapping["ms_id"]
+        evotor_id = mapping["evotor_id"]
+        if ms_id not in ms_ids_in_ms:
+            # Удаляем товар из Эвотор
+            try:
+                url = f"{EVOTOR_BASE}/stores/{tenant['evotor_store_id']}/products/{evotor_id}"
+                r = requests.delete(
+                    url,
+                    headers=_evotor_headers(tenant["evotor_token"]),
+                    timeout=20,
+                )
+                if r.ok or r.status_code == 404:
+                    store.delete_by_ms_id(tenant_id=tenant_id, entity_type="product", ms_id=ms_id)
+                    deleted += 1
+                    log.info("Deleted product from Evotor evotor_id=%s ms_id=%s", evotor_id, ms_id)
+                else:
+                    log.warning("Failed to delete Evotor product evotor_id=%s status=%s", evotor_id, r.status_code)
+            except Exception as e:
+                log.error("Error deleting Evotor product evotor_id=%s err=%s", evotor_id, e)
+
     return {
         "status": "ok" if failed == 0 else "partial",
         "synced": synced,
         "skipped": skipped,
         "failed": failed,
+        "deleted": deleted,
         "errors": errors[:10],
     }

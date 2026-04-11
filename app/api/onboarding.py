@@ -149,7 +149,7 @@ def _reply_in_telegram(chat_id: str | int | None, text: str) -> None:
         log.exception("Failed to reply in Telegram chat_id=%s", chat_id)
 
 
-def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None]:
+def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None, int, dict | None]:
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -158,16 +158,44 @@ def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None]:
         if not row:
             raise HTTPException(status_code=404, detail="Tenant not found")
         tenant = dict(row)
+
         cur.execute(aq("SELECT COUNT(*) as cnt FROM mappings WHERE tenant_id = ? AND entity_type = 'product'"), (tenant_id,))
         mappings_count = cur.fetchone()["cnt"]
+
         cur.execute(aq("SELECT * FROM stock_sync_status WHERE tenant_id = ?"), (tenant_id,))
         stock = cur.fetchone()
         stock_row = dict(stock) if stock else None
+
         cur.execute(aq("SELECT status, COUNT(*) as cnt FROM event_store WHERE tenant_id = ? GROUP BY status"), (tenant_id,))
         event_counts = {r["status"]: r["cnt"] for r in cur.fetchall()}
-        return tenant, event_counts, mappings_count, stock_row
+
+        cur.execute(aq("""
+            SELECT event_type, created_at, payload_json
+            FROM event_store
+            WHERE tenant_id = ? AND status = 'DONE'
+            ORDER BY created_at DESC LIMIT 1
+        """), (tenant_id,))
+        last_event_row = cur.fetchone()
+        last_event = dict(last_event_row) if last_event_row else None
     finally:
         conn.close()
+
+    # Получаем количество товаров в МойСклад
+    ms_products_count = 0
+    if tenant.get("moysklad_token"):
+        try:
+            r = requests.get(
+                f"{MS_BASE}/entity/product",
+                headers=_ms_headers(tenant["moysklad_token"]),
+                params={"limit": 1},
+                timeout=10,
+            )
+            if r.ok:
+                ms_products_count = r.json().get("meta", {}).get("size", 0)
+        except Exception:
+            pass
+
+    return tenant, event_counts, mappings_count, stock_row, ms_products_count, last_event
 
 
 def _is_valid_email(email: str) -> bool:
@@ -387,10 +415,20 @@ def _render_sync_result(result: dict) -> str:
 @router.get("/onboarding/evotor/connect", response_class=HTMLResponse)
 def onboarding_token_form():
     body = """
+    <p style="color:#5b6475;font-size:14px;margin-bottom:20px;line-height:1.6;">
+        Введите токен из личного кабинета Эвотор. Система автоматически загрузит список ваших магазинов.
+    </p>
     <form method="post" action="/onboarding/evotor/connect">
         <div class="field">
             <label>Evotor token</label>
             <input type="text" name="evotor_token" required placeholder="Вставьте токен из личного кабинета Эвотор" />
+        </div>
+        <div style="margin-bottom:20px;">
+            <a href="/static/help/evotor-token.html" target="_blank"
+               style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#2458d3;text-decoration:none;">
+                <span style="font-size:16px;">📖</span>
+                Где найти токен Эвотор? Пошаговая инструкция
+            </a>
         </div>
         <button type="submit" class="ob-btn">Получить мои магазины →</button>
     </form>"""
@@ -865,28 +903,62 @@ def _save_evotor_and_sync(
 
 @router.get("/onboarding/tenants/{tenant_id}", response_class=HTMLResponse)
 def lk_overview(tenant_id: str):
-    tenant, event_counts, mappings_count, stock_row = _get_lk_data(tenant_id)
+    tenant, event_counts, mappings_count, stock_row, ms_products_count, last_event = _get_lk_data(tenant_id)
     ms_ok = bool(tenant.get("moysklad_token"))
     evotor_ok = bool(tenant.get("evotor_token"))
     sync_ok = bool(tenant.get("sync_completed_at"))
     tg_ok = bool(tenant.get("telegram_chat_id") and tenant.get("alerts_telegram_enabled"))
     email_ok = bool(tenant.get("alert_email") and tenant.get("alerts_email_enabled"))
+
     stock_badge = ""
     if stock_row:
         ok = stock_row["status"] == "ok"
         stock_badge = f'<div class="lk-row"><span class="lk-row-label">Синхронизация остатков</span><span class="{"badge-ok" if ok else "badge-err"}">{stock_row["status"].upper()}</span></div>'
+
     failed = event_counts.get("FAILED", 0)
     retry = event_counts.get("RETRY", 0)
     done = event_counts.get("DONE", 0)
     new_ev = event_counts.get("NEW", 0)
+
+    # Баннер новых товаров
+    new_products_banner = ""
+    if ms_products_count > mappings_count:
+        diff = ms_products_count - mappings_count
+        new_products_banner = f'''<div class="lk-row" style="background:#fffbeb;margin:0 -24px;padding:10px 24px;border-radius:0;">
+            <span class="lk-row-label" style="color:#92400e;">⚠️ Новых товаров в МойСклад: {diff}</span>
+            <a href="/onboarding/tenants/{tenant_id}/actions" class="btn btn-outline" style="padding:5px 12px;font-size:12px;">Синхронизировать →</a>
+        </div>'''
+
+    # Последнее событие
+    last_event_html = ""
+    if last_event:
+        try:
+            import json as _json
+            payload = _json.loads(last_event.get("payload_json") or "{}")
+            body = payload.get("body", {})
+            total = body.get("sum", 0)
+            total_str = f" на {int(total):,} ₽".replace(",", " ") if total else ""
+        except Exception:
+            total_str = ""
+        ts = _format_ts(last_event.get("created_at"))
+        last_event_html = f'''<div class="lk-row">
+            <span class="lk-row-label">Последняя продажа</span>
+            <span class="lk-row-value" style="font-size:13px;color:#059669;">✓ {ts}{total_str}</span>
+        </div>'''
+
     content = f"""
     <div class="lk-card">
         <div class="lk-card-title">Статус</div>
         <div class="lk-row"><span class="lk-row-label">МойСклад</span>{_badge(ms_ok, "Подключён", "Не подключён")}</div>
         <div class="lk-row"><span class="lk-row-label">Эвотор</span>{_badge(evotor_ok, "Подключён", "Не подключён")}</div>
         <div class="lk-row"><span class="lk-row-label">Первичная синхронизация</span>{_badge(sync_ok, f"Выполнена {_format_ts(tenant.get('sync_completed_at'))}", "Не выполнена")}</div>
-        <div class="lk-row"><span class="lk-row-label">Товаров в маппинге</span><span class="lk-row-value">{mappings_count}</span></div>
+        <div class="lk-row">
+            <span class="lk-row-label">Товаров синхронизировано</span>
+            <span class="lk-row-value">{mappings_count}{"/" + str(ms_products_count) if ms_products_count else ""}</span>
+        </div>
+        {new_products_banner}
         {stock_badge}
+        {last_event_html}
         <div class="lk-row"><span class="lk-row-label">Telegram</span>{_badge(tg_ok, "Подключён", "Не подключён")}</div>
         <div class="lk-row"><span class="lk-row-label">Email</span>{_badge(email_ok, html.escape(tenant.get("alert_email") or "Активен"), "Не настроен")}</div>
     </div>
@@ -899,6 +971,7 @@ def lk_overview(tenant_id: str):
             <div class="stat-card"><div class="stat-value" style="color:{'#dc2626' if failed > 0 else '#1a1d2e'};">{failed}</div><div class="stat-label">Ошибки</div></div>
         </div>
     </div>"""
+
     return _lk_layout(tenant, "overview", content)
 
 
@@ -1048,21 +1121,158 @@ def onboarding_tenant_email_update(
 def lk_actions(tenant_id: str):
     tenant = _load_tenant(tenant_id)
     tid = html.escape(tenant_id)
+
     content = f"""
+    <style>
+    .tooltip-wrap {{ position: relative; display: inline-block; }}
+    .tooltip-btn {{
+        background: none; border: none; cursor: pointer;
+        color: #9ca3af; font-size: 15px; padding: 0 4px;
+        vertical-align: middle; line-height: 1;
+        transition: color 0.15s;
+    }}
+    .tooltip-btn:hover {{ color: #3b6ff5; }}
+    .tooltip-popup {{
+        display: none;
+        position: absolute;
+        bottom: calc(100% + 8px);
+        left: 50%;
+        transform: translateX(-50%);
+        background: #1a1d2e;
+        color: #fff;
+        font-size: 13px;
+        line-height: 1.5;
+        padding: 10px 14px;
+        border-radius: 8px;
+        width: 260px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+        z-index: 100;
+        pointer-events: none;
+    }}
+    .tooltip-popup::after {{
+        content: '';
+        position: absolute;
+        top: 100%;
+        left: 50%;
+        transform: translateX(-50%);
+        border: 6px solid transparent;
+        border-top-color: #1a1d2e;
+    }}
+    .tooltip-wrap:hover .tooltip-popup {{ display: block; }}
+    .action-row {{
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }}
+    .action-row form {{ flex: 1; }}
+    .action-row .btn-ghost {{ width: 100%; }}
+    
+    .btn-ghost:disabled {{
+        opacity: 0.6;
+        cursor: not-allowed;
+        pointer-events: none;
+    }}
+    .btn-ghost.loading::after {{
+        content: ' ⏳';
+    }}
+    .sync-overlay {{
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(255,255,255,0.8);
+        backdrop-filter: blur(2px);
+        z-index: 999;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        gap: 16px;
+    }}
+    .sync-overlay.visible {{ display: flex; }}
+    .sync-spinner {{
+        width: 48px; height: 48px;
+        border: 4px solid #e4e8f0;
+        border-top-color: #3b6ff5;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+    }}
+    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+    .sync-label {{
+        font-size: 15px;
+        font-weight: 600;
+        color: #1a1d2e;
+    }}
+    .sync-sublabel {{
+        font-size: 13px;
+        color: #6b7280;
+    }}
+    </style>
+
     <div class="lk-card">
         <div class="lk-card-title">Синхронизация</div>
         <div class="actions-list">
-            <form method="post" action="/onboarding/tenants/{tid}/sync">
-                <button type="submit" class="btn btn-ghost">Повторная синхронизация товаров из Эвотор</button>
-            </form>
-            <form method="post" action="/onboarding/tenants/{tid}/sync-ms-to-evotor">
-                <button type="submit" class="btn btn-ghost">Синхронизировать новые товары из МойСклад</button>
-            </form>
-            <form method="post" action="/onboarding/tenants/{tid}/reconcile">
-                <button type="submit" class="btn btn-ghost">Синхронизировать остатки</button>
-            </form>
+
+            <div class="action-row">
+                <form method="post" action="/onboarding/tenants/{tid}/sync">
+                    <button type="submit" class="btn btn-ghost">Повторная синхронизация товаров</button>
+                </form>
+                <div class="tooltip-wrap">
+                    <button class="tooltip-btn">?</button>
+                    <div class="tooltip-popup">
+                        Пересоздаёт маппинг всех товаров из Эвотор в МойСклад.<br><br>
+                        Используйте если товары пропали или данные расходятся между системами.
+                    </div>
+                </div>
+            </div>
+
+            <div class="action-row">
+                <form method="post" action="/onboarding/tenants/{tid}/reconcile">
+                    <button type="submit" class="btn btn-ghost">Синхронизировать остатки</button>
+                </form>
+                <div class="tooltip-wrap">
+                    <button class="tooltip-btn">?</button>
+                    <div class="tooltip-popup">
+                        Обновляет количество товаров в Эвотор на основе текущих остатков в МойСклад.<br><br>
+                        Используйте если остатки на кассе не совпадают с МойСклад.
+                    </div>
+                </div>
+            </div>
+
+            <div class="action-row">
+                <form method="post" action="/onboarding/tenants/{tid}/sync-ms-to-evotor">
+                    <button type="submit" class="btn btn-ghost">Синхронизировать новые товары из МойСклад</button>
+                </form>
+                <div class="tooltip-wrap">
+                    <button class="tooltip-btn">?</button>
+                    <div class="tooltip-popup">
+                        Создаёт в Эвотор товары, которые были добавлены в МойСклад после первичной синхронизации.<br><br>
+                        Используйте когда добавили новые товары в МойСклад и хотите чтобы они появились на кассе.
+                    </div>
+                </div>
+            </div>
+
         </div>
+    </div>
+    
+    <div class="sync-overlay" id="syncOverlay">
+        <div class="sync-spinner"></div>
+        <div class="sync-label" id="syncLabel">Синхронизация...</div>
+        <div class="sync-sublabel">Это может занять до 30 секунд</div>
+    </div>
+
+    <script>
+    document.querySelectorAll('.action-row form').forEach(function(form) {{
+        form.addEventListener('submit', function(e) {{
+            var btn = form.querySelector('button');
+            var label = btn ? btn.textContent.trim() : 'Синхронизация';
+            btn && btn.classList.add('loading');
+            btn && (btn.disabled = true);
+            document.getElementById('syncLabel').textContent = label + '...';
+            document.getElementById('syncOverlay').classList.add('visible');
+        }});
+    }});
+    </script>
     </div>"""
+
     return _lk_layout(tenant, "actions", content)
 
 

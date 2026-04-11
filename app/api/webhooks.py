@@ -126,9 +126,65 @@ def _extract_customer(candidate_root: dict | None) -> dict | None:
             }
     return None
 
+def _fetch_full_evotor_document(store_id: str, doc_id: str, evotor_token: str) -> dict | None:
+    try:
+        import requests as req
+        r = req.get(
+            f"https://api.evotor.ru/stores/{store_id}/documents/{doc_id}",
+            headers={"X-Authorization": evotor_token},
+            timeout=10,
+        )
+        if r.ok:
+            return r.json()
+        log.warning("Failed to fetch full document store_id=%s doc_id=%s status=%s", store_id, doc_id, r.status_code)
+        return None
+    except Exception as e:
+        log.exception("Error fetching full document store_id=%s doc_id=%s err=%s", store_id, doc_id, e)
+        return None
+
+
+def _tax_type_to_percent(tax_type: str | None) -> int | None:
+    mapping = {
+        "VAT_0": 0, "VAT_10": 10, "VAT_18": 20,
+        "VAT_20": 20, "VAT_10_110": 10, "VAT_20_120": 20,
+        "NO_VAT": 0,
+    }
+    return mapping.get(str(tax_type).upper(), None) if tax_type else None
 
 def _normalize_receipt_created(body_dict: dict) -> tuple[str, str, dict] | tuple[None, None, None]:
     data = body_dict.get("data") or {}
+    # Если items пришли без деталей — запрашиваем полный документ через API
+    items_raw = data.get("items", [])
+    if items_raw and len(items_raw) > 0 and len(items_raw[0]) == 1:
+        store_id = data.get("storeId")
+        doc_id = data.get("id")
+        evotor_token = body_dict.get("_evotor_token")  # передаётся из обработчика
+        if store_id and doc_id and evotor_token:
+            full_doc = _fetch_full_evotor_document(store_id, doc_id, evotor_token)
+            if full_doc:
+                # Переписываем data из полного документа
+                body = full_doc.get("body", {})
+                positions = body.get("positions", [])
+                # Конвертируем positions в формат items
+                new_items = []
+                for pos in positions:
+                    new_items.append({
+                        "id": pos.get("product_id"),
+                        "name": pos.get("product_name"),
+                        "quantity": pos.get("quantity"),
+                        "price": pos.get("price"),
+                        "sumPrice": pos.get("sum"),
+                        "resultPrice": pos.get("result_price"),
+                        "resultSum": pos.get("result_sum"),
+                        "discount": pos.get("sum", 0) - pos.get("result_sum", pos.get("sum", 0)),
+                        "tax": pos.get("tax", {}).get("type"),
+                        "taxPercent": _tax_type_to_percent(pos.get("tax", {}).get("type")),
+                        "measureName": pos.get("measure_name"),
+                    })
+                data = dict(data)
+                data["items"] = new_items
+                log.info("Enriched receipt from full document store_id=%s doc_id=%s positions=%d",
+                         store_id, doc_id, len(new_items))
     receipt_doc_type = (data.get("type") or "").strip().upper()
 
     if receipt_doc_type != "SELL":
@@ -387,6 +443,26 @@ async def evotor_webhook(raw_body: EvotorWebhook, request: Request, tenant_id: s
     event_type_raw = body_dict.get("type") or "sale"
 
     if event_type_raw == "ReceiptCreated":
+        # Получаем evotor_token из tenant для запроса полного документа
+        try:
+            store_id_for_token = (body_dict.get("data") or {}).get("storeId")
+            user_id_for_token = body_dict.get("userId") or body_dict.get("userUuid")
+            conn = get_connection()
+            try:
+                cur = conn.cursor()
+                if store_id_for_token:
+                    cur.execute(aq("SELECT evotor_token FROM tenants WHERE evotor_store_id = ?"), (store_id_for_token,))
+                elif user_id_for_token:
+                    cur.execute(aq("SELECT evotor_token FROM tenants WHERE evotor_user_id = ?"), (user_id_for_token,))
+                else:
+                    cur = None
+                row = cur.fetchone() if cur else None
+                if row and row["evotor_token"]:
+                    body_dict["_evotor_token"] = row["evotor_token"]
+            finally:
+                conn.close()
+        except Exception as e:
+            log.warning("Failed to get evotor_token for receipt enrichment err=%s", e)
         event_type, event_id, normalized_payload = _normalize_receipt_created(body_dict)
 
         if not event_type:

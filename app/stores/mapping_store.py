@@ -104,3 +104,34 @@ class MappingStore:
             return False
         finally:
             conn.close()
+            
+    def delete_by_ms_id(self, tenant_id: str, entity_type: str, ms_id: str) -> bool:
+        """Удалить маппинг по ms_id."""
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                aq("DELETE FROM mappings WHERE tenant_id = ? AND entity_type = ? AND ms_id = ?"),
+                (tenant_id, entity_type, ms_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        except Exception as e:
+            conn.rollback()
+            log.error("Delete mapping failed ms_id=%s err=%s", ms_id, e)
+            return False
+        finally:
+            conn.close()
+
+    def get_all_ms_ids(self, tenant_id: str, entity_type: str) -> list[str]:
+        """Получить все ms_id маппингов tenant'а."""
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                aq("SELECT ms_id, evotor_id FROM mappings WHERE tenant_id = ? AND entity_type = ?"),
+                (tenant_id, entity_type),
+            )
+            return [{"ms_id": r["ms_id"], "evotor_id": r["evotor_id"]} for r in cur.fetchall()]
+        finally:
+            conn.close()
