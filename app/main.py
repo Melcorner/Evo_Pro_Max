@@ -7,6 +7,7 @@ import os
 import time
 
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response as StarletteResponse
 
 from app.observability.metrics import (
@@ -64,6 +65,7 @@ app = FastAPI(
 admin_dependencies = [Depends(require_admin_api_token)]
 
 # Protected admin/internal API
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 app.include_router(sync_router, dependencies=admin_dependencies)
 app.include_router(tenants_router, dependencies=admin_dependencies)
 app.include_router(events_router, dependencies=admin_dependencies)

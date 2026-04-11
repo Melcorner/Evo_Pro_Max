@@ -1,14 +1,15 @@
 # Evotor ↔ MoySklad Integration Bus
 
-Интеграционная шина между **Эвотор** и **МойСклад**.
+Интеграционная шина между **Эвотор** и **МойСклад**. Доступна как решение в каталоге МойСклад.
 
-Проект решает пять основных задач:
+Проект решает шесть основных задач:
 
 1. Приём продаж из Эвотор и формирование документов в МойСклад
 2. Синхронизация товаров и остатков между МойСклад и Эвотор
 3. Автоматическое обновление остатков по webhook от МойСклад
 4. Фискализация документа **Отгрузка** из МойСклад через **Универсальный фискализатор**
-5. Наблюдаемость: метрики Prometheus, дашборды Grafana, логи Loki
+5. Публикация в каталоге решений МойСклад с онбордингом через iframe
+6. Наблюдаемость: метрики Prometheus, дашборды Grafana, логи Loki
 
 ---
 
@@ -17,8 +18,7 @@
 ### 1. Продажи Эвотор → МойСклад
 
 - приём webhook событий от Эвотор
-- поддержка формата:
-  - `ReceiptCreated`
+- поддержка формата `ReceiptCreated`
 - нормализация payload продажи
 - сохранение события в `event_store`
 - обработка через `worker`
@@ -27,30 +27,17 @@
 
 #### Покупатель
 
-Поддерживается перенос данных покупателя из webhook Эвотор:
-
-- поиск контрагента по `email`
-- поиск по `phone`
+- поиск контрагента по `email`, затем по `phone`
 - создание нового контрагента
-- fallback имени: `email → phone → "Покупатель"`
-- fallback на `default agent`, если buyer data отсутствует или резолв завершился ошибкой
+- fallback на `default agent`, если buyer data отсутствует
 
 #### Скидки
 
-Поддерживаются:
+Поддерживаются production-поля (`discount`, `totalDiscount`) и enriched-поля (`resultPrice`, `resultSum`, `positionDiscount.discountPercent`). Скидка передаётся процентным полем `discount`, базовая цена позиции не искажается.
 
-- production-поля `discount`, `totalDiscount`
-- enriched/test-поля `resultPrice`, `resultSum`, `positionDiscount.discountPercent`
+#### НДС
 
-Скидка передаётся в МойСклад отдельным процентным полем `discount`, а базовая цена позиции не искажается.
-
-#### НДС продажи
-
-НДС переносится из фактического чека Эвотор:
-
-- `taxPercent = 0` → `vat = 0`, `vatEnabled = false`
-- `taxPercent = 10` → `vat = 10`, `vatEnabled = true`
-- `taxPercent = 20` → `vat = 20`, `vatEnabled = true`
+`taxPercent = 0/10/20` → соответствующие `vat` и `vatEnabled` в МойСклад.
 
 ---
 
@@ -58,40 +45,15 @@
 
 #### Initial sync
 
-`POST /sync/{tenant_id}/initial`
+`POST /sync/{tenant_id}/initial` — первичная синхронизация Эвотор → МойСклад.
 
-Первичная синхронизация:
+#### Синхронизация МойСклад → Эвотор
 
-- получает товары из Эвотор
-- создаёт товары в МойСклад (с НДС и типом маркировки)
-- сохраняет `mappings`
-- переводит tenant в режим `МойСклад → Эвотор`
-- корректно завершает initial sync даже если каталог Эвотор пуст или товары уже были обработаны без ошибок
+`POST /sync/{tenant_id}/ms-to-evotor` — синхронизирует все товары из МойСклад в Эвотор. Новые создаются, существующие обновляются.
 
-#### Синхронизация одного товара
+#### Маппинг типов маркировки
 
-`POST /sync/{tenant_id}/product/{ms_product_id}`
-
-Если mapping уже есть:
-
-- обновляется карточка товара в Эвотор
-
-Если mapping отсутствует:
-
-- товар создаётся в Эвотор
-- затем сохраняется mapping
-
-Синхронизируются:
-
-- название
-- цена
-- себестоимость
-- единица измерения
-- штрихкоды
-- описание
-- артикул
-- НДС
-- тип маркируемого товара
+Поддерживаются все актуальные типы: MILK, TOBACCO, SHOES, LP_CLOTHES, LP_LINENS, PERFUMERY, ELECTRONICS, TIRES, CAMERA_PHOTO, WATER, OTP, BICYCLE, WHEELCHAIRS, ALCOHOL, MEDICINE, NABEER, NICOTINE, FOOD_SUPPLEMENT, ANTISEPTIC, MEDICAL_DEVICES, SOFT_DRINKS, VETPHARMA, SEAFOOD, VEGETABLE_OIL, ANIMAL_FOOD, MOTOR_OIL, GROCERIES, COSMETICS, FUR, NOT_TRACKED.
 
 #### Синхронизация остатков
 
@@ -99,299 +61,101 @@
 - массовая: `POST /sync/{tenant_id}/stock/reconcile`
 - статус: `GET /sync/{tenant_id}/stock/status`
 
-Остатки читаются из МойСклад через `/report/stock/all`.
-
 ---
 
 ### 3. Автоматическая синхронизация остатков
 
-Webhook от МойСклад обновляет остатки в Эвотор при изменении документов:
-
-- `demand`
-- `supply`
-- `inventory`
-- `loss`
-- `enter`
-
-Сценарий:
-
-1. МойСклад отправляет webhook
-2. система проверяет подпись webhook
-3. определяет затронутые товары
-4. получает актуальные остатки через `/report/stock/all`
-5. обновляет остатки в Эвотор
-6. обновляет `stock_sync_status`, чтобы автоматическая синхронизация была видна в статусах и мониторинге
+Webhook от МойСклад обновляет остатки в Эвотор при изменении документов `demand`, `supply`, `inventory`, `loss`, `enter`.
 
 ---
 
 ### 4. Фискализация документа МойСклад
 
-Реализован отдельный контур:
-
 **МойСклад demand → fiscalization24 → касса Эвотор**
 
-#### Клиент `fiscalization_client.py`
+Для фискализации нужны: `fiscal_token`, `fiscal_client_uid`, `fiscal_device_uid`. Настраиваются через онбординг или `PATCH /tenants/{tenant_id}/fiscal`.
 
-Поддерживает:
-
-- `get_clients()` — список клиентов, магазинов и касс интегратора
-- `create_check(payload)` — отправка чека на фискализацию
-- `get_check_state(uid)` — получение статуса чека
-
-Авторизация:
-
-- `X-Datetime: <unix timestamp UTC>`
-- `Authorization: SHA1(X-Datetime + token)`
-
-#### Контур фискализации
-
-Сценарий:
-
-1. `GET /sync/{tenant_id}/demands`
-2. `POST /sync/{tenant_id}/fiscalize/{ms_demand_id}`
-3. `_map_demand_to_fiscal_check()`
-4. `FiscalizationClient.create_check()`
-5. сохранение в `fiscalization_checks`
-6. `GET /sync/{tenant_id}/fiscalization/{uid}`
-
-#### Конфигурация tenant
-
-Для фискализации нужны:
-
-- `fiscal_token`
-- `fiscal_client_uid`
-- `fiscal_device_uid`
-
-Настройка:
-
-```http
-PATCH /tenants/{tenant_id}/fiscal
-```
-
-#### Статусы чека
-
-- `1` — новый
-- `2` — отправлен на кассу
-- `5` — принят кассой
-- `9` — ошибка
-- `10` — успешно фискализирован
-
-#### Текущее ограничение MVP
-
-Текущая версия фискализации работает в упрощённом сценарии:
-
-- `paymentType = 1`
-- `payCashSumma = сумма чека`
-- `payCardSumma = 0`
-
-То есть чек сейчас уходит как сценарий **наличной оплаты**.
+**Текущее ограничение MVP:** чек уходит как наличная оплата (`payCashSumma = сумма чека`).
 
 ---
 
-### 5. Мониторинг integration bus
+### 5. Каталог решений МойСклад
 
-#### JSON snapshot
+#### Vendor API
 
-`GET /monitoring/dashboard`
+- `PUT /vendor/api/moysklad/vendor/1.0/apps/{appId}/{accountId}` — activate/suspend/resume
+- `DELETE /vendor/api/moysklad/vendor/1.0/apps/{appId}/{accountId}` — delete
 
-Возвращает snapshot текущего состояния системы:
+При установке МойСклад передаёт токен доступа к JSON API — сохраняется в tenant автоматически.
 
-- статус сервиса и worker
-- количество событий по статусам: `NEW / PROCESSING / DONE / RETRY / FAILED`
-- последние проблемные события и ошибки
-- latency обработки успешных событий
+#### Дескриптор
 
-#### HTML dashboard
+`descriptor.xml` с namespace `https://apps-api.moysklad.ru/xml/ns/appstore/app/v2`.
 
-`GET /dashboard`
+#### Онбординг из iframe МойСклад
 
-Простая server-rendered HTML-страница для мониторинга без отдельного frontend-приложения.
+1. МойСклад открывает iframe, передаёт `contextKey` и `appId`
+2. Система находит tenant по `ms_account_id`
+3. Если Эвотор не подключён — форма подключения
+4. Пользователь вводит только **Evotor token** (МойСклад токен уже есть)
+5. Система загружает организации/склады/контрагентов из МойСклад
+6. Запускается первичная синхронизация
+
+#### Личный кабинет
+
+`/onboarding/tenants/{tenant_id}` — 4 вкладки: Обзор, Интеграция, Уведомления, Действия.
 
 ---
 
 ### 6. Alerts: Telegram + email
 
-Отдельный контур автоматических уведомлений.
+`alert_worker.py` — tenant-aware уведомления по 4 типам сигналов: worker stale, FAILED события, RETRY события, ошибки stock sync. Отправляется только при смене состояния (anti-spam). Доставка журналируется в `notification_log`.
 
-Поддерживаются два канала доставки: Telegram и email.
-
-На первом этапе контакты для пользовательских уведомлений сохраняются в профиле tenant через onboarding:
-
-- email для уведомлений
-- признак включения email-уведомлений
-- `telegram_chat_id` и признак включения Telegram-уведомлений в tenant
-
-На четвёртом этапе Telegram больше не вводится вручную в onboarding:
-
-- после создания tenant пользователь открывает страницу статуса Telegram
-- система создаёт одноразовый `telegram_link_token`
-- deep link вида `https://t.me/<BOT_USERNAME>?start=tglink_<token>` открывает бот
-- после `/start` webhook сохраняет `telegram_chat_id` в tenant и включает `alerts_telegram_enabled`
-
-Для этого используются:
-
-- `GET /onboarding/tenants/{tenant_id}/telegram`
-- `POST /onboarding/tenants/{tenant_id}/telegram/link`
-- публичный `POST /webhooks/telegram`
-
-На втором этапе `alert_worker.py` использует эти контакты для tenant-aware уведомлений:
-
-- system/admin alerts остаются глобальными и уходят в каналы из `.env`
-- tenant alerts по `FAILED`, `RETRY` и ошибкам `stock_sync_status` отправляются по контактам конкретного tenant
-- если у tenant канал не заполнен или выключен, он просто пропускается без падения worker
-
-На третьем этапе доставка уведомлений журналируется в `notification_log`:
-
-- успешные отправки пишутся со статусом `sent`
-- ошибки доставки пишутся со статусом `failed`
-- для tenant alerts статус `skipped` пишется только в практичных случаях, когда канал включён, но контакт не заполнен
-
-Реализованы четыре типа сигналов:
-
-- `worker stale` или отсутствие heartbeat
-- наличие событий со статусом `FAILED`
-- наличие событий со статусом `RETRY`
-- наличие ошибок синхронизации остатков в `stock_sync_status`
-
-Alert отправляется только при смене состояния (anti-spam).
+Telegram подключается через deep link: `https://t.me/<BOT>?start=tglink_<token>`.
 
 ---
 
 ### 7. Observability: Prometheus + Grafana + Loki
 
-Полный observability stack на базе Docker Compose.
-
-#### Метрики Prometheus
-
-| Endpoint | Описание |
-|---|---|
-| `GET /metrics` | API метрики |
-| `http://localhost:8001/metrics` | Worker метрики |
-| `http://localhost:8002/metrics` | Fiscal poller метрики |
-
-Метрики включают:
-
-- количество и latency HTTP-запросов к API
-- количество обработанных событий по статусам (`done`, `retry`, `failed`)
-- latency обработки событий worker'ом
-- количество polling-циклов fiscal poller
-- DB-метрики: счётчики `event_store`, `errors`, `stock_sync_status`
-
-#### Grafana дашборды
-
-Доступны по адресу `/grafana/` (через Nginx reverse proxy).
-
-Дашборды:
-
-- **API** — HTTP метрики, latency, error rate
-- **Worker** — события, latency, stale recovery
-- **Fiscal poller** — polling циклы, статусы чеков
-- **Фискализация** — запросы фискализации, статусы
-- **Logs** — логи через Loki
-
-#### Loki + Promtail
-
-Loki собирает JSON-логи из файлов в директории `logs/`.
-
-Для включения логирования в файлы задай в `.env`:
-
-```env
-LOG_TO_FILE=true
-LOG_FILE_PATH=logs/api.log
-LOG_FORMAT=json
-SERVICE_NAME=integration-api
-```
+- **Метрики:** `/metrics` (API), `:8001/metrics` (Worker), `:8002/metrics` (Fiscal poller)
+- **Grafana:** `/grafana/` — дашборды API, Worker, Fiscal poller, Logs
+- **Логи:** systemd drop-in → `logs/*.log` → Promtail → Loki → Grafana
 
 ---
 
 ## Безопасность
 
-### Верификация webhook Эвотор
-
-```http
-Authorization: Bearer <token>
-```
-
 ```env
-EVOTOR_WEBHOOK_SECRET=your_secret
+EVOTOR_WEBHOOK_SECRET=    # Bearer токен для webhook Эвотор
+MS_WEBHOOK_SECRET=         # HMAC-SHA256 для webhook МойСклад
+ADMIN_API_TOKEN=           # Bearer для admin/internal API (опционально)
 ```
 
-Если секрет не задан — проверка пропускается (локальная разработка).
-
-### Верификация webhook МойСклад
-
-```http
-X-Lognex-Signature: <hex_hmac_sha256>
-```
-
-```env
-MS_WEBHOOK_SECRET=your_secret
-```
-
-Подпись проверяется по raw body через HMAC-SHA256.
-
-Если секрет не задан — проверка пропускается (локальная разработка).
-
-### Admin API auth
-
-```env
-ADMIN_API_TOKEN=token
-```
-
-Логика работы:
-
-- если `ADMIN_API_TOKEN` не задан, internal/admin auth отключён
-- если `ADMIN_API_TOKEN` задан, для protected endpoints нужен заголовок `Authorization: Bearer <ADMIN_API_TOKEN>`
-
-#### Защищённые ручки
-
-- `/tenants`, `/sync`, `/events`, `/errors`, `/mappings`, `/monitoring`, `/dashboard`
-
-#### Публичные ручки
-
-- `/health`, `/metrics`, `/webhooks/evotor/{tenant_id}`, `/webhooks/moysklad/{tenant_id}`, `/webhooks/telegram`, `/api/v1/user/token`, `/onboarding`
+Публичные ручки (без авторизации): `/health`, `/metrics`, `/webhooks/*`, `/onboarding/*`, `/vendor/*`.
 
 ---
 
 ## Архитектура
 
-### Продажи: event-driven pipeline
-
 ```text
-Эвотор Webhook → Event Store → Worker → Dispatch → Sale Handler → Sale Mapper → МойСклад API
-```
+# Продажи
+Эвотор Webhook → Event Store → Worker → Sale Handler → МойСклад API
 
-### Товары и остатки: API-driven sync
+# Товары
+sync.py → MoySklad API / Evotor API → mappings
 
-```text
-Manual/API Trigger → sync.py → MoySklad API / Evotor API → mappings / stock_sync_status
-```
+# Автоматические остатки
+МойСклад Webhook → moysklad_webhooks.py → /report/stock/all → Evotor API
 
-### Автоматическая синхронизация остатков
+# Каталог МойСклад
+Vendor API → tenant (с токеном МС) → iframe → Evotor connect → sync
 
-```text
-МойСклад документ → Webhook → moysklad_webhooks.py → позиции документа → /report/stock/all → Evotor API
-```
-
-### Фискализация документа
-
-```text
-Manual/API Trigger → sync.py → MoySklad demand → mapper → FiscalizationClient → fiscalization24
-```
-
-### Observability
-
-```text
-API / Worker / Fiscal poller → /metrics → Prometheus → Grafana
+# Observability
 logs/*.log → Promtail → Loki → Grafana
-```
+/metrics → Prometheus → Grafana
 
-### Alerts
-
-```text
-service_heartbeats → alert_worker.py → global Telegram / Email
-event_store / stock_sync_status → alert_worker.py → tenant Telegram / Email
-alert_worker.py → notification_log
+# Alerts
+event_store → alert_worker.py → tenant Telegram/Email → notification_log
 ```
 
 ---
@@ -403,337 +167,111 @@ alert_worker.py → notification_log
 | `tenants` | Tenant'ы и конфигурация интеграции |
 | `event_store` | Очередь входящих событий |
 | `processed_events` | Идемпотентность обработки |
-| `errors` | Журнал ошибок |
 | `mappings` | Связи `evotor_id ↔ ms_id` |
-| `stock_sync_status` | Статус последней синхронизации остатков |
+| `stock_sync_status` | Статус синхронизации остатков |
 | `fiscalization_checks` | Отправленные чеки и их статусы |
 | `service_heartbeats` | Heartbeat фоновых сервисов |
-| `notification_log` | Журнал отправки уведомлений по email и Telegram |
-| `telegram_link_tokens` | Одноразовые токены привязки Telegram-чата к tenant |
-
----
-
-## Health-check
-
-`GET /health` — публичный endpoint, не требует авторизации.
-
-Верхний статус:
-
-- `ok` — всё в норме
-- `degraded` — worker stale, есть FAILED события или ошибки stock sync
-- `error` — не удалось подключиться к БД
-
----
-
-## API endpoint'ы
-
-### Infrastructure
-
-| Метод | URL | Описание |
-|---|---|---|
-| GET | `/health` | Проверка сервера и фоновых сервисов |
-| GET | `/metrics` | Prometheus метрики |
-
-### Onboarding
-
-| Метод | URL | Описание |
-|---|---|---|
-| GET | `/onboarding/evotor/connect` | Форма ввода Evotor token |
-| POST | `/onboarding/evotor/connect` | Получить магазины по Evotor token |
-| GET | `/onboarding/evotor/sessions/{session_id}/stores` | Выбор магазина Эвотор |
-| POST | `/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token` | Загрузить данные МойСклад |
-| POST | `/onboarding/store-profile` | Создать профиль магазина и сохранить email-канал уведомлений |
-| GET | `/onboarding/tenants/{tenant_id}/telegram` | Страница статуса и подключения Telegram |
-| POST | `/onboarding/tenants/{tenant_id}/telegram/link` | Создать или обновить deep link для подключения Telegram |
-
-### Tenants
-
-| Метод | URL | Описание |
-|---|---|---|
-| POST | `/tenants` | Создать tenant |
-| GET | `/tenants` | Список tenants |
-| PATCH | `/tenants/{tenant_id}/moysklad` | Сохранить конфигурацию tenant |
-| PATCH | `/tenants/{tenant_id}/fiscal` | Сохранить конфигурацию фискализации |
-| POST | `/tenants/{tenant_id}/complete-sync` | Отметить initial sync как завершённую |
-| DELETE | `/tenants/{tenant_id}/complete-sync` | Сбросить initial sync |
-| DELETE | `/tenants/{tenant_id}` | Удалить tenant и все связанные данные |
-
-### Webhooks
-
-| Метод | URL | Описание |
-|---|---|---|
-| POST | `/webhooks/evotor/{tenant_id}` | Принять webhook от Эвотор |
-| POST | `/webhooks/moysklad/{tenant_id}` | Принять webhook от МойСклад |
-| POST | `/webhooks/telegram` | Принять update от Telegram-бота для linking flow |
-| POST | `/api/v1/user/token` | Сохранить токен Эвотор |
-
-### Sync API
-
-| Метод | URL | Описание |
-|---|---|---|
-| POST | `/sync/{tenant_id}/initial` | Первичная синхронизация товаров Эвотор → МойСклад |
-| GET | `/sync/{tenant_id}/status` | Общий статус синхронизации tenant |
-| GET | `/sync/{tenant_id}/demands` | Последние документы demand из МойСклад |
-| GET | `/sync/{tenant_id}/fiscal/clients` | Список клиентов и касс фискализатора |
-| POST | `/sync/{tenant_id}/fiscalize/{ms_demand_id}` | Отправить demand на фискализацию |
-| GET | `/sync/{tenant_id}/fiscalization/{uid}` | Статус чека фискализации |
-| POST | `/sync/{tenant_id}/product/{ms_product_id}` | Синхронизация одного товара МойСклад → Эвотор |
-| GET | `/sync/{tenant_id}/moysklad/products` | Поиск товаров МойСклад |
-| POST | `/sync/{tenant_id}/stock/{ms_product_id}` | Синхронизация остатка одного товара |
-| POST | `/sync/{tenant_id}/stock/reconcile` | Batch-синхронизация остатков |
-| GET | `/sync/{tenant_id}/stock/status` | Статус последней синхронизации остатков |
-
-### Mappings
-
-| Метод | URL | Описание |
-|---|---|---|
-| GET | `/mappings` | Список маппингов (фильтр по tenant_id, entity_type) |
-| POST | `/mappings/` | Создать или обновить маппинг |
-| DELETE | `/mappings/{tenant_id}/{entity_type}/{evotor_id}` | Удалить один маппинг |
-| DELETE | `/mappings/{tenant_id}/{entity_type}` | Удалить все маппинги тенанта по типу |
-| DELETE | `/mappings/{tenant_id}` | Удалить все маппинги тенанта |
-
-### Диагностика
-
-| Метод | URL | Описание |
-|---|---|---|
-| GET | `/events` | Последние события |
-| GET | `/events/retry` | События в статусе RETRY |
-| GET | `/events/failed` | События в статусе FAILED |
-| GET | `/events/{id}` | Детали события |
-| POST | `/events/{id}/requeue` | Повторная постановка FAILED → NEW |
-| GET | `/errors` | Журнал ошибок |
-
-### Monitoring
-
-| Метод | URL | Описание |
-|---|---|---|
-| GET | `/monitoring/dashboard` | JSON snapshot состояния integration bus |
-| GET | `/monitoring/notifications` | Журнал уведомлений (`tenant_id`, `limit`, `offset`) |
-| GET | `/dashboard` | HTML dashboard мониторинга |
+| `notification_log` | Журнал уведомлений |
+| `telegram_link_tokens` | Токены привязки Telegram |
+| `evotor_onboarding_sessions` | Сессии ручного онбординга |
 
 ---
 
 ## Требования
 
-- Python 3.11+
+- Python 3.12+
 - PostgreSQL 14+
-- Docker + Docker Compose (для observability stack)
-- Доступ к API Эвотор
-- Доступ к API МойСклад
-- Доступ к API Универсального фискализатора
+- Docker + Docker Compose (для observability)
+- Аккаунт разработчика МойСклад
 
 ---
 
 ## Установка
 
-### 1. Создать виртуальное окружение
-
 ```bash
-python3.11 -m venv venv
-source venv/bin/activate
-```
-
-### 2. Установить зависимости
-
-```bash
+# 1. Виртуальное окружение
+python3.12 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+
+# 2. База данных
+sudo -u postgres psql -c "CREATE USER evotor WITH PASSWORD 'password';"
+sudo -u postgres psql -c "CREATE DATABASE evotor_ms OWNER evotor;"
+python -m app.scripts.init_db
+
+# 3. Настройка логирования для Grafana
+cp deploy/systemd/evo-api-logging.conf /etc/systemd/system/evo-api.service.d/logging.conf
+cp deploy/systemd/evo-worker-logging.conf /etc/systemd/system/evo-worker.service.d/logging.conf
+cp deploy/systemd/evo-fiscal-poller-logging.conf /etc/systemd/system/evo-fiscal-poller.service.d/logging.conf
+systemctl daemon-reload
 ```
 
-### 3. Настроить `.env`
+### .env
 
 ```env
-# База данных
 DATABASE_URL=postgresql://user:password@localhost:5432/evotor_ms
-
-# Безопасность
+MS_APP_ID=your_app_id
+MS_VENDOR_SECRET_KEY=your_vendor_secret
 EVOTOR_WEBHOOK_SECRET=your_secret
 MS_WEBHOOK_SECRET=your_secret
 ADMIN_API_TOKEN=token
-
-# Observability (опционально)
-LOG_TO_FILE=true
-LOG_FILE_PATH=logs/api.log
-LOG_FORMAT=json
-SERVICE_NAME=integration-api
-WORKER_METRICS_PORT=8001
-FISCAL_POLLER_METRICS_PORT=8002
-
-# Telegram alerts (опционально)
-# TELEGRAM_CHAT_ID используется для глобальных system/admin alerts
-# tenant Telegram уведомления используют тот же bot token, но chat_id берут из tenant profile
-# TELEGRAM_BOT_USERNAME нужен для deep link в onboarding Telegram linking flow
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_BOT_USERNAME=your_bot_username
 TELEGRAM_CHAT_ID=your_chat_id
-
-# Email alerts (опционально)
-# ALERT_EMAIL_TO используется для глобальных system/admin alerts
-# tenant email уведомления используют тот же SMTP transport, но адрес получателя берут из tenant profile
 SMTP_HOST=smtp.mail.ru
 SMTP_PORT=465
-SMTP_USERNAME=your_mail_login@mail.ru
-SMTP_PASSWORD=your_external_app_password
-SMTP_FROM=your_mail_login@mail.ru
+SMTP_USERNAME=your@mail.ru
+SMTP_PASSWORD=your_password
+SMTP_FROM=your@mail.ru
 ALERT_EMAIL_TO=recipient@example.com
 SMTP_USE_SSL=true
-SMTP_USE_TLS=false
-
-# Worker
 ALERT_POLL_INTERVAL_SEC=30
-WORKER_STALE_AFTER_SEC=30
-```
-
-Минимально для локальной разработки обычно достаточно:
-
-```env
-EVOTOR_WEBHOOK_SECRET=your_evotor_secret
-MS_WEBHOOK_SECRET=your_moysklad_secret
-```
-
-Если нужно закрыть internal/admin endpoints, задайте `ADMIN_API_TOKEN`:
-
-```env
-ADMIN_API_TOKEN=your_admin_token
-```
-
-### 4. Создать базу данных PostgreSQL
-
-```bash
-sudo -u postgres psql
-```
-
-```sql
-CREATE USER evotor WITH PASSWORD 'your_password';
-CREATE DATABASE evotor_ms OWNER evotor;
-GRANT ALL PRIVILEGES ON DATABASE evotor_ms TO evotor;
-\q
-```
-
-### 5. Инициализировать схему БД
-
-```bash
-python -m app.scripts.init_db
-```
-
-### 6. Миграция с SQLite (если нужно)
-
-```bash
-export SQLITE_PATH=data/app.db
-python -m app.scripts.migrate_to_pg
 ```
 
 ---
 
 ## Запуск
 
-### API сервер
-
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000   # API
+python -m app.workers.worker                        # Worker
+python -m app.workers.fiscal_poller                 # Fiscal poller
+python -m app.workers.alert_worker                  # Alert worker
+docker compose -f docker-compose.observability.yml up -d  # Observability
 ```
-
-Swagger: `http://127.0.0.1:8000/docs`
-
-### Worker
-
-```bash
-python -m app.workers.worker
-```
-
-### Fiscal poller
-
-```bash
-python -m app.workers.fiscal_poller
-```
-
-### Alert worker
-
-```bash
-python -m app.workers.alert_worker
-```
-
-### Observability stack
-
-```bash
-mkdir -p logs
-docker compose -f docker-compose.observability.yml up -d
-```
-
-Доступные адреса:
-
-- Grafana: `/grafana/` (через Nginx reverse proxy)
-- Prometheus: `http://localhost:9090`
-- Loki: `http://localhost:3100`
 
 ---
 
-## Базовый сценарий настройки
+## Тесты
 
-### Через онбординг (рекомендуется)
+```bash
+./run_tests.sh                                          # SQLite + PostgreSQL smoke
+DATABASE_URL=sqlite:///tmp/test.db python -m pytest tests/ -v  # Только SQLite
+RUN_PG_RUNTIME_SMOKE=1 python -m pytest tests/test_pg_runtime_smoke.py -v  # Только PG
+```
+
+---
+
+## Онбординг
+
+### Через каталог МойСклад (рекомендуется)
+
+1. Установить решение из каталога МойСклад
+2. МойСклад откроет iframe с формой подключения Эвотор
+3. Ввести Evotor token — система загрузит магазины и данные МойСклад
+4. Выбрать магазин, организацию, склад, контрагента
+5. Запустится первичная синхронизация
+6. Подключить Telegram в разделе Уведомления
+
+### Вручную
 
 1. Открыть `/onboarding/evotor/connect`
-2. Ввести Evotor token — система получит список магазинов
-3. Выбрать магазин
-4. Ввести MoySklad token — система автоматически загрузит организации, склады и контрагентов
-5. Выбрать организацию, склад и контрагента по умолчанию из списков
-6. Создать профиль магазина, при необходимости указать email для уведомлений
-7. Открыть `/onboarding/tenants/{tenant_id}/telegram`, создать deep link и нажать `/start` в Telegram-боте
-8. Выполнить `POST /sync/{tenant_id}/initial`
-
-### Через API вручную
-
-1. Создать tenant: `POST /tenants`
-2. Настроить МойСклад: `PATCH /tenants/{tenant_id}/moysklad`
-3. Сохранить токен Эвотор: `POST /api/v1/user/token`
-4. Выполнить `POST /sync/{tenant_id}/initial`
-5. Настроить фискализацию: `PATCH /tenants/{tenant_id}/fiscal`
-6. Проверить статус: `GET /sync/{tenant_id}/status`
-
----
-
-## Примеры curl
-
-### Получить demand
-
-```bash
-curl -H "Authorization: Bearer <ADMIN_API_TOKEN>" \
-  "http://127.0.0.1:8000/sync/{tenant_id}/demands"
-```
-
-### Отправить demand на фискализацию
-
-```bash
-curl -X POST \
-  -H "Authorization: Bearer <ADMIN_API_TOKEN>" \
-  "http://127.0.0.1:8000/sync/{tenant_id}/fiscalize/{ms_demand_id}"
-```
-
-### Получить события
-
-```bash
-curl -H "Authorization: Bearer <ADMIN_API_TOKEN>" \
-  "http://127.0.0.1:8000/events"
-```
-
-### Получить dashboard snapshot
-
-```bash
-curl -H "Authorization: Bearer <ADMIN_API_TOKEN>" \
-  "http://127.0.0.1:8000/monitoring/dashboard"
-```
-
-### Проверить метрики
-
-```bash
-curl "http://127.0.0.1:8000/metrics"
-curl "http://127.0.0.1:8001/metrics"
-```
+2. Ввести Evotor token → выбрать магазин
+3. Ввести MoySklad token → настроить параметры → создать профиль
 
 ---
 
 ## Дальнейшее развитие
 
 - поддержка card/mixed payment в фискализации
-- расширение dashboard: фильтры, цветовая индикация, дополнительные метрики
+- получение `accountId` из `contextKey` МойСклад (ожидаем endpoint от поддержки МойСклад)
 - E2E-тесты на PostgreSQL
