@@ -6,6 +6,9 @@ import os
 import time
 import uuid
 import requests
+import jwt as pyjwt
+import uuid
+import time
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -170,30 +173,40 @@ def _setup_ms_webhooks(tenant_id: str, access_token: str) -> None:
     log.info("vendor.webhooks: created=%d/%d tenant_id=%s", created, len(webhooks), tenant_id)
 
 def _notify_ms_activated(ms_account_id: str, access_token: str) -> None:
-    """
-    Уведомляет МойСклад что настройка решения завершена — переводит статус в Activated.
-    """
-    import os
-    app_id = os.getenv("MS_APP_ID", "")
-    if not app_id:
-        log.warning("notify_ms_activated: MS_APP_ID not set — skipping")
+    """Уведомляет МойСклад что настройка решения завершена — переводит статус в Activated."""
+    import os, uuid, time
+    import jwt as pyjwt
+
+    app_id = os.getenv("MS_APP_ID", "").strip()
+    app_uid = os.getenv("MS_APP_UID", "").strip()
+    secret_key = os.getenv("MS_VENDOR_SECRET_KEY", "").strip()
+
+    if not app_id or not app_uid or not secret_key:
+        log.warning("notify_ms_activated: MS_APP_ID/MS_APP_UID/MS_VENDOR_SECRET_KEY not set — skipping")
         return
     try:
-        url = f"https://apps-api.moysklad.ru/api/moysklad/vendor/1.0/apps/{app_id}/{ms_account_id}"
+        now = int(time.time())
+        token = pyjwt.encode(
+            {"sub": app_uid, "iat": now, "exp": now + 300, "jti": str(uuid.uuid4())},
+            secret_key,
+            algorithm="HS256",
+        )
+        url = f"https://apps-api.moysklad.ru/api/vendor/1.0/apps/{app_id}/{ms_account_id}/status"
         r = requests.put(
             url,
             json={"status": "Activated"},
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {access_token}",
+                "Accept-Encoding": "gzip",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
             },
             timeout=10,
         )
-        log.warning("notify_ms_activated: failed status=%s body=%s url=%s", r.status_code, r.text[:500], url)
         if r.ok:
             log.info("notify_ms_activated: success account_id=%s", ms_account_id)
         else:
-            log.warning("notify_ms_activated: failed status=%s body=%s", r.status_code, r.text[:200])
+            log.warning("notify_ms_activated: failed status=%s body=%s", r.status_code, r.text[:300])
     except Exception as e:
         log.warning("notify_ms_activated: error account_id=%s err=%s", ms_account_id, e)
 
