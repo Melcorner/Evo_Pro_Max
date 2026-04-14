@@ -169,6 +169,34 @@ def _setup_ms_webhooks(tenant_id: str, access_token: str) -> None:
 
     log.info("vendor.webhooks: created=%d/%d tenant_id=%s", created, len(webhooks), tenant_id)
 
+def _notify_ms_activated(ms_account_id: str, access_token: str) -> None:
+    """
+    Уведомляет МойСклад что настройка решения завершена — переводит статус в Activated.
+    """
+    import os
+    app_id = os.getenv("MS_APP_ID", "")
+    if not app_id:
+        log.warning("notify_ms_activated: MS_APP_ID not set — skipping")
+        return
+    try:
+        url = f"https://apps-api.moysklad.ru/api/moysklad/vendor/1.0/apps/{app_id}/{ms_account_id}"
+        r = requests.put(
+            url,
+            json={"status": "Activated"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {access_token}",
+            },
+            timeout=10,
+        )
+        log.warning("notify_ms_activated: failed status=%s body=%s url=%s", r.status_code, r.text[:500], url)
+        if r.ok:
+            log.info("notify_ms_activated: success account_id=%s", ms_account_id)
+        else:
+            log.warning("notify_ms_activated: failed status=%s body=%s", r.status_code, r.text[:200])
+    except Exception as e:
+        log.warning("notify_ms_activated: error account_id=%s err=%s", ms_account_id, e)
+
 def _set_tenant_status(ms_account_id: str, status: str) -> None:
     """Устанавливает статус tenant'а (active/suspended/deleted)."""
     conn = get_connection()

@@ -184,6 +184,16 @@ def complete_sync(tenant_id: str):
     conn.commit()
     conn.close()
 
+# Уведомляем МойСклад что настройка завершена
+    try:
+        from app.api.vendor import _notify_ms_activated
+        cursor.execute(aq("SELECT ms_account_id, moysklad_token FROM tenants WHERE id = ?"), (tenant_id,))
+        t = cursor.fetchone()
+        if t and t["ms_account_id"] and t["moysklad_token"]:
+            _notify_ms_activated(t["ms_account_id"], t["moysklad_token"])
+    except Exception as e:
+        log.warning("complete_sync: notify_ms_activated failed err=%s", e)
+
     return {
         "status": "ok",
         "sync_completed_at": now,

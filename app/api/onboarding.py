@@ -399,8 +399,21 @@ def _select(name: str, items: list[dict]) -> str:
 
 def _run_initial_sync(tenant_id: str) -> dict:
     from app.api.sync import initial_sync
+    from app.api.vendor import _notify_ms_activated
     try:
-        return initial_sync(tenant_id)
+        result = initial_sync(tenant_id)
+        # Уведомляем МойСклад что настройка завершена
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(aq("SELECT ms_account_id, moysklad_token FROM tenants WHERE id = ?"), (tenant_id,))
+            t = cur.fetchone()
+            conn.close()
+            if t and t["ms_account_id"] and t["moysklad_token"]:
+                _notify_ms_activated(t["ms_account_id"], t["moysklad_token"])
+        except Exception as notify_err:
+            log.warning("_run_initial_sync: notify_ms_activated failed err=%s", notify_err)
+        return result
     except Exception as e:
         log.exception("Auto initial sync failed tenant_id=%s", tenant_id)
         return {"status": "error", "error": str(e), "synced": 0, "failed": 0, "skipped": 0}
