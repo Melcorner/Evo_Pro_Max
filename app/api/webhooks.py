@@ -396,16 +396,19 @@ def _resolve_tenant_id(
 @router.post("/webhooks/evotor/{tenant_id}")
 async def evotor_webhook(raw_body: EvotorWebhook, request: Request, tenant_id: str | None = None):
     if not _verify_evotor_signature(dict(request.headers)):
+        auth = request.headers.get("authorization", "")
+        token_preview = auth[:30] if auth else "<missing>"
         log.warning(
-            "Evotor webhook signature verification failed tenant_id=%s ip=%s user_agent=%s",
+            "Evotor webhook signature verification failed tenant_id=%s ip=%s user_agent=%s auth_preview=%s",
             tenant_id,
             request.client.host if request.client else "unknown",
             request.headers.get("user-agent", ""),
+            token_preview,
         )
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     body_dict = raw_body.model_dump()
-    log.debug(
+    log.info(
         "RAW EVOTOR BODY tenant_id=%s body=%s",
         tenant_id,
         json.dumps(body_dict, ensure_ascii=False),
