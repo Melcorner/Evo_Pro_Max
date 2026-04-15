@@ -1123,6 +1123,50 @@ def _get_default_currency_meta(ms_token: str) -> dict:
     return meta
 
 
+# Кэш UOM
+_uom_cache: dict[str, list] = {}
+
+EVOTOR_MEASURE_TO_MS_CODE = {
+    "шт": "796", "кг": "166", "г": "163", "л": "112",
+    "мл": "111", "м": "006", "см": "004", "мм": "003",
+    "м2": "055", "м3": "113", "км": "008", "т": "168",
+    "упак": "796", "уп": "796", "пара": "796", "компл": "796",
+    "рулон": "736", "блок": "813", "ящ": "812", "пог. м": "018",
+}
+
+
+def _get_ms_uom_meta(ms_token: str, measure_name: str) -> dict | None:
+    if not measure_name:
+        return None
+    if ms_token not in _uom_cache:
+        try:
+            r = requests.get(
+                f"{MS_BASE}/entity/uom",
+                headers=_ms_headers(ms_token),
+                params={"limit": 100},
+                timeout=20,
+            )
+            if r.ok:
+                _uom_cache[ms_token] = r.json().get("rows", [])
+            else:
+                return None
+        except Exception as e:
+            log.warning("Failed to fetch UOM list err=%s", e)
+            return None
+    uoms = _uom_cache[ms_token]
+    measure_lower = measure_name.strip().lower()
+    for uom in uoms:
+        if uom.get("name", "").lower() == measure_lower:
+            return uom.get("meta")
+    ms_code = EVOTOR_MEASURE_TO_MS_CODE.get(measure_lower)
+    if ms_code:
+        for uom in uoms:
+            if uom.get("code") == ms_code:
+                return uom.get("meta")
+    log.warning("UOM not found for measure_name=%s", measure_name)
+    return None
+
+
 def _create_ms_product(ms_token: str, product: dict) -> str:
     price_type_meta = _get_default_price_type_meta(ms_token)
     currency_meta = _get_default_currency_meta(ms_token)
@@ -1145,6 +1189,14 @@ def _create_ms_product(ms_token: str, product: dict) -> str:
             "value": round(float(product.get("cost_price", 0)) * 100),
             "currency": {"meta": currency_meta},
         }
+
+    # --- Единица измерения ---
+    measure_name = product.get("measure_name", "").strip()
+    if measure_name:
+        uom_meta = _get_ms_uom_meta(ms_token, measure_name)
+        if uom_meta:
+            payload["uom"] = {"meta": uom_meta}
+
 
     # --- НДС ---
     evotor_tax = str(product.get("tax") or "").strip().upper()
