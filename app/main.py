@@ -35,6 +35,7 @@ from app.api.moysklad_webhooks import router as moysklad_webhooks_router
 from app.api.monitoring import router as monitoring_router
 from app.api.onboarding import router as onboarding_router
 from app.api.vendor import router as vendor_router
+from app.api.stores import router as stores_router
 
 setup_logging()
 log = logging.getLogger("api")
@@ -68,6 +69,7 @@ admin_dependencies = [Depends(require_admin_api_token)]
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 app.include_router(sync_router, dependencies=admin_dependencies)
 app.include_router(tenants_router, dependencies=admin_dependencies)
+app.include_router(stores_router, dependencies=admin_dependencies)
 app.include_router(events_router, dependencies=admin_dependencies)
 app.include_router(mappings_router, dependencies=admin_dependencies)
 app.include_router(errors_router, dependencies=admin_dependencies)

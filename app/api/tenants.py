@@ -125,6 +125,27 @@ def configure_moysklad(tenant_id: str, body: TenantMoySkladConfig):
             ),
         )
 
+    # Upsert в tenant_stores если evotor_store_id задан
+    if body.evotor_store_id and body.evotor_store_id.strip():
+        import uuid as _uuid_mod, time as _time_mod
+        cursor.execute(
+            aq("""
+            INSERT INTO tenant_stores (id, tenant_id, evotor_store_id, ms_store_id, ms_organization_id, is_primary, created_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT (evotor_store_id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                ms_store_id = EXCLUDED.ms_store_id,
+                ms_organization_id = EXCLUDED.ms_organization_id
+            """),
+            (
+                str(_uuid_mod.uuid4()), tenant_id,
+                body.evotor_store_id.strip(),
+                body.ms_store_id or None,
+                body.ms_organization_id or None,
+                int(_time_mod.time()),
+            ),
+        )
+
     conn.commit()
     conn.close()
 
@@ -298,6 +319,9 @@ def delete_tenant(tenant_id: str):
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     try:
+        cur.execute(aq("DELETE FROM tenant_stores WHERE tenant_id = ?"), (tenant_id,))
+        deleted_tenant_stores = cur.rowcount
+
         cur.execute(aq("DELETE FROM mappings WHERE tenant_id = ?"), (tenant_id,))
         deleted_mappings = cur.rowcount
 
@@ -339,6 +363,7 @@ def delete_tenant(tenant_id: str):
             "tenant_id": tenant_id,
             "tenant_name": tenant["name"],
             "tenants": deleted_tenants,
+            "tenant_stores": deleted_tenant_stores,
             "mappings": deleted_mappings,
             "errors": deleted_errors,
             "stock_sync_status": deleted_stock_sync_status,

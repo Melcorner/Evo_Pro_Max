@@ -321,6 +321,26 @@ def _query_single_tenant_id(sql: str, params: tuple) -> str | None:
 def _resolve_tenant_id_by_store_id(store_id: str | None) -> str | None:
     if not store_id:
         return None
+    # Сначала ищем через tenant_stores
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("SELECT tenant_id FROM tenant_stores WHERE evotor_store_id = ?"),
+            (store_id,),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if len(rows) == 1:
+        return rows[0]["tenant_id"]
+    if len(rows) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Ambiguous tenant resolution for Evotor webhook.",
+        )
+    # Fallback: старая колонка (тенанты до миграции)
     return _query_single_tenant_id(
         "SELECT id FROM tenants WHERE evotor_store_id = ?",
         (store_id,),
@@ -440,6 +460,28 @@ async def evotor_webhook(raw_body: EvotorWebhook, request: Request, tenant_id: s
         finally:
             conn.close()
 
+        # Если store_id есть в теле — добавляем запись в tenant_stores
+        install_store_id = _extract_store_id(body_dict)
+        if install_store_id:
+            import uuid as _uuid_mod, time as _time_mod
+            conn2 = get_connection()
+            try:
+                cur2 = conn2.cursor()
+                cur2.execute(
+                    aq("""
+                    INSERT INTO tenant_stores (id, tenant_id, evotor_store_id, is_primary, created_at)
+                    VALUES (?, ?, ?, 1, ?)
+                    ON CONFLICT (evotor_store_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id
+                    """),
+                    (str(_uuid_mod.uuid4()), resolved_tenant_id, install_store_id, int(_time_mod.time())),
+                )
+                conn2.commit()
+                log.info("tenant_stores upserted tenant_id=%s store_id=%s", resolved_tenant_id, install_store_id)
+            except Exception as _e:
+                log.warning("Failed to upsert tenant_stores err=%s", _e)
+            finally:
+                conn2.close()
+
         log.info("Evotor token saved tenant_id=%s", resolved_tenant_id)
         return {"status": "accepted", "tenant_id": resolved_tenant_id}
 
@@ -454,12 +496,30 @@ async def evotor_webhook(raw_body: EvotorWebhook, request: Request, tenant_id: s
             try:
                 cur = conn.cursor()
                 if store_id_for_token:
-                    cur.execute(aq("SELECT evotor_token FROM tenants WHERE evotor_store_id = ?"), (store_id_for_token,))
+                    # Сначала через tenant_stores
+                    cur.execute(
+                        aq("""
+                        SELECT t.evotor_token
+                        FROM tenant_stores ts
+                        JOIN tenants t ON t.id = ts.tenant_id
+                        WHERE ts.evotor_store_id = ?
+                        LIMIT 1
+                        """),
+                        (store_id_for_token,),
+                    )
+                    row = cur.fetchone()
+                    # Fallback
+                    if not row:
+                        cur.execute(
+                            aq("SELECT evotor_token FROM tenants WHERE evotor_store_id = ?"),
+                            (store_id_for_token,),
+                        )
+                        row = cur.fetchone()
                 elif user_id_for_token:
                     cur.execute(aq("SELECT evotor_token FROM tenants WHERE evotor_user_id = ?"), (user_id_for_token,))
+                    row = cur.fetchone()
                 else:
-                    cur = None
-                row = cur.fetchone() if cur else None
+                    row = None
                 if row and row["evotor_token"]:
                     body_dict["_evotor_token"] = row["evotor_token"]
             finally:

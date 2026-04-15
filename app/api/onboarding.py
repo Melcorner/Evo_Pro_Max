@@ -5,8 +5,9 @@ import os
 import re
 import time
 import uuid
-
 import requests
+
+from urllib.parse import quote_plus
 from fastapi import APIRouter, Body, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -107,6 +108,90 @@ def _extract_store_name(store: dict, fallback_id: str) -> str:
     return str(store.get("name") or store.get("title") or store.get("storeName") or f"Store {fallback_id}").strip()
 
 
+def _get_session_store(session: dict, store_id: str) -> dict | None:
+    stores = json.loads(session.get("stores_json") or "[]")
+    for store in stores:
+        if _extract_store_id(store) == store_id:
+            return store
+    return None
+
+
+def _ensure_primary_store_row(tenant_id: str) -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(aq("SELECT * FROM tenants WHERE id = ?"), (tenant_id,))
+        tenant = cur.fetchone()
+        if not tenant:
+            return
+        tenant = dict(tenant)
+
+        evotor_store_id = (tenant.get("evotor_store_id") or "").strip()
+        if not evotor_store_id:
+            return
+
+        cur.execute(
+            aq("SELECT id FROM tenant_stores WHERE tenant_id = ? AND evotor_store_id = ?"),
+            (tenant_id, evotor_store_id),
+        )
+        row = cur.fetchone()
+        now = int(time.time())
+
+        if row:
+            cur.execute(
+                aq("""
+                    UPDATE tenant_stores
+                    SET name = COALESCE(NULLIF(name, ''), ?),
+                        ms_store_id = COALESCE(ms_store_id, ?),
+                        ms_organization_id = COALESCE(ms_organization_id, ?),
+                        ms_agent_id = COALESCE(ms_agent_id, ?),
+                        sync_completed_at = COALESCE(sync_completed_at, ?),
+                        is_primary = CASE WHEN is_primary IS NULL THEN 1 ELSE is_primary END,
+                        updated_at = ?
+                    WHERE tenant_id = ? AND evotor_store_id = ?
+                """),
+                (
+                    tenant.get("name") or None,
+                    tenant.get("ms_store_id") or None,
+                    tenant.get("ms_organization_id") or None,
+                    tenant.get("ms_agent_id") or None,
+                    tenant.get("sync_completed_at") or None,
+                    now,
+                    tenant_id,
+                    evotor_store_id,
+                ),
+            )
+        else:
+            cur.execute(
+                aq("""
+                    INSERT INTO tenant_stores (
+                        id, tenant_id, evotor_store_id, name,
+                        ms_store_id, ms_organization_id, ms_agent_id,
+                        is_primary, sync_completed_at, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """),
+                (
+                    str(uuid.uuid4()),
+                    tenant_id,
+                    evotor_store_id,
+                    tenant.get("name") or None,
+                    tenant.get("ms_store_id") or None,
+                    tenant.get("ms_organization_id") or None,
+                    tenant.get("ms_agent_id") or None,
+                    tenant.get("sync_completed_at") or None,
+                    tenant.get("created_at") or now,
+                    now,
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.exception("Failed to ensure primary store row tenant_id=%s", tenant_id)
+    finally:
+        conn.close()
+
+
 def _load_tenant(tenant_id: str) -> dict:
     conn = get_connection()
     cur = conn.cursor()
@@ -149,6 +234,25 @@ def _reply_in_telegram(chat_id: str | int | None, text: str) -> None:
         log.exception("Failed to reply in Telegram chat_id=%s", chat_id)
 
 
+def _load_tenant_stores(tenant_id: str) -> list[dict]:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("""
+            SELECT id, tenant_id, evotor_store_id, name, ms_store_id,
+                   ms_organization_id, ms_agent_id, is_primary, sync_completed_at, created_at
+            FROM tenant_stores
+            WHERE tenant_id = ?
+            ORDER BY is_primary DESC, created_at ASC
+            """),
+            (tenant_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None, int, dict | None]:
     conn = get_connection()
     try:
@@ -159,7 +263,11 @@ def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None, int, dic
             raise HTTPException(status_code=404, detail="Tenant not found")
         tenant = dict(row)
 
-        cur.execute(aq("SELECT COUNT(*) as cnt FROM mappings WHERE tenant_id = ? AND entity_type = 'product'"), (tenant_id,))
+        # Считаем уникальные ms_id — один товар МС может быть в нескольких магазинах
+        cur.execute(
+            aq("SELECT COUNT(DISTINCT ms_id) as cnt FROM mappings WHERE tenant_id = ? AND entity_type = 'product'"),
+            (tenant_id,),
+        )
         mappings_count = cur.fetchone()["cnt"]
 
         cur.execute(aq("SELECT * FROM stock_sync_status WHERE tenant_id = ?"), (tenant_id,))
@@ -249,6 +357,20 @@ body { font-family: 'Inter', -apple-system, sans-serif; background: #f0f2f7; col
 .btn-ghost:hover { background: #eaecf5; text-decoration: none; color: #1a1d2e; }
 .btn-ghost::after { content: "→"; }
 .actions-list { display: flex; flex-direction: column; gap: 10px; }
+.sync-overlay { display:none; position:fixed; inset:0; background:rgba(255,255,255,0.8); backdrop-filter:blur(2px); z-index:999; align-items:center; justify-content:center; flex-direction:column; gap:16px; }
+.sync-overlay.visible { display:flex; }
+.sync-spinner { width:48px; height:48px; border:4px solid #e4e8f0; border-top-color:#3b6ff5; border-radius:50%; animation:spin 0.8s linear infinite; }
+.sync-label { font-size:15px; font-weight:600; color:#1a1d2e; }
+.sync-sublabel { font-size:13px; color:#6b7280; }
+.tooltip-wrap { position: relative; display: inline-block; }
+.tooltip-btn { background: none; border: none; cursor: pointer; color: #9ca3af; font-size: 15px; padding: 0 4px; vertical-align: middle; line-height: 1; transition: color 0.15s; }
+.tooltip-btn:hover { color: #3b6ff5; }
+.tooltip-popup { display: none; position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); background: #1a1d2e; color: #fff; font-size: 13px; line-height: 1.5; padding: 10px 14px; border-radius: 8px; width: 260px; box-shadow: 0 4px 20px rgba(0,0,0,0.2); z-index: 100; pointer-events: none; }
+.tooltip-popup::after { content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); border: 6px solid transparent; border-top-color: #1a1d2e; }
+.tooltip-wrap:hover .tooltip-popup { display: block; }
+.action-row { display: flex; align-items: center; gap: 8px; }
+.action-row form { flex: 1; }
+.action-row .btn-ghost { width: 100%; }
 .alert-box { border-radius: 10px; padding: 14px 18px; font-size: 14px; margin-bottom: 16px; }
 .alert-success { background: #ecfdf5; border: 1px solid #a7f3d0; color: #065f46; }
 .alert-error { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
@@ -319,6 +441,7 @@ def _lk_layout(tenant: dict, active_tab: str, content: str,
     name = html.escape(tenant.get("name", ""))
     tabs = [
         ("overview",      f"/onboarding/tenants/{tenant_id}",               "Обзор"),
+        ("stores",        f"/onboarding/tenants/{tenant_id}/stores",        "Магазины"),
         ("integration",   f"/onboarding/tenants/{tenant_id}/integration",   "Интеграция"),
         ("notifications", f"/onboarding/tenants/{tenant_id}/notifications", "Уведомления"),
         ("actions",       f"/onboarding/tenants/{tenant_id}/actions",       "Действия"),
@@ -398,25 +521,63 @@ def _select(name: str, items: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 def _run_initial_sync(tenant_id: str) -> dict:
-    from app.api.sync import initial_sync
+    """
+    Запускает первичную синхронизацию для всех магазинов тенанта.
+    Использует store-level sync для каждого магазина.
+    """
+    from app.api.sync import initial_sync_store
     from app.api.vendor import _notify_ms_activated
-    try:
-        result = initial_sync(tenant_id)
-        # Уведомляем МойСклад что настройка завершена
+
+    # Загружаем все магазины тенанта
+    stores = _load_tenant_stores(tenant_id)
+    if not stores:
+        # Fallback: если магазинов нет в tenant_stores — пробуем старый путь
+        from app.api.sync import initial_sync
         try:
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute(aq("SELECT ms_account_id, moysklad_token FROM tenants WHERE id = ?"), (tenant_id,))
-            t = cur.fetchone()
-            conn.close()
-            if t and t["ms_account_id"] and t["moysklad_token"]:
-                _notify_ms_activated(t["ms_account_id"], t["moysklad_token"])
-        except Exception as notify_err:
-            log.warning("_run_initial_sync: notify_ms_activated failed err=%s", notify_err)
-        return result
-    except Exception as e:
-        log.exception("Auto initial sync failed tenant_id=%s", tenant_id)
-        return {"status": "error", "error": str(e), "synced": 0, "failed": 0, "skipped": 0}
+            return initial_sync(tenant_id)
+        except Exception as e:
+            log.exception("Auto initial sync (legacy) failed tenant_id=%s", tenant_id)
+            return {"status": "error", "error": str(e), "synced": 0, "failed": 0, "skipped": 0}
+
+    total_synced = total_failed = total_skipped = 0
+    all_errors = []
+
+    for store in stores:
+        store_id = store["evotor_store_id"]
+        try:
+            result = initial_sync_store(tenant_id, store_id)
+            total_synced += result.get("synced", 0)
+            total_failed += result.get("failed", 0)
+            total_skipped += result.get("skipped", 0)
+            all_errors.extend(result.get("errors", []))
+            log.info(
+                "_run_initial_sync: store=%s synced=%s failed=%s",
+                store_id, result.get("synced", 0), result.get("failed", 0),
+            )
+        except Exception as e:
+            log.exception("_run_initial_sync: store=%s failed err=%s", store_id, e)
+            total_failed += 1
+            all_errors.append({"store": store_id, "error": str(e)})
+
+    # Уведомляем МойСклад что настройка завершена
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(aq("SELECT ms_account_id, moysklad_token FROM tenants WHERE id = ?"), (tenant_id,))
+        t = cur.fetchone()
+        conn.close()
+        if t and t["ms_account_id"] and t["moysklad_token"]:
+            _notify_ms_activated(t["ms_account_id"], t["moysklad_token"])
+    except Exception as notify_err:
+        log.warning("_run_initial_sync: notify_ms_activated failed err=%s", notify_err)
+
+    return {
+        "status": "ok" if total_failed == 0 else "partial",
+        "synced": total_synced,
+        "failed": total_failed,
+        "skipped": total_skipped,
+        "errors": all_errors[:10],
+    }
 
 
 def _render_sync_result(result: dict) -> str:
@@ -507,10 +668,16 @@ def onboarding_token_submit(evotor_token: str = Form(...)):
 @router.get("/onboarding/evotor/sessions/{session_id}/stores", response_class=HTMLResponse)
 def onboarding_evotor_stores(session_id: str):
     session = _load_session(session_id)
-    stores = json.loads(session["stores_json"] or "[]")
+    stores = json.loads(session.get("stores_json") or "[]")
     if not stores:
         return HTMLResponse(_ob_layout("Выбор магазина", '<div class="ob-error">Магазины не найдены.</div>'), status_code=400)
-    parts = []
+
+    parts = [
+        '<p style="color:#5b6475;font-size:14px;margin-bottom:20px;line-height:1.6;">'
+        'Выберите магазин Эвотор, для которого хотите создать профиль интеграции.'
+        '</p>'
+    ]
+
     for store in stores:
         store_id = _extract_store_id(store)
         if not store_id:
@@ -519,10 +686,11 @@ def onboarding_evotor_stores(session_id: str):
         link = f"/onboarding/evotor/sessions/{html.escape(session_id)}/stores/{html.escape(store_id)}/ms-token"
         parts.append(f"""
         <div class="store">
-            <p><strong>{html.escape(store_name)}</strong></p>
-            <p style="margin:4px 0 12px;color:#5b6475;font-size:13px;">ID: <code>{html.escape(store_id)}</code></p>
-            <a href="{link}">Создать профиль →</a>
+            <p style="font-size:16px;font-weight:700;margin-bottom:6px;">{html.escape(store_name)}</p>
+            <p style="margin:0 0 14px;color:#8793a8;font-size:13px;">Подключение МойСклад и настройка привязки для этого магазина</p>
+            <a href="{link}" class="ob-btn" style="display:inline-block;text-decoration:none;">Выбрать магазин →</a>
         </div>""")
+
     return HTMLResponse(_ob_layout("Выбор магазина", "".join(parts), back_url="/onboarding/evotor/connect"))
 
 
@@ -532,13 +700,24 @@ def onboarding_evotor_stores(session_id: str):
 
 @router.get("/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token", response_class=HTMLResponse)
 def onboarding_ms_token_form(session_id: str, store_id: str):
+    session = _load_session(session_id)
+    store = _get_session_store(session, store_id)
+    if not store:
+        return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Выбранный магазин не найден в сессии.</div>'), status_code=404)
+
+    store_name = _extract_store_name(store, store_id)
     body = f"""
-    <p style="margin-bottom:20px;color:#5b6475;font-size:14px;">Магазин: <code>{html.escape(store_id)}</code></p>
+    <div class="ob-success" style="margin-bottom:20px;">
+        <strong>Выбран магазин:</strong> {html.escape(store_name)}
+    </div>
+    <p style="margin-bottom:20px;color:#5b6475;font-size:14px;line-height:1.6;">
+        Теперь введите токен МойСклад. После этого мы загрузим организации, склады и контрагентов именно для этого магазина.
+    </p>
     <form method="post" action="/onboarding/evotor/sessions/{html.escape(session_id)}/stores/{html.escape(store_id)}/ms-token">
         <div class="field">
             <label>MoySklad token</label>
             <input type="text" name="moysklad_token" required placeholder="Токен из раздела «Безопасность» → «Токены»" />
-            <span class="hint">Система загрузит организации, склады и контрагентов автоматически.</span>
+            <span class="hint">Система автоматически загрузит организации, склады и контрагентов.</span>
         </div>
         <button type="submit" class="ob-btn">Загрузить данные →</button>
     </form>"""
@@ -547,6 +726,12 @@ def onboarding_ms_token_form(session_id: str, store_id: str):
 
 @router.post("/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token", response_class=HTMLResponse)
 def onboarding_ms_token_submit(session_id: str, store_id: str, moysklad_token: str = Form(...)):
+    session = _load_session(session_id)
+    store = _get_session_store(session, store_id)
+    if not store:
+        return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Выбранный магазин не найден в сессии.</div>'), status_code=404)
+
+    store_name = _extract_store_name(store, store_id)
     moysklad_token = moysklad_token.strip()
     if not moysklad_token:
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Токен обязателен.</div>'), status_code=400)
@@ -560,9 +745,11 @@ def onboarding_ms_token_submit(session_id: str, store_id: str, moysklad_token: s
     except Exception as exc:
         log.exception("Failed to fetch MoySklad data")
         return HTMLResponse(_ob_layout("Ошибка", f'<div class="ob-error">{html.escape(str(exc))}</div>'), status_code=502)
+
     for check, msg in [(orgs, "организаций"), (ms_stores, "складов"), (agents, "контрагентов")]:
         if not check:
             return HTMLResponse(_ob_layout("Ошибка", f'<div class="ob-error">Не найдено {msg}.</div>'), status_code=400)
+
     now = int(time.time())
     conn = get_connection()
     try:
@@ -574,29 +761,40 @@ def onboarding_ms_token_submit(session_id: str, store_id: str, moysklad_token: s
         conn.commit()
     finally:
         conn.close()
+
     body = f"""
+    <div class="ob-success"><strong>Выбран магазин:</strong> {html.escape(store_name)}</div>
     <div class="ob-success">Данные МойСклад загружены.</div>
     <form method="post" action="/onboarding/store-profile">
         <input type="hidden" name="session_id" value="{html.escape(session_id)}" />
         <input type="hidden" name="evotor_store_id" value="{html.escape(store_id)}" />
-        <div class="field"><label>Имя профиля</label><input type="text" name="name" required placeholder="Мой магазин на Ленина" /></div>
+
+        <div class="field">
+            <label>Название магазина</label>
+            <input type="text" name="name" value="{html.escape(store_name)}" required placeholder="Название магазина" />
+            <span class="hint">Можно оставить название из Эвотор или изменить вручную.</span>
+        </div>
+
         <div class="section-title">МойСклад</div>
         <div class="field"><label>Организация</label>{_select("ms_organization_id", orgs)}</div>
         <div class="field"><label>Склад</label>{_select("ms_store_id", ms_stores)}</div>
         <div class="field"><label>Контрагент по умолчанию</label>{_select("ms_agent_id", agents)}</div>
+
         <div class="section-title">Уведомления (необязательно)</div>
         <div class="field"><label>Email</label><input type="email" name="alert_email" placeholder="owner@example.com" /></div>
         <div class="checkbox">
             <input id="alerts_email_enabled" type="checkbox" name="alerts_email_enabled" checked />
             <label for="alerts_email_enabled">Включить email-уведомления</label>
         </div>
+
         <div class="section-title">Фискализация (необязательно)</div>
         <div class="field"><label>Fiscal token</label><input type="text" name="fiscal_token" placeholder="Оставьте пустым если не нужна" /></div>
         <div class="field"><label>Fiscal client UID</label><input type="text" name="fiscal_client_uid" /></div>
         <div class="field"><label>Fiscal device UID</label><input type="text" name="fiscal_device_uid" /></div>
+
         <button type="submit" class="ob-btn">Создать профиль →</button>
     </form>"""
-    return HTMLResponse(_ob_layout("Настройка профиля", body,
+    return HTMLResponse(_ob_layout("Настройка магазина", body,
         back_url=f"/onboarding/evotor/sessions/{session_id}/stores/{store_id}/ms-token"))
 
 
@@ -619,9 +817,20 @@ def onboarding_store_profile_submit(
     fiscal_device_uid: str = Form(""),
 ):
     session = _load_session(session_id)
+    session_store = _get_session_store(session, evotor_store_id)
+    if not session_store:
+        return HTMLResponse(
+            _ob_layout("Ошибка", '<div class="ob-error">Выбранный магазин не найден в сессии. Начните заново.</div>'),
+            status_code=400,
+        )
+
     moysklad_token = session.get("moysklad_token", "").strip()
     if not moysklad_token:
-        return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Сессия истекла. Начните заново.</div>'), status_code=400)
+        return HTMLResponse(
+            _ob_layout("Ошибка", '<div class="ob-error">Сессия истекла. Начните заново.</div>'),
+            status_code=400,
+        )
+
     ms_data = json.loads(session.get("ms_data_json") or "{}")
     if ms_organization_id not in {i["id"] for i in ms_data.get("orgs", [])}:
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Неверная организация.</div>'), status_code=400)
@@ -629,13 +838,18 @@ def onboarding_store_profile_submit(
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Неверный склад.</div>'), status_code=400)
     if ms_agent_id not in {i["id"] for i in ms_data.get("agents", [])}:
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Неверный контрагент.</div>'), status_code=400)
+
+    store_name = _extract_store_name(session_store, evotor_store_id)
+    final_name = (name or "").strip() or store_name
     alert_email_value = alert_email.strip() or None
     alerts_email_enabled_value = 1 if alerts_email_enabled and alert_email_value else 0
     tenant_id = str(uuid.uuid4())
     now = int(time.time())
+
     conn = get_connection()
     try:
         cur = conn.cursor()
+
         cur.execute(aq("SELECT id FROM tenants WHERE evotor_store_id = ?"), (evotor_store_id,))
         existing = cur.fetchone()
         if existing:
@@ -644,33 +858,110 @@ def onboarding_store_profile_submit(
                 f'<p style="margin-top:16px;"><a href="/onboarding/evotor/connect">← Начать сначала</a></p>'
             )
             return HTMLResponse(_ob_layout("Профиль уже существует", body), status_code=409)
+
         cur.execute(
-            aq("""INSERT INTO tenants (id, name, evotor_api_key, moysklad_token, created_at,
-                evotor_token, evotor_store_id, ms_organization_id, ms_store_id, ms_agent_id,
-                alert_email, alerts_email_enabled, telegram_chat_id, alerts_telegram_enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""),
-            (tenant_id, name.strip(), "", moysklad_token, now,
-             session["evotor_token"], evotor_store_id.strip(),
-             ms_organization_id.strip(), ms_store_id.strip(), ms_agent_id.strip(),
-             alert_email_value, alerts_email_enabled_value, None, 0),
+            aq("""
+                INSERT INTO tenants (
+                    id, name, evotor_api_key, moysklad_token, created_at,
+                    evotor_token, evotor_store_id, ms_organization_id, ms_store_id, ms_agent_id,
+                    alert_email, alerts_email_enabled, telegram_chat_id, alerts_telegram_enabled
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """),
+            (
+                tenant_id,
+                final_name,
+                "",
+                moysklad_token,
+                now,
+                session["evotor_token"],
+                evotor_store_id.strip(),
+                ms_organization_id.strip(),
+                ms_store_id.strip(),
+                ms_agent_id.strip(),
+                alert_email_value,
+                alerts_email_enabled_value,
+                None,
+                0,
+            ),
         )
+
+        cur.execute(
+            aq("""
+                INSERT INTO tenant_stores (
+                    id,
+                    tenant_id,
+                    evotor_store_id,
+                    name,
+                    ms_store_id,
+                    ms_organization_id,
+                    ms_agent_id,
+                    is_primary,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT (evotor_store_id) DO UPDATE SET
+                    tenant_id = EXCLUDED.tenant_id,
+                    name = COALESCE(EXCLUDED.name, tenant_stores.name),
+                    ms_store_id = COALESCE(EXCLUDED.ms_store_id, tenant_stores.ms_store_id),
+                    ms_organization_id = COALESCE(EXCLUDED.ms_organization_id, tenant_stores.ms_organization_id),
+                    ms_agent_id = COALESCE(EXCLUDED.ms_agent_id, tenant_stores.ms_agent_id),
+                    is_primary = 1,
+                    updated_at = EXCLUDED.updated_at
+            """),
+            (
+                str(uuid.uuid4()),
+                tenant_id,
+                evotor_store_id.strip(),
+                final_name or None,
+                ms_store_id.strip() or None,
+                ms_organization_id.strip() or None,
+                ms_agent_id.strip() or None,
+                now,
+                now,
+            ),
+        )
+
         if fiscal_token.strip() and fiscal_client_uid.strip() and fiscal_device_uid.strip():
             cur.execute(
                 aq("UPDATE tenants SET fiscal_token=?, fiscal_client_uid=?, fiscal_device_uid=? WHERE id=?"),
                 (fiscal_token.strip(), fiscal_client_uid.strip(), fiscal_device_uid.strip(), tenant_id),
             )
+
         conn.commit()
+
     except Exception as exc:
         conn.rollback()
         log.exception("Failed to create store profile")
         return HTMLResponse(_ob_layout("Ошибка", f'<div class="ob-error">{html.escape(str(exc))}</div>'), status_code=500)
     finally:
         conn.close()
+
     log.info("Starting auto initial sync for tenant_id=%s", tenant_id)
     sync_result = _run_initial_sync(tenant_id)
+
+    tenant_after_sync = _load_tenant(tenant_id)
+    tenant_sync_ts = tenant_after_sync.get("sync_completed_at")
+    if tenant_sync_ts:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                aq("""
+                    UPDATE tenant_stores
+                    SET sync_completed_at = ?, updated_at = ?
+                    WHERE tenant_id = ? AND evotor_store_id = ?
+                """),
+                (tenant_sync_ts, int(time.time()), tenant_id, evotor_store_id.strip()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     sync_html = _render_sync_result(sync_result)
     body = f"""
-    <div class="ob-success"><strong>Профиль создан!</strong></div>
+    <div class="ob-success"><strong>Профиль создан!</strong><br>Магазин: {html.escape(final_name)}</div>
     <div class="section-title">Первичная синхронизация</div>
     {sync_html}
     <hr>
@@ -960,6 +1251,8 @@ def _save_evotor_and_sync(
     fiscal_device_uid: str = "",
 ) -> HTMLResponse:
     now = int(time.time())
+    final_name = (store_name or "").strip() or (tenant.get("name") or "Магазин Эвотор")
+
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -988,6 +1281,36 @@ def _save_evotor_and_sync(
 
         update_values.append(tenant_id)
         cur.execute(aq(f"UPDATE tenants SET {update_fields} WHERE id = ?"), update_values)
+
+        cur.execute(
+            aq("""
+                INSERT INTO tenant_stores (
+                    id, tenant_id, evotor_store_id, name,
+                    ms_store_id, ms_organization_id, ms_agent_id,
+                    is_primary, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT (evotor_store_id) DO UPDATE SET
+                    tenant_id = EXCLUDED.tenant_id,
+                    name = COALESCE(EXCLUDED.name, tenant_stores.name),
+                    ms_store_id = COALESCE(EXCLUDED.ms_store_id, tenant_stores.ms_store_id),
+                    ms_organization_id = COALESCE(EXCLUDED.ms_organization_id, tenant_stores.ms_organization_id),
+                    ms_agent_id = COALESCE(EXCLUDED.ms_agent_id, tenant_stores.ms_agent_id),
+                    is_primary = 1,
+                    updated_at = EXCLUDED.updated_at
+            """),
+            (
+                str(uuid.uuid4()),
+                tenant_id,
+                store_id,
+                final_name,
+                ms_store_id.strip() or None,
+                ms_organization_id.strip() or None,
+                ms_agent_id.strip() or None,
+                now,
+                now,
+            ),
+        )
         conn.commit()
     except Exception as exc:
         conn.rollback()
@@ -999,11 +1322,30 @@ def _save_evotor_and_sync(
 
     log.info("Evotor connected tenant_id=%s store_id=%s", tenant_id, store_id)
     sync_result = _run_initial_sync(tenant_id)
+
+    tenant_after_sync = _load_tenant(tenant_id)
+    tenant_sync_ts = tenant_after_sync.get("sync_completed_at")
+    if tenant_sync_ts:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                aq("""
+                    UPDATE tenant_stores
+                    SET sync_completed_at = ?, updated_at = ?
+                    WHERE tenant_id = ? AND evotor_store_id = ?
+                """),
+                (tenant_sync_ts, int(time.time()), tenant_id, store_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     sync_html = _render_sync_result(sync_result)
 
     body = f"""
     <div class="ob-success"><strong>Эвотор успешно подключён!</strong><br>
-    Магазин: {html.escape(store_name)}</div>
+    Магазин: {html.escape(final_name)}</div>
     <div class="section-title">Первичная синхронизация</div>
     {sync_html}
     <hr>
@@ -1127,17 +1469,41 @@ def lk_overview(tenant_id: str):
             <div class="sync-label" id="syncLabel">Синхронизация...</div>
             <div class="sync-sublabel">Это может занять до 30 секунд</div>
         </div>
-        <style>
-        .sync-overlay { display:none; position:fixed; inset:0; background:rgba(255,255,255,0.8);
-            backdrop-filter:blur(2px); z-index:999; align-items:center; justify-content:center;
-            flex-direction:column; gap:16px; }
-        .sync-overlay.visible { display:flex; }
-        .sync-spinner { width:48px; height:48px; border:4px solid #e4e8f0;
-            border-top-color:#3b6ff5; border-radius:50%; animation:spin 0.8s linear infinite; }
-        @keyframes spin { to { transform:rotate(360deg); } }
-        .sync-label { font-size:15px; font-weight:600; color:#1a1d2e; }
-        .sync-sublabel { font-size:13px; color:#6b7280; }
-        </style>"""
+"""
+
+    # Блок магазинов
+    stores = _load_tenant_stores(tenant_id)
+    if stores:
+        stores_rows = ""
+        for s in stores:
+            sname = html.escape(s.get("name") or s["evotor_store_id"])
+            sid = html.escape(s["evotor_store_id"])
+            sync_ts = _format_ts(s.get("sync_completed_at"))
+            primary_badge = '<span class="badge-ok" style="font-size:11px;margin-left:6px;">основной</span>' if s["is_primary"] else ""
+            sync_badge = f'<span class="badge-ok">Синхр. {sync_ts}</span>' if s.get("sync_completed_at") else '<span class="badge-warn">Не синхронизирован</span>'
+            stores_rows += f"""
+            <div class="lk-row" style="flex-wrap:wrap;gap:8px;">
+                <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0;">
+                    <span class="lk-row-label" style="font-weight:600;">{sname}</span>
+                    {primary_badge}
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;">
+                    {sync_badge}
+                    <a href="/onboarding/tenants/{html.escape(tenant_id)}/stores/{sid}"
+                       class="btn btn-outline" style="padding:4px 12px;font-size:12px;">Управлять →</a>
+                </div>
+            </div>"""
+
+        content += f"""
+    <div class="lk-card">
+        <div class="lk-card-title" style="display:flex;justify-content:space-between;align-items:center;">
+            <span>Магазины</span>
+            <a href="/onboarding/tenants/{html.escape(tenant_id)}/stores"
+               style="font-size:12px;font-weight:500;color:#3b6ff5;text-decoration:none;">Все магазины →</a>
+        </div>
+        {stores_rows}
+    </div>"""
+
     return _lk_layout(tenant, "overview", content)
 
 
@@ -1284,93 +1650,14 @@ def onboarding_tenant_email_update(
 # ---------------------------------------------------------------------------
 
 @router.get("/onboarding/tenants/{tenant_id}/actions", response_class=HTMLResponse)
-def lk_actions(tenant_id: str):
+def lk_actions(tenant_id: str, msg: str | None = None, err: str | None = None):
     tenant = _load_tenant(tenant_id)
     tid = html.escape(tenant_id)
 
     content = f"""
     <style>
-    .tooltip-wrap {{ position: relative; display: inline-block; }}
-    .tooltip-btn {{
-        background: none; border: none; cursor: pointer;
-        color: #9ca3af; font-size: 15px; padding: 0 4px;
-        vertical-align: middle; line-height: 1;
-        transition: color 0.15s;
-    }}
-    .tooltip-btn:hover {{ color: #3b6ff5; }}
-    .tooltip-popup {{
-        display: none;
-        position: absolute;
-        bottom: calc(100% + 8px);
-        left: 50%;
-        transform: translateX(-50%);
-        background: #1a1d2e;
-        color: #fff;
-        font-size: 13px;
-        line-height: 1.5;
-        padding: 10px 14px;
-        border-radius: 8px;
-        width: 260px;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.2);
-        z-index: 100;
-        pointer-events: none;
-    }}
-    .tooltip-popup::after {{
-        content: '';
-        position: absolute;
-        top: 100%;
-        left: 50%;
-        transform: translateX(-50%);
-        border: 6px solid transparent;
-        border-top-color: #1a1d2e;
-    }}
-    .tooltip-wrap:hover .tooltip-popup {{ display: block; }}
-    .action-row {{
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }}
-    .action-row form {{ flex: 1; }}
-    .action-row .btn-ghost {{ width: 100%; }}
-    
-    .btn-ghost:disabled {{
-        opacity: 0.6;
-        cursor: not-allowed;
-        pointer-events: none;
-    }}
-    .btn-ghost.loading::after {{
-        content: ' ⏳';
-    }}
-    .sync-overlay {{
-        display: none;
-        position: fixed;
-        inset: 0;
-        background: rgba(255,255,255,0.8);
-        backdrop-filter: blur(2px);
-        z-index: 999;
-        align-items: center;
-        justify-content: center;
-        flex-direction: column;
-        gap: 16px;
-    }}
-    .sync-overlay.visible {{ display: flex; }}
-    .sync-spinner {{
-        width: 48px; height: 48px;
-        border: 4px solid #e4e8f0;
-        border-top-color: #3b6ff5;
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-    }}
-    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-    .sync-label {{
-        font-size: 15px;
-        font-weight: 600;
-        color: #1a1d2e;
-    }}
-    .sync-sublabel {{
-        font-size: 13px;
-        color: #6b7280;
-    }}
+    .btn-ghost:disabled {{ opacity: 0.6; cursor: not-allowed; pointer-events: none; }}
+    .btn-ghost.loading::after {{ content: ' ⏳'; }}
     .confirm-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.4);
         z-index:1000; align-items:center; justify-content:center; }}
     .confirm-overlay.visible {{ display:flex; }}
@@ -1482,8 +1769,6 @@ def lk_actions(tenant_id: str):
                 if (_pendingForm) {{
                     var overlay = document.getElementById('syncOverlay');
                     if (overlay) overlay.classList.add('visible');
-                    var action = _pendingForm.getAttribute('action');
-                    var method = _pendingForm.getAttribute('method') || 'post';
                     setTimeout(function() {{
                         _pendingForm.submit();
                     }}, 50);
@@ -1498,10 +1783,9 @@ def lk_actions(tenant_id: str):
         }}
     }});
     </script>
-    </div>"""
+    """
 
-    return _lk_layout(tenant, "actions", content)
-
+    return _lk_layout(tenant, "actions", content, info_message=msg, error_message=err)
 
 # ---------------------------------------------------------------------------
 # Telegram linking
@@ -1639,43 +1923,76 @@ def onboarding_tenant_token_submit(tenant_id: str, moysklad_token: str = Form(..
 
 @router.post("/onboarding/tenants/{tenant_id}/sync", response_class=HTMLResponse)
 def onboarding_tenant_sync(tenant_id: str):
+    from app.stores.mapping_store import MappingStore
+    from urllib.parse import quote_plus
+    # Сбрасываем sync для всех магазинов
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute(aq("UPDATE tenants SET sync_completed_at=NULL WHERE id=?"), (tenant_id,))
+        cur.execute(aq("UPDATE tenants SET sync_completed_at = NULL WHERE id = ?"), (tenant_id,))
+        cur.execute(
+            aq("UPDATE tenant_stores SET sync_completed_at = NULL, updated_at = ? WHERE tenant_id = ?"),
+            (int(time.time()), tenant_id),
+        )
         conn.commit()
     finally:
         conn.close()
+    # Сбрасываем маппинги всех магазинов
+    stores = _load_tenant_stores(tenant_id)
+    ms_store = MappingStore()
+    for store in stores:
+        deleted = ms_store.delete_by_store(tenant_id, store["evotor_store_id"])
+        log.info("tenant_sync: deleted %d mappings store=%s", deleted, store["evotor_store_id"])
+    # Запускаем синхронизацию
     result = _run_initial_sync(tenant_id)
-    tenant = _load_tenant(tenant_id)
     synced = result.get("synced", 0)
     failed = result.get("failed", 0)
-    msg = f"Синхронизация завершена: {synced} новых товаров, {failed} ошибок."
+    msg = f"Синхронизация завершена: новых товаров — {synced}, ошибок — {failed}."
     if failed > 0:
-        return _lk_layout(tenant, "actions", "", error_message=msg)
-    return _lk_layout(tenant, "actions", "", info_message=msg)
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(msg)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        url=f"/onboarding/tenants/{tenant_id}/actions?msg={quote_plus(msg)}",
+        status_code=303,
+    )
 
 
 @router.post("/onboarding/tenants/{tenant_id}/reconcile", response_class=HTMLResponse)
 def onboarding_tenant_reconcile(tenant_id: str):
     from app.clients.evotor_client import EvotorClient
     from app.clients.moysklad_client import MoySkladClient
+
     tenant = _load_tenant(tenant_id)
     if not tenant.get("sync_completed_at"):
-        return _lk_layout(tenant, "actions", "", error_message="Сначала выполните первичную синхронизацию.")
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus('Сначала выполните первичную синхронизацию.')}",
+            status_code=303,
+        )
+
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute(aq("SELECT evotor_id, ms_id FROM mappings WHERE tenant_id=? AND entity_type='product'"), (tenant_id,))
+        cur.execute(
+            aq("SELECT evotor_id, ms_id FROM mappings WHERE tenant_id=? AND entity_type='product'"),
+            (tenant_id,),
+        )
         mappings = cur.fetchall()
     finally:
         conn.close()
+
     if not mappings:
-        return _lk_layout(tenant, "actions", "", error_message="Нет маппингов товаров.")
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus('Нет маппингов товаров.')}",
+            status_code=303,
+        )
+
     ms_client = MoySkladClient(tenant_id)
     evotor_client = EvotorClient(tenant_id)
     synced = 0
     failed = 0
+
     for row in mappings:
         try:
             quantity = ms_client.get_product_stock(row["ms_id"])
@@ -1684,24 +2001,655 @@ def onboarding_tenant_reconcile(tenant_id: str):
         except Exception as e:
             log.error("reconcile stock failed ms_id=%s err=%s", row["ms_id"], e)
             failed += 1
-    tenant = _load_tenant(tenant_id)
-    msg = f"Остатки синхронизированы: {synced} товаров, {failed} ошибок."
+
+    msg = f"Остатки синхронизированы: товаров — {synced}, ошибок — {failed}."
     if failed > 0:
-        return _lk_layout(tenant, "actions", "", error_message=msg)
-    return _lk_layout(tenant, "actions", "", info_message=msg)
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(msg)}",
+            status_code=303,
+        )
+
+    return RedirectResponse(
+        url=f"/onboarding/tenants/{tenant_id}/actions?msg={quote_plus(msg)}",
+        status_code=303,
+    )
 
 @router.post("/onboarding/tenants/{tenant_id}/sync-ms-to-evotor", response_class=HTMLResponse)
 def onboarding_tenant_sync_ms_to_evotor(tenant_id: str):
-    from app.api.sync import sync_all_ms_products_to_evotor
-    try:
-        result = sync_all_ms_products_to_evotor(tenant_id)
-    except Exception as e:
-        tenant = _load_tenant(tenant_id)
-        return _lk_layout(tenant, "actions", "", error_message=f"Ошибка: {e}")
+    from app.api.sync import sync_ms_to_evotor_store
+    from urllib.parse import quote_plus
+    stores = _load_tenant_stores(tenant_id)
+    total_synced = total_failed = 0
+    for store in stores:
+        try:
+            result = sync_ms_to_evotor_store(tenant_id, store["evotor_store_id"])
+            total_synced += result.get("synced", 0)
+            total_failed += result.get("failed", 0)
+        except Exception as e:
+            log.error("sync_ms_to_evotor store=%s err=%s", store["evotor_store_id"], e)
+            total_failed += 1
+    msg = f"МС→Эвотор: добавлено/обновлено — {total_synced}, ошибок — {total_failed}."
+    if total_failed > 0:
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(msg)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        url=f"/onboarding/tenants/{tenant_id}/actions?msg={quote_plus(msg)}",
+        status_code=303,
+    )
+
+
+@router.get("/onboarding/tenants/{tenant_id}/stores", response_class=HTMLResponse)
+def lk_stores(tenant_id: str, msg: str | None = None, err: str | None = None):
+    _ensure_primary_store_row(tenant_id)
     tenant = _load_tenant(tenant_id)
-    synced = result.get("synced", 0)
-    failed = result.get("failed", 0)
-    msg = f"Синхронизация МС→Эвотор: {synced} товаров, {failed} ошибок."
-    if failed > 0:
-        return _lk_layout(tenant, "actions", "", error_message=msg)
-    return _lk_layout(tenant, "actions", "", info_message=msg)
+    stores = _load_tenant_stores(tenant_id)
+    tid = html.escape(tenant_id)
+
+    # Загружаем данные МойСклад
+    ms_orgs = []
+    ms_stores_list = []
+    ms_agents = []
+    ms_load_error = ""
+    ms_store_name_map = {}
+
+    if tenant.get("moysklad_token"):
+        try:
+            ms_orgs, ms_stores_list, ms_agents = _ms_fetch_all(tenant["moysklad_token"])
+            ms_store_name_map = {
+                str(item["id"]): item["name"]
+                for item in ms_stores_list
+                if item.get("id")
+            }
+        except Exception as e:
+            ms_load_error = str(e)
+
+    # Загружаем магазины Эвотор
+    evotor_available_stores = []
+    evotor_load_error = ""
+    evotor_name_map = {}
+
+    try:
+        evotor_token = (tenant.get("evotor_token") or tenant.get("evotor_api_key") or "").strip()
+        if evotor_token:
+            raw_evotor_stores = fetch_stores_by_token(evotor_token) or []
+
+            linked_ids = {
+                str(row.get("evotor_store_id") or "").strip()
+                for row in stores
+                if row.get("evotor_store_id")
+            }
+
+            for item in raw_evotor_stores:
+                store_id = _extract_store_id(item)
+                if not store_id:
+                    continue
+
+                store_name = _extract_store_name(item, store_id)
+                evotor_name_map[store_id] = store_name
+
+                if store_id not in linked_ids:
+                    evotor_available_stores.append({
+                        "id": store_id,
+                        "name": store_name,
+                    })
+    except Exception as e:
+        log.exception("Failed to load Evotor stores for tenant_id=%s", tenant_id)
+        evotor_load_error = str(e)
+
+    # Карточки уже привязанных магазинов
+    rows_parts = []
+    for s in stores:
+        sid_raw = s["evotor_store_id"]
+        sid = html.escape(sid_raw)
+
+        store_display_name = html.escape(
+            s.get("name")
+            or evotor_name_map.get(sid_raw)
+            or "Магазин Эвотор"
+        )
+
+        ms_store_display = html.escape(
+            ms_store_name_map.get(str(s.get("ms_store_id") or ""), "Склад не выбран")
+        )
+
+        sync_ts = _format_ts(s.get("sync_completed_at"))
+        primary_badge = (
+            '<span class="badge-ok" style="font-size:11px;margin-left:6px;">основной</span>'
+            if s["is_primary"] else ""
+        )
+        sync_badge = (
+            f'<span class="badge-ok">Синхронизирован {sync_ts}</span>'
+            if s.get("sync_completed_at")
+            else '<span class="badge-warn">Не синхронизирован</span>'
+        )
+
+        rows_parts.append(
+            '<div class="lk-card" style="margin-bottom:12px;">'
+            '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;">'
+            '<div>'
+            f'<div style="font-size:15px;font-weight:700;color:#1a1d2e;">{store_display_name}{primary_badge}</div>'
+            f'<div style="font-size:12px;color:#9ca3af;margin-top:2px;">Склад МойСклад: {ms_store_display}</div>'
+            '</div>'
+            '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
+            f'{sync_badge}'
+            f'<a href="/onboarding/tenants/{tid}/stores/{sid}" class="btn btn-primary" style="padding:6px 14px;font-size:13px;">Управлять &rarr;</a>'
+            '</div></div></div>'
+        )
+
+    rows_html = ''.join(rows_parts)
+
+    def build_select(field_name, items, placeholder):
+        if not items:
+            return f'<input class="form-input" name="{field_name}" placeholder="{placeholder}" />'
+
+        options = '<option value="">— выберите —</option>'
+        for item in items:
+            item_id = html.escape(item["id"])
+            item_name = html.escape(item["name"])
+            options += f'<option value="{item_id}">{item_name}</option>'
+
+        return f'<select class="form-input" name="{field_name}">{options}</select>'
+
+    def build_evotor_store_select(items):
+        if not items:
+            return (
+                '<div class="form-hint" style="color:#92400e;">'
+                'Нет доступных магазинов Эвотор для привязки. Возможно, все магазины уже добавлены.'
+                '</div>'
+            )
+
+        options = '<option value="">— выберите магазин —</option>'
+        for item in items:
+            sid = html.escape(item["id"])
+            sname = html.escape(item["name"])
+            options += f'<option value="{sid}" data-store-name="{sname}">{sname}</option>'
+
+        return (
+            '<select class="form-input" name="evotor_store_id" id="evotor_store_id" required '
+            'onchange="document.getElementById(\'store_name_input\').value=this.options[this.selectedIndex].dataset.storeName || \'\';">'
+            + options +
+            '</select>'
+        )
+
+    ms_error_html = (
+        f'<div class="alert-box alert-warning">Не удалось загрузить данные МойСклад: {html.escape(ms_load_error)}</div>'
+        if ms_load_error else ""
+    )
+
+    evotor_error_html = (
+        f'<div class="alert-box alert-warning">Не удалось загрузить магазины Эвотор: {html.escape(evotor_load_error)}</div>'
+        if evotor_load_error else ""
+    )
+
+    add_form_parts = [
+        '<div class="lk-card" id="addStoreCard" style="margin-top:8px;display:none;">',
+        '<div class="lk-card-title">Добавить магазин</div>',
+        evotor_error_html,
+        ms_error_html,
+        f'<form method="post" action="/onboarding/tenants/{tid}/stores/add">',
+        '<div style="display:flex;flex-direction:column;gap:12px;">',
+
+        '<div class="form-field">',
+        '<label class="form-label">Магазин Эвотор <span style="color:#dc2626;">*</span></label>',
+        build_evotor_store_select(evotor_available_stores),
+        '<span class="form-hint">Показываются магазины, доступные по токену этого тенанта и ещё не привязанные в системе</span>',
+        '</div>',
+
+        '<div class="form-field">',
+        '<label class="form-label">Название магазина</label>',
+        '<input class="form-input" id="store_name_input" name="name" placeholder="Название подтянется автоматически" />',
+        '<span class="form-hint">Можно оставить как есть или изменить вручную</span>',
+        '</div>',
+
+        '<div class="form-field">',
+        '<label class="form-label">Организация МойСклад</label>',
+        build_select("ms_organization_id", ms_orgs, "UUID организации"),
+        '</div>',
+
+        '<div class="form-field">',
+        '<label class="form-label">Склад МойСклад</label>',
+        build_select("ms_store_id", ms_stores_list, "UUID склада"),
+        '</div>',
+
+        '<div class="form-field">',
+        '<label class="form-label">Контрагент по умолчанию</label>',
+        build_select("ms_agent_id", ms_agents, "UUID контрагента"),
+        '</div>',
+
+        '<div style="display:flex;align-items:center;gap:10px;">',
+        '<input type="checkbox" name="is_primary" id="is_primary_new" style="width:auto;cursor:pointer;" />',
+        '<label for="is_primary_new" style="font-size:14px;color:#374151;cursor:pointer;">Сделать основным магазином</label>',
+        '</div>',
+
+        '<div style="display:flex;gap:10px;margin-top:4px;">',
+        '<button type="submit" class="btn btn-primary">Добавить магазин</button>',
+        '<button type="button" class="btn btn-outline" onclick="document.getElementById(\'addStoreCard\').style.display=\'none\';document.getElementById(\'addStoreBtn\').style.display=\'\';">Отмена</button>',
+        '</div>',
+
+        '</div></form></div>',
+    ]
+    add_form = ''.join(add_form_parts)
+
+    add_btn = (
+        '<button id="addStoreBtn" class="btn btn-primary" '
+        'onclick="this.style.display=\'none\';document.getElementById(\'addStoreCard\').style.display=\'\';">'
+        'Добавить магазин &rarr;</button>'
+    )
+
+    content = (
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">'
+        f'<div style="font-size:13px;color:#6b7280;">Всего магазинов: {len(stores)}</div>'
+        + add_btn +
+        '</div>'
+        + rows_html
+        + add_form
+    )
+
+    return _lk_layout(tenant, "stores", content, info_message=msg, error_message=err)
+
+
+@router.get("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}", response_class=HTMLResponse)
+def lk_store_detail(
+    tenant_id: str,
+    evotor_store_id: str,
+    msg: str | None = None,
+    err: str | None = None,
+):
+    _ensure_primary_store_row(tenant_id)
+    tenant = _load_tenant(tenant_id)
+    stores = _load_tenant_stores(tenant_id)
+    store = next((s for s in stores if s["evotor_store_id"] == evotor_store_id), None)
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    tid = html.escape(tenant_id)
+    sid = html.escape(evotor_store_id)
+    sync_ok = bool(store.get("sync_completed_at"))
+
+    ms_store_name_map = {}
+    ms_org_name_map = {}
+    ms_agent_name_map = {}
+
+    if tenant.get("moysklad_token"):
+        try:
+            ms_orgs, ms_stores_list, ms_agents = _ms_fetch_all(tenant["moysklad_token"])
+            ms_store_name_map = {
+                str(item["id"]): item["name"]
+                for item in ms_stores_list
+                if item.get("id")
+            }
+            ms_org_name_map = {
+                str(item["id"]): item["name"]
+                for item in ms_orgs
+                if item.get("id")
+            }
+            ms_agent_name_map = {
+                str(item["id"]): item["name"]
+                for item in ms_agents
+                if item.get("id")
+            }
+        except Exception as e:
+            log.warning("Failed to load MS names for store detail tenant_id=%s err=%s", tenant_id, e)
+
+    evotor_name_map = {}
+    try:
+        evotor_token = (tenant.get("evotor_token") or tenant.get("evotor_api_key") or "").strip()
+        if evotor_token:
+            raw_evotor_stores = fetch_stores_by_token(evotor_token) or []
+            for item in raw_evotor_stores:
+                store_id = _extract_store_id(item)
+                if store_id:
+                    evotor_name_map[store_id] = _extract_store_name(item, store_id)
+    except Exception as e:
+        log.warning("Failed to load Evotor names for store detail tenant_id=%s err=%s", tenant_id, e)
+
+    store_display_name = html.escape(
+        store.get("name")
+        or evotor_name_map.get(evotor_store_id)
+        or "Магазин Эвотор"
+    )
+
+    ms_store_display = html.escape(
+        ms_store_name_map.get(str(store.get("ms_store_id") or ""), "Склад не выбран")
+    )
+    ms_org_display = html.escape(
+        ms_org_name_map.get(str(store.get("ms_organization_id") or ""), "Организация не выбрана")
+    )
+    ms_agent_display = html.escape(
+        ms_agent_name_map.get(str(store.get("ms_agent_id") or ""), "Контрагент не выбран")
+    )
+
+    store_switcher = ""
+    if len(stores) > 1:
+        options_parts = []
+        for s in stores:
+            option_value = html.escape(s["evotor_store_id"])
+            option_name = html.escape(
+                s.get("name")
+                or evotor_name_map.get(s["evotor_store_id"])
+                or "Магазин Эвотор"
+            )
+            selected = ' selected' if s["evotor_store_id"] == evotor_store_id else ""
+            options_parts.append(
+                f'<option value="{option_value}"{selected}>{option_name}</option>'
+            )
+
+        store_switcher = (
+            '<div style="margin-bottom:20px;">'
+            '<label style="font-size:13px;font-weight:600;color:#374151;display:block;margin-bottom:6px;">Магазин</label>'
+            f'<select data-base="/onboarding/tenants/{tid}/stores/" '
+            'onchange="window.location=this.dataset.base + this.value" '
+            'style="padding:8px 12px;border:1.5px solid #e4e8f0;border-radius:8px;font-size:14px;'
+            'font-family:inherit;color:#1a1d2e;background:#fff;cursor:pointer;width:100%;max-width:400px;">'
+            + ''.join(options_parts) +
+            '</select></div>'
+        )
+
+    set_primary_btn = ""
+    if not store["is_primary"]:
+        set_primary_btn = (
+            '<div class="action-row">'
+            f'<form method="post" action="/onboarding/tenants/{tid}/stores/{sid}/set-primary">'
+            '<button type="submit" class="btn btn-ghost">Сделать основным магазином</button>'
+            '</form>'
+            '<div class="tooltip-wrap"><button class="tooltip-btn">?</button>'
+            '<div class="tooltip-popup">Назначает этот магазин основным для тенанта.</div>'
+            '</div></div>'
+        )
+
+    content_parts = [
+        f'<a href="/onboarding/tenants/{tid}/stores" '
+        'style="display:inline-flex;align-items:center;gap:6px;font-size:13px;'
+        'color:#6b7280;text-decoration:none;margin-bottom:20px;">&larr; Все магазины</a>',
+        store_switcher,
+
+        '<div class="lk-card">',
+        '<div class="lk-card-title">Статус магазина</div>',
+
+        '<div class="lk-row"><span class="lk-row-label">Магазин</span>'
+        f'<span class="lk-row-value">{store_display_name}</span></div>',
+
+        '<div class="lk-row"><span class="lk-row-label">Организация МойСклад</span>'
+        f'<span class="lk-row-value">{ms_org_display}</span></div>',
+
+        '<div class="lk-row"><span class="lk-row-label">Склад МойСклад</span>'
+        f'<span class="lk-row-value">{ms_store_display}</span></div>',
+
+        '<div class="lk-row"><span class="lk-row-label">Контрагент по умолчанию</span>'
+        f'<span class="lk-row-value">{ms_agent_display}</span></div>',
+
+        '<div class="lk-row"><span class="lk-row-label">Первичная синхронизация</span>'
+        + _badge(sync_ok, "Выполнена " + _format_ts(store.get("sync_completed_at")), "Не выполнена")
+        + '</div>',
+
+        '<div class="lk-row"><span class="lk-row-label">Основной магазин</span>'
+        + _badge(bool(store["is_primary"]), "Да", "Нет")
+        + '</div>',
+
+        '</div>',
+
+        '<div class="lk-card">',
+        '<div class="lk-card-title">Действия</div>',
+        '<div class="actions-list">',
+
+        '<div class="action-row">'
+        f'<form method="post" action="/onboarding/tenants/{tid}/stores/{sid}/sync">'
+        '<button type="submit" class="btn btn-ghost">Повторная синхронизация товаров</button>'
+        '</form>'
+        '<div class="tooltip-wrap"><button class="tooltip-btn">?</button>'
+        '<div class="tooltip-popup">Пересоздаёт маппинг товаров для этого магазина.</div>'
+        '</div></div>',
+
+        '<div class="action-row">'
+        f'<form method="post" action="/onboarding/tenants/{tid}/stores/{sid}/reconcile">'
+        '<button type="submit" class="btn btn-ghost">Синхронизировать остатки</button>'
+        '</form>'
+        '<div class="tooltip-wrap"><button class="tooltip-btn">?</button>'
+        '<div class="tooltip-popup">Обновляет остатки в этом магазине из МойСклад.</div>'
+        '</div></div>',
+
+        '<div class="action-row">'
+        f'<form method="post" action="/onboarding/tenants/{tid}/stores/{sid}/sync-ms-to-evotor">'
+        '<button type="submit" class="btn btn-ghost">Синхронизировать новые товары из МойСклад</button>'
+        '</form>'
+        '<div class="tooltip-wrap"><button class="tooltip-btn">?</button>'
+        '<div class="tooltip-popup">Создаёт в этом магазине товары, добавленные в МойСклад.</div>'
+        '</div></div>',
+
+        set_primary_btn,
+
+        '</div></div>',
+
+        '<div class="sync-overlay" id="syncOverlay">',
+        '<div class="sync-spinner"></div>',
+        '<div class="sync-label" id="syncLabel">Синхронизация...</div>',
+        '<div class="sync-sublabel">Это может занять до 30 секунд</div>',
+        '</div>',
+
+        '<script>'
+        'document.querySelectorAll(".action-row form").forEach(function(form){'
+        'form.addEventListener("submit",function(){'
+        'var btn=form.querySelector("button");'
+        'var label=btn?btn.textContent.trim():"Синхронизация";'
+        'if(btn){btn.disabled=true;}'
+        'document.getElementById("syncLabel").textContent=label+"...";'
+        'document.getElementById("syncOverlay").classList.add("visible");'
+        '});'
+        '});'
+        '</script>',
+    ]
+
+    content = ''.join(content_parts)
+
+    return _lk_layout(tenant, "stores", content, info_message=msg, error_message=err)
+
+
+@router.post("/onboarding/tenants/{tenant_id}/stores/add", response_class=HTMLResponse)
+def store_add(
+    tenant_id: str,
+    evotor_store_id: str = Form(...),
+    name: str = Form(""),
+    ms_store_id: str = Form(""),
+    ms_organization_id: str = Form(""),
+    ms_agent_id: str = Form(""),
+    is_primary: bool = Form(False),
+):
+    tenant = _load_tenant(tenant_id)
+    evotor_store_id = evotor_store_id.strip()
+    if not evotor_store_id:
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores?err=Магазин+Эвотор+обязателен",
+            status_code=303,
+        )
+
+    evotor_token = (tenant.get("evotor_token") or tenant.get("evotor_api_key") or "").strip()
+    if not evotor_token:
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores?err=Сначала+подключите+Эвотор",
+            status_code=303,
+        )
+
+    allowed_store_map = {}
+    try:
+        raw_evotor_stores = fetch_stores_by_token(evotor_token) or []
+        for item in raw_evotor_stores:
+            sid = _extract_store_id(item)
+            if sid:
+                allowed_store_map[sid] = _extract_store_name(item, sid)
+    except Exception as e:
+        log.exception("store_add failed to load Evotor stores tenant_id=%s", tenant_id)
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores?err=Не+удалось+загрузить+магазины+Эвотор",
+            status_code=303,
+        )
+
+    if evotor_store_id not in allowed_store_map:
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores?err=Выбранный+магазин+недоступен+для+этого+тенанта",
+            status_code=303,
+        )
+
+    final_name = (name or "").strip() or allowed_store_map[evotor_store_id]
+
+    import uuid as _uuid_mod
+    now = int(time.time())
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("SELECT tenant_id FROM tenant_stores WHERE evotor_store_id = ?"),
+            (evotor_store_id,),
+        )
+        existing = cur.fetchone()
+        if existing and existing["tenant_id"] != tenant_id:
+            return RedirectResponse(
+                url=f"/onboarding/tenants/{tenant_id}/stores?err=Магазин+уже+привязан+к+другому+тенанту",
+                status_code=303,
+            )
+
+        if is_primary:
+            cur.execute(
+                aq("UPDATE tenant_stores SET is_primary = 0 WHERE tenant_id = ?"),
+                (tenant_id,),
+            )
+
+        cur.execute(
+            aq("SELECT COUNT(*) as cnt FROM tenant_stores WHERE tenant_id = ?"),
+            (tenant_id,),
+        )
+        count = cur.fetchone()["cnt"]
+        final_primary = 1 if (is_primary or count == 0) else 0
+
+        sql = (
+            "INSERT INTO tenant_stores "
+            "(id, tenant_id, evotor_store_id, name, ms_store_id, "
+            "ms_organization_id, ms_agent_id, is_primary, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (evotor_store_id) DO UPDATE SET "
+            "tenant_id = EXCLUDED.tenant_id, "
+            "name = COALESCE(EXCLUDED.name, tenant_stores.name), "
+            "ms_store_id = COALESCE(EXCLUDED.ms_store_id, tenant_stores.ms_store_id), "
+            "ms_organization_id = COALESCE(EXCLUDED.ms_organization_id, tenant_stores.ms_organization_id), "
+            "ms_agent_id = COALESCE(EXCLUDED.ms_agent_id, tenant_stores.ms_agent_id), "
+            "is_primary = EXCLUDED.is_primary, "
+            "updated_at = EXCLUDED.updated_at"
+        )
+
+        cur.execute(
+            aq(sql),
+            (
+                str(_uuid_mod.uuid4()),
+                tenant_id,
+                evotor_store_id,
+                final_name or None,
+                ms_store_id.strip() or None,
+                ms_organization_id.strip() or None,
+                ms_agent_id.strip() or None,
+                final_primary,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        log.exception("store_add failed tenant_id=%s", tenant_id)
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores?err=Ошибка+при+сохранении+магазина",
+            status_code=303,
+        )
+    finally:
+        conn.close()
+
+    return RedirectResponse(
+        url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg=Магазин+добавлен",
+        status_code=303,
+    )
+
+
+@router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/sync", response_class=HTMLResponse)
+def store_sync(tenant_id: str, evotor_store_id: str):
+    from app.api.sync import initial_sync_store
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("UPDATE tenant_stores SET sync_completed_at = NULL, updated_at = ? WHERE tenant_id = ? AND evotor_store_id = ?"),
+            (int(time.time()), tenant_id, evotor_store_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    try:
+        result = initial_sync_store(tenant_id, evotor_store_id)
+        synced = result.get("synced", 0)
+        failed = result.get("failed", 0)
+        msg = f"Синхронизация завершена: {synced} товаров, {failed} ошибок."
+        if failed > 0:
+            return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={msg}", status_code=303)
+        return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={e}", status_code=303)
+
+
+@router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/reconcile", response_class=HTMLResponse)
+def store_reconcile(tenant_id: str, evotor_store_id: str):
+    from app.api.sync import reconcile_stock_store
+    try:
+        result = reconcile_stock_store(tenant_id, evotor_store_id)
+        synced = result.get("synced", 0)
+        failed = result.get("failed", 0)
+        msg = f"Остатки синхронизированы: {synced} товаров, {failed} ошибок."
+        if failed > 0:
+            return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={msg}", status_code=303)
+        return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={e}", status_code=303)
+
+
+@router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/sync-ms-to-evotor", response_class=HTMLResponse)
+def store_sync_ms_to_evotor(tenant_id: str, evotor_store_id: str):
+    from app.api.sync import sync_ms_to_evotor_store
+
+    try:
+        result = sync_ms_to_evotor_store(tenant_id, evotor_store_id)
+        synced = result.get("synced", 0)
+        failed = result.get("failed", 0)
+        deleted = result.get("deleted", 0)
+        msg = f"МС→Эвотор: добавлено/обновлено — {synced}, удалено — {deleted}, ошибок — {failed}."
+
+        if failed > 0:
+            return RedirectResponse(
+                url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={msg}",
+                status_code=303,
+            )
+
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={msg}",
+            status_code=303,
+        )
+    except Exception as e:
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={e}",
+            status_code=303,
+        )
+
+@router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/set-primary", response_class=HTMLResponse)
+def store_set_primary(tenant_id: str, evotor_store_id: str):
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(aq("UPDATE tenant_stores SET is_primary = 0 WHERE tenant_id = ?"), (tenant_id,))
+        cur.execute(
+            aq("UPDATE tenant_stores SET is_primary = 1, updated_at = ? WHERE tenant_id = ? AND evotor_store_id = ?"),
+            (int(time.time()), tenant_id, evotor_store_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse(
+        url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg=Магазин назначен основным",
+        status_code=303,
+    )

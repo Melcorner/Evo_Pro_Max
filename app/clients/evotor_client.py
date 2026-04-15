@@ -10,31 +10,68 @@ EVOTOR_BASE = "https://api.evotor.ru"
 
 class EvotorClient:
 
-    def __init__(self, tenant_id: str):
+    def __init__(self, tenant_id: str, store_id: str | None = None):
+        """
+        store_id — конкретный магазин из tenant_stores.
+        Если не передан — берётся primary магазин тенанта.
+        """
         self.tenant_id = tenant_id
-        self.token, self.store_id = self._load_config()
+        self.token, self.store_id = self._load_config(store_id)
 
-    def _load_config(self):
+    def _load_config(self, store_id: str | None):
         conn = get_connection()
         cur = conn.cursor()
+
+        # Загружаем токен из tenants
         cur.execute(
-            aq("""
-            SELECT evotor_token, evotor_store_id
-            FROM tenants WHERE id = ?
-            """),
+            aq("SELECT evotor_token FROM tenants WHERE id = ?"),
             (self.tenant_id,),
         )
         row = cur.fetchone()
-        conn.close()
-
         if not row:
+            conn.close()
             raise Exception(f"Tenant not found: {self.tenant_id}")
         if not row["evotor_token"]:
+            conn.close()
             raise Exception(f"evotor_token not configured for tenant {self.tenant_id}")
-        if not row["evotor_store_id"]:
-            raise Exception(f"evotor_store_id not configured for tenant {self.tenant_id}")
+        token = row["evotor_token"]
 
-        return row["evotor_token"], row["evotor_store_id"]
+        # Загружаем store_id
+        if store_id:
+            # Проверяем что магазин принадлежит тенанту
+            cur.execute(
+                aq("SELECT evotor_store_id FROM tenant_stores WHERE tenant_id = ? AND evotor_store_id = ?"),
+                (self.tenant_id, store_id),
+            )
+            store_row = cur.fetchone()
+            conn.close()
+            if not store_row:
+                raise Exception(f"Store {store_id} not found for tenant {self.tenant_id}")
+            return token, store_id
+        else:
+            # Берём primary магазин из tenant_stores
+            cur.execute(
+                aq("""
+                SELECT evotor_store_id FROM tenant_stores
+                WHERE tenant_id = ? AND is_primary = 1
+                ORDER BY created_at ASC LIMIT 1
+                """),
+                (self.tenant_id,),
+            )
+            store_row = cur.fetchone()
+            if store_row:
+                conn.close()
+                return token, store_row["evotor_store_id"]
+            # Fallback: старая колонка tenants.evotor_store_id
+            cur.execute(
+                aq("SELECT evotor_store_id FROM tenants WHERE id = ?"),
+                (self.tenant_id,),
+            )
+            fallback = cur.fetchone()
+            conn.close()
+            if not fallback or not fallback["evotor_store_id"]:
+                raise Exception(f"evotor_store_id not configured for tenant {self.tenant_id}")
+            return token, fallback["evotor_store_id"]
 
     def _headers(self):
         return {"Authorization": f"Bearer {self.token}"}
