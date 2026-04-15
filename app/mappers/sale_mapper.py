@@ -151,7 +151,7 @@ def _extract_vat_fields(item: dict) -> dict:
         rounded = int(round(raw_tax_percent))
         if rounded == 0:
             return {"vat": 0, "vatEnabled": False}
-        if rounded in (10, 20):
+        if rounded in (10, 20, 22):
             return {"vat": rounded, "vatEnabled": True}
         log.warning(f"Unsupported Evotor taxPercent={raw_tax_percent}")
         return {}

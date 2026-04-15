@@ -302,31 +302,31 @@ def _map_ms_tracking_type_to_evotor_type(ms_product: dict, current_type: str | N
         "MILK":           "DAIRY_MARKED",
         "TOBACCO":        "TOBACCO_MARKED",
         "SHOES":          "SHOES_MARKED",
-        "LP_CLOTHES":     "CLOTHES_MARKED",
-        "LP_LINENS":      "LINENS_MARKED",
-        "PERFUMERY":      "PERFUMERY_MARKED",
-        "ELECTRONICS":    "ELECTRONICS_MARKED",
-        "TIRES":          "TIRES_MARKED",
-        "CAMERA_PHOTO":   "CAMERA_MARKED",
+        "LP_CLOTHES":     "LIGHT_INDUSTRY_MARKED",
+        "LP_LINENS":      "LIGHT_INDUSTRY_MARKED",
+        "PERFUMERY":      "PERFUME_MARKED",
+        "ELECTRONICS":    "RADIO_MARKED",
+        "TIRES":          "TYRES_MARKED",
+        "CAMERA_PHOTO":   "PHOTOS_MARKED",
         "WATER":          "WATER_MARKED",
-        "OTP":            "OTP_MARKED",
-        "BICYCLE":        "BICYCLE_MARKED",
+        "OTP":            "TOBACCO_PRODUCTS_MARKED",
+        "BICYCLE":        "BIKE_MARKED",
         "WHEELCHAIRS":    "WHEELCHAIRS_MARKED",
         "ALCOHOL":        "ALCOHOL_MARKED",
         "MEDICINE":       "MEDICINE_MARKED",
-        "NABEER":         "NABEER_MARKED",
-        "NICOTINE":        "NICOTINE_MARKED",
-        "FOOD_SUPPLEMENT": "FOOD_SUPPLEMENT_MARKED",
+        "NABEER":         "NOT_ALCOHOL_BEER_MARKED",
+        "NICOTINE":        "TOBACCO_STICKS_MARKED",
+        "FOOD_SUPPLEMENT": "DIETARY_SUPPLEMENTS_MARKED",
         "ANTISEPTIC":      "ANTISEPTIC_MARKED",
-        "MEDICAL_DEVICES": "WHEELCHAIRS_MARKED",
-        "SOFT_DRINKS":     "SOFT_DRINKS_MARKED",
-        "VETPHARMA":       "VETPHARMA_MARKED",
-        "SEAFOOD":         "SEAFOOD_MARKED",
+        "MEDICAL_DEVICES": "MEDICAL_DEVICES_MARKED",
+        "SOFT_DRINKS":     "JUICE_MARKED",
+        "VETPHARMA":       "VETERINARY_MARKED",
+        "SEAFOOD":         "PRESERVES_MARKED",
         "VEGETABLE_OIL":   "VEGETABLE_OIL_MARKED",
-        "ANIMAL_FOOD":     "ANIMAL_FOOD_MARKED",
-        "MOTOR_OIL":       "MOTOR_OIL_MARKED",
-        "GROCERIES":       "GROCERIES_MARKED",
-        "COSMETICS":       "COSMETICS_MARKED",
+        "ANIMAL_FOOD":     "PET_FOOD_MARKED",
+        "MOTOR_OIL":       "AUTO_FLUIDS_MARKED",
+        "GROCERIES":       "NORMAL",
+        "COSMETICS":       "PERFUME_MARKED",
         "FUR":             "FUR_MARKED",
         "NOT_TRACKED":    "NORMAL",
     }
@@ -396,13 +396,43 @@ def _build_evotor_product_payload(
         payload.pop("barcodes", None)
 
     classification_code = _extract_classification_code(ms_product)
-    if classification_code and payload.get("type") not in {"DAIRY_MARKED"}:
+    _classification_allowed = {
+        "NORMAL", "DAIRY_MARKED", "WATER_MARKED", "JEWELRY_MARKED", "FUR_MARKED",
+        "BIKE_MARKED", "LOTTERY_TICKET", "LOTTERY_PRIZE", "DIETARY_SUPPLEMENTS_MARKED",
+        "JUICE_MARKED", "MEDICAL_DEVICES_MARKED", "WHEELCHAIRS_MARKED", "FURSLP_MARKED",
+        "AUTO_FLUIDS_MARKED", "CHEMICALS_MARKED",
+    }
+    if classification_code and payload.get("type") in _classification_allowed:
         payload["classification_code"] = classification_code
     else:
         payload.pop("classification_code", None)
 
     if current_product and "quantity" in current_product:
         payload["quantity"] = current_product["quantity"]
+
+    # Очищаем алкогольные поля если тип не алкогольный
+    alcohol_types = {"ALCOHOL_MARKED", "ALCOHOL_NOT_MARKED", "BEER_MARKED", "BEER_MARKED_KEG", "NOT_ALCOHOL_BEER_MARKED", "ANTISEPTIC_MARKED"}
+    if payload.get("type") not in alcohol_types:
+        for field in ("alcohol_by_volume", "alcohol_product_kind_code", "tare_volume", "is_excisable"):
+            payload.pop(field, None)
+
+    # Убираем служебные поля Эвотора которые нельзя передавать
+    for field in ("store_id", "user_id", "created_at", "updated_at", "quantity_in_package"):
+        payload.pop(field, None)
+
+    # Убираем alcocodes если пустой список
+    if not payload.get("alcocodes"):
+        payload.pop("alcocodes", None)
+
+    # classification_code только для типов которые его поддерживают (по документации Эвотор)
+    supported_classification = {
+        "NORMAL", "DAIRY_MARKED", "WATER_MARKED", "JEWELRY_MARKED", "FUR_MARKED",
+        "BIKE_MARKED", "LOTTERY_TICKET", "LOTTERY_PRIZE", "DIETARY_SUPPLEMENTS_MARKED",
+        "JUICE_MARKED", "MEDICAL_DEVICES_MARKED", "WHEELCHAIRS_MARKED", "FURSLP_MARKED",
+        "AUTO_FLUIDS_MARKED", "CHEMICALS_MARKED",
+    }
+    if payload.get("type") not in supported_classification:
+        payload.pop("classification_code", None)
 
     return payload
 
@@ -454,7 +484,7 @@ def _get_ms_product(ms_token: str, ms_product_id: str) -> dict:
 
 def _search_ms_products(ms_token: str, search: str | None = None, limit: int = 1000, offset: int = 0) -> dict:
     url = f"{MS_BASE}/entity/product"
-    params = {"limit": limit, "offset": offset}
+    params = {"limit": limit, "offset": offset, "expand": "uom"}
     if search:
         params["search"] = search
 
