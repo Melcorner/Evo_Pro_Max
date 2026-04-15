@@ -255,6 +255,30 @@ async def moysklad_webhook(
             doc_type = event.meta.type or _extract_doc_type_from_href(href)
             doc_id = _extract_ms_id_from_href(href)
 
+            # Обработка создания/обновления товара
+            if doc_type == "product" and doc_id:
+                log.info("MoySklad product event tenant_id=%s product_id=%s", tenant_id, doc_id)
+                try:
+                    from app.api.sync import sync_ms_to_evotor_store
+                    from app.db import get_connection as _gc, adapt_query as _aq
+                    _conn = _gc()
+                    _cur = _conn.cursor()
+                    _cur.execute(
+                        _aq("SELECT evotor_store_id FROM tenant_stores WHERE tenant_id = ? AND sync_completed_at IS NOT NULL"),
+                        (tenant_id,),
+                    )
+                    store_ids = [r["evotor_store_id"] for r in _cur.fetchall()]
+                    _conn.close()
+                    for _sid in store_ids:
+                        try:
+                            _res = sync_ms_to_evotor_store(tenant_id, _sid)
+                            log.info("Product sync after MS webhook store=%s synced=%s", _sid, _res.get("synced", 0))
+                        except Exception as _e:
+                            log.error("Product sync failed store=%s err=%s", _sid, _e)
+                except Exception as e:
+                    log.error("Failed to handle product webhook err=%s", e)
+                continue
+
             if not doc_type or doc_type not in STOCK_TRIGGER_TYPES:
                 log.info("Skipping non-stock doc_type=%s href=%s", doc_type, href)
                 continue

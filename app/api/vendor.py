@@ -151,6 +151,8 @@ def _setup_ms_webhooks(tenant_id: str, access_token: str) -> None:
         {"entityType": "inventory", "action": "UPDATE"},
         {"entityType": "loss",      "action": "CREATE"},
         {"entityType": "enter",     "action": "CREATE"},
+        {"entityType": "product",   "action": "CREATE"},
+        {"entityType": "product",   "action": "UPDATE"},
     ]
     created = 0
     for wh in webhooks:
