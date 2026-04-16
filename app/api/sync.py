@@ -652,9 +652,12 @@ def _find_evotor_product_by_external_code(tenant: dict, external_code: str) -> d
         log.warning("_find_evotor_product_by_external_code failed code=%s err=%s", external_code, e)
         return None
 
-def _get_ms_product(ms_token: str, ms_product_id: str) -> dict:
+def _get_ms_product(ms_token: str, ms_product_id: str, expand: str | None = None) -> dict:
     url = f"{MS_BASE}/entity/product/{ms_product_id}"
-    r = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
+    params = {}
+    if expand:
+        params["expand"] = expand
+    r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
     if not r.ok:
         log.error("MoySklad get_product error status=%s body=%s", r.status_code, r.text)
         r.raise_for_status()
@@ -2840,7 +2843,7 @@ def sync_ms_to_evotor_store(tenant_id: str, evotor_store_id: str):
 
             if existing_evotor_id:
                 try:
-                    ms_product_full = _get_ms_product(tenant["moysklad_token"], ms_id)
+                    ms_product_full = _get_ms_product(tenant["moysklad_token"], ms_id, expand="productFolder")
                     upd_payload = _build_evotor_product_payload(
                         ms_product_full,
                         evotor_id=existing_evotor_id,
@@ -2852,6 +2855,11 @@ def sync_ms_to_evotor_store(tenant_id: str, evotor_store_id: str):
                     for _f in ("store_id", "user_id", "created_at", "updated_at"):
                         upd_payload.pop(_f, None)
 
+                    # Передаём группу товара если есть папка в МС
+                    _apply_product_group(
+                        upd_payload, ms_product_full,
+                        tenant_id, evotor_store_id, tenant["evotor_token"],
+                    )
                     bulk_update_items.append(upd_payload)
                 except Exception as _e:
                     log.warning("Failed to build update payload ms_id=%s err=%s", ms_id, _e)
