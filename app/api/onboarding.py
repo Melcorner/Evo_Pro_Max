@@ -606,6 +606,493 @@ def _render_sync_result(result: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# NEW WIZARD — пошаговый онбординг для тенантов с токеном МС
+# ---------------------------------------------------------------------------
+
+def _ob_step_layout(step: int, total: int, title: str, body: str, back_url: str | None = None) -> str:
+    """Layout для пошагового онбординга с индикатором прогресса."""
+    back_btn = f'<a href="{html.escape(back_url)}" class="back-btn">← Назад</a>' if back_url else ""
+    steps_html = ""
+    for i in range(1, total + 1):
+        if i < step:
+            cls = "step-done"
+            icon = "✓"
+        elif i == step:
+            cls = "step-active"
+            icon = str(i)
+        else:
+            cls = "step-pending"
+            icon = str(i)
+        steps_html += f'<div class="ob-step {cls}"><span class="ob-step-num">{icon}</span></div>'
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <title>{html.escape(title)}</title>
+    {LK_STYLE}
+    <style>
+    .ob-steps {{display:flex;align-items:center;gap:8px;margin-bottom:28px;}}
+    .ob-step {{display:flex;align-items:center;gap:8px;}}
+    .ob-step-num {{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;}}
+    .step-done .ob-step-num {{background:#059669;color:#fff;}}
+    .step-active .ob-step-num {{background:#2458d3;color:#fff;}}
+    .step-pending .ob-step-num {{background:#e5e7eb;color:#9ca3af;}}
+    .ob-step:not(:last-child)::after {{content:"";flex:1;height:2px;background:#e5e7eb;margin:0 4px;}}
+    .step-done::after {{background:#059669 !important;}}
+    .help-toggle {{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#2458d3;
+                   text-decoration:none;cursor:pointer;background:none;border:none;padding:0;margin-top:8px;}}
+    .help-toggle:hover {{text-decoration:underline;}}
+    .help-box {{display:none;background:#f0f4ff;border:1px solid #c7d7f5;border-radius:10px;
+                padding:16px;margin-top:12px;font-size:13px;color:#374151;line-height:1.6;}}
+    .help-box.visible {{display:block;}}
+    </style>
+</head>
+<body style="background:#f5f7fb;padding:24px;">
+    <div style="margin-bottom:8px;font-size:15px;font-weight:700;">Evotor ↔ MoySklad</div>
+    <div style="color:#5b6475;margin-bottom:24px;font-size:14px;">Настройка интеграции</div>
+    <div class="onboarding-card">
+        {back_btn}
+        <div class="ob-steps">{steps_html}</div>
+        <h2 style="font-size:20px;font-weight:700;margin-bottom:20px;">{html.escape(title)}</h2>
+        {body}
+    </div>
+</body>
+</html>"""
+
+
+# Шаг 1 — ввод токена Эвотор
+@router.get("/onboarding/wizard/{tenant_id}/step1", response_class=HTMLResponse)
+def wizard_step1(tenant_id: str, err: str | None = None):
+    tenant = _load_tenant(tenant_id)
+    if not tenant.get("moysklad_token"):
+        return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Токен МойСклад не найден. Переустановите решение.</div>'))
+
+    err_html = f'<div class="ob-error">{html.escape(err)}</div>' if err else ""
+    body = f"""
+    <style>
+    .help-modal {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5);
+        z-index:1000; align-items:flex-start; justify-content:center; overflow-y:auto; padding:20px; }}
+    .help-modal.visible {{ display:flex; }}
+    .help-modal-box {{ background:#fff; border-radius:14px; width:100%; max-width:700px;
+        margin:auto; overflow:hidden; box-shadow:0 8px 40px rgba(0,0,0,0.2); }}
+    .help-modal-header {{ display:flex; align-items:center; justify-content:space-between;
+        padding:16px 20px; border-bottom:1px solid #e4e8f0; }}
+    .help-modal-title {{ font-size:16px; font-weight:700; color:#1a1d2e; }}
+    .help-modal-close {{ background:none; border:none; font-size:22px; cursor:pointer;
+        color:#9ca3af; line-height:1; padding:0 4px; }}
+    .help-modal-close:hover {{ color:#1a1d2e; }}
+    .help-modal-content {{ padding:20px; max-height:75vh; overflow-y:auto; }}
+    .help-step {{ margin-bottom:24px; }}
+    .help-step-num {{ display:inline-flex; align-items:center; justify-content:center;
+        width:28px; height:28px; border-radius:8px; background:#FF4D00; color:#fff;
+        font-size:13px; font-weight:700; margin-bottom:10px; }}
+    .help-step-title {{ font-size:15px; font-weight:700; color:#1a1d2e; margin-bottom:6px; }}
+    .help-step-desc {{ font-size:13px; color:#6b7280; margin-bottom:10px; line-height:1.5; }}
+    .help-step img {{ width:100%; border-radius:8px; border:1px solid #e4e8f0; }}
+    .help-link {{ display:inline-flex; align-items:center; gap:6px; font-size:13px;
+        color:#2458d3; text-decoration:none; cursor:pointer; background:none; border:none;
+        padding:0; font-family:inherit; margin-top:6px; }}
+    .help-link:hover {{ text-decoration:underline; }}
+    </style>
+    {err_html}
+    <p style="color:#5b6475;font-size:14px;margin-bottom:20px;line-height:1.6;">
+        Введите токен из личного кабинета Эвотор. Мы автоматически загрузим список ваших магазинов.
+    </p>
+    <form method="post" action="/onboarding/wizard/{html.escape(tenant_id)}/step1">
+        <div class="field">
+            <label>Evotor Token</label>
+            <input type="text" name="evotor_token" required
+                   placeholder="Вставьте токен из личного кабинета Эвотор"
+                   value="{html.escape(tenant.get('evotor_token') or '')}" />
+            <span class="hint">Найдите в evotor.ru → Мои приложения → Универсальный фискализатор → Настройки</span>
+            <button type="button" class="help-link" onclick="document.getElementById('helpModal').classList.add('visible')">
+                📖 Где найти токен? Пошаговая инструкция
+            </button>
+        </div>
+        <button type="submit" class="ob-btn" style="margin-top:20px;">Получить магазины →</button>
+    </form>
+
+    <div class="help-modal" id="helpModal">
+        <div class="help-modal-box">
+            <div class="help-modal-header">
+                <div class="help-modal-title">Как найти токен Эвотор</div>
+                <button class="help-modal-close" onclick="document.getElementById('helpModal').classList.remove('visible')">×</button>
+            </div>
+            <div class="help-modal-content">
+                <div class="help-step">
+                    <div class="help-step-num">1</div>
+                    <div class="help-step-title">Войдите в личный кабинет Эвотор</div>
+                    <div class="help-step-desc">Откройте <strong>evotor.ru</strong> и войдите в аккаунт.</div>
+                    <img src="/static/help/img/step1.png" alt="Шаг 1">
+                </div>
+                <div class="help-step">
+                    <div class="help-step-num">2</div>
+                    <div class="help-step-title">Найдите "Универсальный фискализатор"</div>
+                    <div class="help-step-desc">В строке поиска введите <strong>«Универсальный фискализатор»</strong> и перейдите на вкладку <strong>Приложения</strong>.</div>
+                    <img src="/static/help/img/step2.png" alt="Шаг 2">
+                </div>
+                <div class="help-step">
+                    <div class="help-step-num">3</div>
+                    <div class="help-step-title">Откройте страницу приложения</div>
+                    <div class="help-step-desc">Нажмите на приложение и затем кнопку <strong>«Открыть»</strong>.</div>
+                    <img src="/static/help/img/step3.png" alt="Шаг 3">
+                </div>
+                <div class="help-step">
+                    <div class="help-step-num">4</div>
+                    <div class="help-step-title">Установите приложение на кассу</div>
+                    <div class="help-step-desc">На вкладке <strong>«Установка / Удаление»</strong> выберите кассу и нажмите <strong>«Установить»</strong>.</div>
+                    <img src="/static/help/img/step4.png" alt="Шаг 4">
+                </div>
+                <div class="help-step">
+                    <div class="help-step-num">5</div>
+                    <div class="help-step-title">Откройте "Мои приложения"</div>
+                    <div class="help-step-desc">В меню слева нажмите <strong>«Мои приложения»</strong> и откройте <strong>«Универсальный фискализатор»</strong>.</div>
+                    <img src="/static/help/img/step5.png" alt="Шаг 5">
+                </div>
+                <div class="help-step">
+                    <div class="help-step-num">6</div>
+                    <div class="help-step-title">Скопируйте токен</div>
+                    <div class="help-step-desc">На странице приложения найдите поле <strong>Evotor Token</strong> и скопируйте его значение.</div>
+                    <img src="/static/help/img/step6.png" alt="Шаг 6">
+                </div>
+            </div>
+        </div>
+    </div>"""
+    return HTMLResponse(_ob_step_layout(1, 4, "Подключение Эвотор", body))
+
+
+@router.post("/onboarding/wizard/{tenant_id}/step1", response_class=HTMLResponse)
+def wizard_step1_submit(tenant_id: str, evotor_token: str = Form(...)):
+    from urllib.parse import quote_plus
+    evotor_token = evotor_token.strip()
+    if not evotor_token:
+        return RedirectResponse(
+            url=f"/onboarding/wizard/{tenant_id}/step1?err=Токен+обязателен",
+            status_code=303,
+        )
+    try:
+        stores = fetch_stores_by_token(evotor_token)
+    except Exception as e:
+        return RedirectResponse(
+            url=f"/onboarding/wizard/{tenant_id}/step1?err={quote_plus(f'Не удалось получить магазины: {e}')}",
+            status_code=303,
+        )
+    if not stores:
+        return RedirectResponse(
+            url=f"/onboarding/wizard/{tenant_id}/step1?err=Магазины+не+найдены+по+этому+токену",
+            status_code=303,
+        )
+    # Сохраняем токен и магазины в сессии
+    now = int(time.time())
+    session_id = str(uuid.uuid4())
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("INSERT INTO evotor_onboarding_sessions (id, evotor_token, stores_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"),
+            (session_id, evotor_token, json.dumps(stores, ensure_ascii=False), now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse(
+        url=f"/onboarding/wizard/{tenant_id}/step2/{session_id}",
+        status_code=303,
+    )
+
+
+# Шаг 2 — выбор магазина
+@router.get("/onboarding/wizard/{tenant_id}/step2/{session_id}", response_class=HTMLResponse)
+def wizard_step2(tenant_id: str, session_id: str):
+    session = _load_session(session_id)
+    stores = json.loads(session.get("stores_json") or "[]")
+
+    # Фильтруем магазины которые уже привязаны к этому тенанту
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(aq("SELECT evotor_store_id FROM tenant_stores WHERE tenant_id = ?"), (tenant_id,))
+    already_added = {r["evotor_store_id"] for r in cur.fetchall()}
+    conn.close()
+
+    parts = [
+        '<p style="color:#5b6475;font-size:14px;margin-bottom:20px;line-height:1.6;">'
+        'Выберите магазин Эвотор который хотите подключить.'
+        '</p>'
+    ]
+
+    has_stores = False
+    for store in stores:
+        store_id = _extract_store_id(store)
+        if not store_id:
+            continue
+        store_name = _extract_store_name(store, store_id)
+        if store_id in already_added:
+            parts.append(f"""
+            <div class="store" style="opacity:0.5;">
+                <p style="font-size:16px;font-weight:700;margin-bottom:4px;">{html.escape(store_name)}</p>
+                <p style="margin:0;color:#8793a8;font-size:13px;">Уже добавлен</p>
+            </div>""")
+        else:
+            has_stores = True
+            parts.append(f"""
+            <div class="store">
+                <p style="font-size:16px;font-weight:700;margin-bottom:4px;">{html.escape(store_name)}</p>
+                <p style="margin:0 0 12px;color:#8793a8;font-size:13px;">ID: {html.escape(store_id)}</p>
+                <a href="/onboarding/wizard/{html.escape(tenant_id)}/step3/{html.escape(session_id)}/{html.escape(store_id)}"
+                   class="ob-btn" style="display:inline-block;text-decoration:none;">Выбрать →</a>
+            </div>""")
+
+    if not has_stores:
+        parts.append('<div class="ob-success">Все магазины уже подключены.</div>')
+        parts.append(f'<a href="/onboarding/tenants/{html.escape(tenant_id)}" class="ob-btn" style="display:inline-block;text-decoration:none;margin-top:12px;">Перейти в личный кабинет →</a>')
+
+    return HTMLResponse(_ob_step_layout(2, 4, "Выберите магазин Эвотор", "".join(parts),
+                        back_url=f"/onboarding/wizard/{tenant_id}/step1"))
+
+
+# Шаг 3 — настройка магазина
+@router.get("/onboarding/wizard/{tenant_id}/step3/{session_id}/{store_id}", response_class=HTMLResponse)
+def wizard_step3(tenant_id: str, session_id: str, store_id: str, err: str | None = None):
+    tenant = _load_tenant(tenant_id)
+    session = _load_session(session_id)
+    store = _get_session_store(session, store_id)
+    if not store:
+        return HTMLResponse(_ob_step_layout(3, 4, "Ошибка", '<div class="ob-error">Магазин не найден.</div>'))
+
+    store_name = _extract_store_name(store, store_id)
+
+    # Загружаем данные МС
+    ms_orgs, ms_stores, ms_agents = [], [], []
+    ms_err = ""
+    try:
+        ms_orgs, ms_stores, ms_agents = _ms_fetch_all(tenant["moysklad_token"])
+    except Exception as e:
+        ms_err = str(e)
+
+    err_html = f'<div class="ob-error">{html.escape(err)}</div>' if err else ""
+    ms_err_html = f'<div class="ob-error">Ошибка загрузки данных МС: {html.escape(ms_err)}</div>' if ms_err else ""
+
+    # Определяем первичный ли это магазин
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(aq("SELECT COUNT(*) as cnt FROM tenant_stores WHERE tenant_id = ?"), (tenant_id,))
+    is_first = cur.fetchone()["cnt"] == 0
+    conn.close()
+
+    body = f"""
+    {err_html}{ms_err_html}
+    <div class="ob-success" style="margin-bottom:20px;">
+        <strong>Магазин:</strong> {html.escape(store_name)}
+    </div>
+    <form method="post" action="/onboarding/wizard/{html.escape(tenant_id)}/step3/{html.escape(session_id)}/{html.escape(store_id)}">
+        <div class="field">
+            <label>Название магазина</label>
+            <input type="text" name="name" value="{html.escape(store_name)}" required />
+            <span class="hint">Можно оставить или изменить вручную</span>
+        </div>
+
+        <div class="section-title">Настройки МойСклад</div>
+        <div class="field"><label>Организация</label>{_select("ms_organization_id", ms_orgs)}</div>
+        <div class="field"><label>Склад</label>{_select("ms_store_id", ms_stores)}</div>
+        <div class="field"><label>Контрагент по умолчанию</label>{_select("ms_agent_id", ms_agents)}</div>
+
+        <div class="section-title">Фискализация <span style="font-weight:400;color:#9ca3af;">(необязательно)</span></div>
+        <div class="field"><label>Fiscal Token</label><input type="text" name="fiscal_token" placeholder="Оставьте пустым если не нужна" /></div>
+        <div class="field"><label>Fiscal Client UID</label><input type="text" name="fiscal_client_uid" /></div>
+        <div class="field"><label>Fiscal Device UID</label><input type="text" name="fiscal_device_uid" /></div>
+
+        {"<input type='hidden' name='is_primary' value='1' />" if is_first else ""}
+        <button type="submit" class="ob-btn" style="margin-top:8px;">Синхронизировать →</button>
+    </form>"""
+
+    return HTMLResponse(_ob_step_layout(3, 4, "Настройка магазина", body,
+                        back_url=f"/onboarding/wizard/{tenant_id}/step2/{session_id}"))
+
+
+@router.post("/onboarding/wizard/{tenant_id}/step3/{session_id}/{store_id}", response_class=HTMLResponse)
+def wizard_step3_submit(
+    tenant_id: str,
+    session_id: str,
+    store_id: str,
+    name: str = Form(""),
+    ms_organization_id: str = Form(...),
+    ms_store_id: str = Form(...),
+    ms_agent_id: str = Form(...),
+    fiscal_token: str = Form(""),
+    fiscal_client_uid: str = Form(""),
+    fiscal_device_uid: str = Form(""),
+    is_primary: str = Form("0"),
+):
+    from urllib.parse import quote_plus
+    tenant = _load_tenant(tenant_id)
+    session = _load_session(session_id)
+    store = _get_session_store(session, store_id)
+    if not store:
+        return HTMLResponse(_ob_step_layout(3, 4, "Ошибка", '<div class="ob-error">Магазин не найден.</div>'))
+
+    store_name = _extract_store_name(store, store_id)
+    final_name = name.strip() or store_name
+    now = int(time.time())
+
+    # Сохраняем evotor_token в тенант если ещё не сохранён
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("UPDATE tenants SET evotor_token = ?, evotor_store_id = COALESCE(evotor_store_id, ?), updated_at = ? WHERE id = ?"),
+            (session["evotor_token"], store_id, now, tenant_id),
+        )
+
+        # Создаём или обновляем tenant_store
+        primary_val = 1 if is_primary == "1" else 0
+        if primary_val:
+            cur.execute(aq("UPDATE tenant_stores SET is_primary = 0 WHERE tenant_id = ?"), (tenant_id,))
+
+        cur.execute(
+            aq("""
+            INSERT INTO tenant_stores
+                (id, tenant_id, evotor_store_id, name, ms_store_id, ms_organization_id, ms_agent_id, is_primary, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (evotor_store_id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                name = EXCLUDED.name,
+                ms_store_id = EXCLUDED.ms_store_id,
+                ms_organization_id = EXCLUDED.ms_organization_id,
+                ms_agent_id = EXCLUDED.ms_agent_id,
+                is_primary = EXCLUDED.is_primary,
+                updated_at = EXCLUDED.updated_at
+            """),
+            (str(uuid.uuid4()), tenant_id, store_id, final_name,
+             ms_store_id.strip(), ms_organization_id.strip(), ms_agent_id.strip(),
+             primary_val, now, now),
+        )
+
+        if fiscal_token.strip() and fiscal_client_uid.strip() and fiscal_device_uid.strip():
+            cur.execute(
+                aq("UPDATE tenants SET fiscal_token=?, fiscal_client_uid=?, fiscal_device_uid=? WHERE id=?"),
+                (fiscal_token.strip(), fiscal_client_uid.strip(), fiscal_device_uid.strip(), tenant_id),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return RedirectResponse(
+            url=f"/onboarding/wizard/{tenant_id}/step3/{session_id}/{store_id}?err={quote_plus(str(e))}",
+            status_code=303,
+        )
+    finally:
+        conn.close()
+
+    return RedirectResponse(
+        url=f"/onboarding/wizard/{tenant_id}/step4/{session_id}/{store_id}",
+        status_code=303,
+    )
+
+
+# Шаг 4 — синхронизация
+@router.get("/onboarding/wizard/{tenant_id}/step4/{session_id}/{store_id}", response_class=HTMLResponse)
+def wizard_step4(tenant_id: str, session_id: str, store_id: str):
+    body = f"""
+    <p style="color:#5b6475;font-size:14px;margin-bottom:20px;">
+        Выполняем первичную синхронизацию товаров из Эвотор в МойСклад и передаём остатки.
+    </p>
+    <div id="syncStatus" style="text-align:center;padding:32px;">
+        <div style="font-size:15px;font-weight:600;margin-bottom:8px;">Синхронизация...</div>
+        <div style="font-size:13px;color:#6b7280;">Это может занять до 30 секунд</div>
+    </div>
+    <script>
+    fetch('/onboarding/wizard/{tenant_id}/step4/{session_id}/{store_id}/run', {{method:'POST'}})
+        .then(r => r.json())
+        .then(data => {{
+            const el = document.getElementById('syncStatus');
+            const synced = data.synced || 0;
+            const skipped = data.skipped || 0;
+            const failed = data.failed || 0;
+            const ok = data.status === 'ok';
+            el.innerHTML = `
+                <div style="font-size:15px;font-weight:600;color:${{ok ? '#059669' : '#dc2626'}};margin-bottom:16px;">
+                    ${{ok ? '✓ Синхронизация завершена' : '⚠ Завершена с ошибками'}}
+                </div>
+                <div style="background:#f9fafb;border-radius:8px;padding:16px;text-align:left;margin-bottom:20px;">
+                    <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #e5e7eb;">
+                        <span style="color:#6b7280;">Товаров создано в МойСклад</span>
+                        <strong>${{synced}}</strong>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #e5e7eb;">
+                        <span style="color:#6b7280;">Уже существовали</span>
+                        <strong>${{skipped}}</strong>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;padding:6px 0;">
+                        <span style="color:#6b7280;">Ошибок</span>
+                        <strong style="color:${{failed > 0 ? '#dc2626' : 'inherit'}}">${{failed}}</strong>
+                    </div>
+                </div>
+                <a href="/onboarding/wizard/{tenant_id}/step5/{session_id}/{store_id}"
+                   style="display:block;background:#2458d3;color:#fff;text-align:center;padding:12px;border-radius:8px;text-decoration:none;font-weight:600;">
+                   Далее →
+                </a>`;
+        }})
+        .catch(err => {{
+            document.getElementById('syncStatus').innerHTML =
+                '<div class="ob-error">Ошибка при синхронизации: ' + err + '</div>';
+        }});
+    </script>"""
+    return HTMLResponse(_ob_step_layout(4, 4, "Синхронизация товаров", body))
+
+
+@router.post("/onboarding/wizard/{tenant_id}/step4/{session_id}/{store_id}/run")
+def wizard_step4_run(tenant_id: str, session_id: str, store_id: str):
+    from app.api.sync import initial_sync_store
+    try:
+        result = initial_sync_store(tenant_id, store_id)
+        return result
+    except Exception as e:
+        log.exception("wizard_step4_run failed")
+        return {"status": "error", "error": str(e), "synced": 0, "skipped": 0, "failed": 1}
+
+
+# Шаг 5 — готово
+@router.get("/onboarding/wizard/{tenant_id}/step5/{session_id}/{store_id}", response_class=HTMLResponse)
+def wizard_step5(tenant_id: str, session_id: str, store_id: str):
+    tenant = _load_tenant(tenant_id)
+    session = _load_session(session_id)
+    stores = json.loads(session.get("stores_json") or "[]")
+
+    # Сколько магазинов ещё не добавлено
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(aq("SELECT evotor_store_id FROM tenant_stores WHERE tenant_id = ?"), (tenant_id,))
+    added = {r["evotor_store_id"] for r in cur.fetchall()}
+    conn.close()
+
+    remaining = [s for s in stores if _extract_store_id(s) and _extract_store_id(s) not in added]
+
+    add_store_btn = ""
+    if remaining:
+        add_store_btn = f"""
+        <a href="/onboarding/wizard/{html.escape(tenant_id)}/step2/{html.escape(session_id)}"
+           class="ob-btn" style="display:block;text-align:center;text-decoration:none;
+                                  background:#f0f4ff;color:#2458d3;border:1px solid #c7d7f5;margin-bottom:12px;">
+            + Добавить ещё магазин ({len(remaining)} доступно)
+        </a>"""
+
+    body = f"""
+    <div style="text-align:center;margin-bottom:28px;">
+        <div style="font-size:48px;margin-bottom:12px;">🎉</div>
+        <div style="font-size:18px;font-weight:700;color:#1a1d2e;margin-bottom:8px;">Интеграция настроена!</div>
+        <div style="font-size:14px;color:#6b7280;">Товары и остатки синхронизированы</div>
+    </div>
+    {add_store_btn}
+    <a href="/onboarding/tenants/{html.escape(tenant_id)}"
+       class="ob-btn" style="display:block;text-align:center;text-decoration:none;">
+        Перейти в личный кабинет →
+    </a>"""
+
+    return HTMLResponse(_ob_step_layout(4, 4, "Готово", body))
+
+
+# ---------------------------------------------------------------------------
 # Step 1 — Evotor token (ручной онбординг)
 # ---------------------------------------------------------------------------
 
@@ -1006,8 +1493,8 @@ def onboarding_ms_entry(request: Request, contextKey: str | None = None):
         tenant = tenants[0]
         evotor_ready = bool(tenant["evotor_token"] and tenant["evotor_store_id"])
         ms_ready = bool(tenant["ms_organization_id"] and tenant["ms_store_id"])
-        if not evotor_ready or not ms_ready:
-            return RedirectResponse(url=f"/onboarding/tenants/{tenant['id']}/evotor", status_code=302)
+        if not evotor_ready:
+            return RedirectResponse(url=f"/onboarding/wizard/{tenant['id']}/step1", status_code=302)
         return RedirectResponse(url=f"/onboarding/tenants/{tenant['id']}", status_code=302)
 
     # Несколько tenant'ов
@@ -1029,31 +1516,19 @@ def onboarding_ms_entry(request: Request, contextKey: str | None = None):
 # ---------------------------------------------------------------------------
 
 @router.get("/onboarding/tenants/{tenant_id}/evotor", response_class=HTMLResponse)
-def onboarding_tenant_evotor_form(tenant_id: str):
+def onboarding_tenant_evotor_form(tenant_id: str, err: str | None = None, msg: str | None = None):
     tenant = _load_tenant(tenant_id)
-    evotor_ok = bool(tenant.get("evotor_token") and tenant.get("evotor_store_id"))
-    ms_configured = bool(tenant.get("ms_organization_id") and tenant.get("ms_store_id"))
+    evotor_ok = bool(tenant.get("evotor_token"))
 
-    # Загружаем данные МойСклад если не заполнены
-    ms_selects_html = ""
-    if tenant.get("moysklad_token") and not ms_configured:
-        try:
-            orgs, ms_stores, agents = _ms_fetch_all(tenant["moysklad_token"])
-            ms_selects_html = f"""
-            <hr>
-            <div class="section-title">Настройки МойСклад</div>
-            <div class="field"><label>Организация</label>{_select("ms_organization_id", orgs)}</div>
-            <div class="field"><label>Склад</label>{_select("ms_store_id", ms_stores)}</div>
-            <div class="field">
-                <label>Контрагент по умолчанию</label>
-                {_select("ms_agent_id", agents)}
-                <span class="hint">Используется если данные клиента в чеке отсутствуют.</span>
-            </div>"""
-        except Exception as e:
-            log.warning("Failed to fetch MS data tenant_id=%s err=%s", tenant_id, e)
-
-    status_html = '<div class="ob-success">Эвотор уже подключён. Можно обновить токен.</div>' if evotor_ok else \
-                  '<div class="ob-error" style="margin-bottom:16px;">Подключите кассу Эвотор для завершения настройки.</div>'
+    status_html = ""
+    if msg:
+        status_html = f'<div class="ob-success">{html.escape(msg)}</div>'
+    elif err:
+        status_html = f'<div class="ob-error">{html.escape(err)}</div>'
+    elif evotor_ok:
+        status_html = '<div class="ob-success">Эвотор подключён. Можно обновить токен.</div>'
+    else:
+        status_html = '<div class="ob-error" style="margin-bottom:16px;">Подключите кассу Эвотор для завершения настройки.</div>'
 
     body = f"""
     <style>
@@ -1085,27 +1560,57 @@ def onboarding_tenant_evotor_form(tenant_id: str):
     {status_html}
     <form method="post" action="/onboarding/tenants/{html.escape(tenant_id)}/evotor">
         <div class="field">
-            <label>Evotor token</label>
-            <input type="text" name="evotor_token" required placeholder="Токен из личного кабинета Эвотор" />
+            <label>Evotor Token</label>
+            <input type="text" name="evotor_token" required
+                   placeholder="Токен из личного кабинета Эвотор" />
             <span class="hint">Найдите в evotor.ru → Мои приложения → Универсальный фискализатор → Настройки</span>
-            <button type="button" class="help-link" onclick="document.getElementById('helpModal').classList.add('visible')">
+            <button type="button" class="help-link"
+                    onclick="document.getElementById('helpModal').classList.add('visible')">
                 📖 Где найти токен? Пошаговая инструкция
             </button>
         </div>
-        {ms_selects_html}
-        <hr>
-        <div class="section-title">Фискализация (необязательно)</div>
-        <div class="field"><label>Fiscal token</label><input type="text" name="fiscal_token" placeholder="Оставьте пустым если не нужна" /></div>
-        <div class="field"><label>Fiscal client UID</label><input type="text" name="fiscal_client_uid" /></div>
-        <div class="field"><label>Fiscal device UID</label><input type="text" name="fiscal_device_uid" /></div>
-        <button type="submit" class="ob-btn" style="margin-top:8px;">Подключить →</button>
+        <div class="field" style="margin-top:20px;">
+            <label style="font-size:14px;font-weight:600;color:#374151;margin-bottom:10px;display:block;">
+                Тип обновления
+            </label>
+            <div style="display:flex;flex-direction:column;gap:10px;">
+                <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;
+                              border:2px solid #2458d3;border-radius:8px;cursor:pointer;background:#f0f4ff;"
+                       id="label_a">
+                    <input type="radio" name="account_type" value="same" id="choice_a" checked
+                           style="width:auto;margin-top:2px;"
+                           onchange="document.getElementById('label_a').style.borderColor='#2458d3';document.getElementById('label_a').style.background='#f0f4ff';document.getElementById('label_b').style.borderColor='#e5e7eb';document.getElementById('label_b').style.background='#fff';" />
+                    <div>
+                        <div style="font-weight:600;font-size:14px;color:#1a1d2e;">Тот же аккаунт Эвотор</div>
+                        <div style="font-size:13px;color:#6b7280;margin-top:2px;">
+                            Просто обновить токен. Магазины и данные синхронизации сохранятся.
+                        </div>
+                    </div>
+                </label>
+                <label style="display:flex;align-items:flex-start;gap:10px;padding:12px;
+                              border:2px solid #e5e7eb;border-radius:8px;cursor:pointer;background:#fff;"
+                       id="label_b">
+                    <input type="radio" name="account_type" value="new" id="choice_b"
+                           style="width:auto;margin-top:2px;"
+                           onchange="document.getElementById('label_b').style.borderColor='#dc2626';document.getElementById('label_b').style.background='#fff5f5';document.getElementById('label_a').style.borderColor='#e5e7eb';document.getElementById('label_a').style.background='#fff';" />
+                    <div>
+                        <div style="font-weight:600;font-size:14px;color:#dc2626;">Новый аккаунт Эвотор</div>
+                        <div style="font-size:13px;color:#6b7280;margin-top:2px;">
+                            Удалить все магазины и начать заново. Все данные синхронизации будут сброшены.
+                        </div>
+                    </div>
+                </label>
+            </div>
+        </div>
+        <button type="submit" class="ob-btn" style="margin-top:8px;">Обновить токен →</button>
     </form>
 
     <div class="help-modal" id="helpModal">
         <div class="help-modal-box">
             <div class="help-modal-header">
                 <div class="help-modal-title">Как найти токен Эвотор</div>
-                <button class="help-modal-close" onclick="document.getElementById('helpModal').classList.remove('visible')">×</button>
+                <button class="help-modal-close"
+                        onclick="document.getElementById('helpModal').classList.remove('visible')">×</button>
             </div>
             <div class="help-modal-content">
                 <div class="help-step">
@@ -1139,85 +1644,93 @@ def onboarding_tenant_evotor_form(tenant_id: str):
                     <img src="/static/help/img/step5.png" alt="Шаг 5">
                 </div>
                 <div class="help-step">
-                    <div class="help-step-num" style="background:#10B981;">✓</div>
+                    <div class="help-step-num">6</div>
                     <div class="help-step-title">Скопируйте токен</div>
-                    <div class="help-step-desc">На вкладке <strong>«Настройки»</strong> нажмите <strong>«Скопировать»</strong> и вставьте токен в поле выше.</div>
+                    <div class="help-step-desc">На странице приложения найдите поле <strong>Evotor Token</strong> и скопируйте его значение.</div>
                     <img src="/static/help/img/step6.png" alt="Шаг 6">
                 </div>
             </div>
         </div>
-    </div>
+    </div>"""
+    return HTMLResponse(_ob_layout("Обновление токена Эвотор", body,
+                        back_url=f"/onboarding/tenants/{tenant_id}/integration"))
 
-    <script>
-    document.getElementById('helpModal').addEventListener('click', function(e) {{
-        if (e.target === this) this.classList.remove('visible');
-    }});
-    </script>"""
-
-    return HTMLResponse(_ob_layout("Подключение Эвотор", body, back_url=f"/onboarding/tenants/{tenant_id}"))
 
 @router.post("/onboarding/tenants/{tenant_id}/evotor", response_class=HTMLResponse)
 def onboarding_tenant_evotor_submit(
     tenant_id: str,
     evotor_token: str = Form(...),
-    ms_organization_id: str = Form(""),
-    ms_store_id: str = Form(""),
-    ms_agent_id: str = Form(""),
-    fiscal_token: str = Form(""),
-    fiscal_client_uid: str = Form(""),
-    fiscal_device_uid: str = Form(""),
+    account_type: str = Form("same"),
 ):
-    tenant = _load_tenant(tenant_id)
+    from urllib.parse import quote_plus
+    from app.stores.mapping_store import MappingStore
     evotor_token = evotor_token.strip()
     if not evotor_token:
-        return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Токен обязателен.</div>'))
-
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/evotor?err=Токен+обязателен",
+            status_code=303,
+        )
     try:
         stores = fetch_stores_by_token(evotor_token)
     except Exception as exc:
-        log.exception("Failed to fetch Evotor stores")
-        return HTMLResponse(_ob_layout("Ошибка",
-            f'<div class="ob-error">Не удалось получить магазины: {html.escape(str(exc))}</div>',
-            back_url=f"/onboarding/tenants/{tenant_id}/evotor"))
-
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/evotor?err={quote_plus(f'Не удалось получить магазины: {exc}')}",
+            status_code=303,
+        )
     if not stores:
-        return HTMLResponse(_ob_layout("Ошибка",
-            '<div class="ob-error">По этому токену не найдено магазинов.</div>',
-            back_url=f"/onboarding/tenants/{tenant_id}/evotor"))
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/evotor?err=По+этому+токену+не+найдено+магазинов",
+            status_code=303,
+        )
 
-    if len(stores) == 1:
-        store = stores[0]
-        store_id = _extract_store_id(store)
-        store_name = _extract_store_name(store, store_id)
-        return _save_evotor_and_sync(tenant_id, tenant, evotor_token, store_id, store_name,
-                                      ms_organization_id=ms_organization_id,
-                                      ms_store_id=ms_store_id,
-                                      ms_agent_id=ms_agent_id)
+    now = int(time.time())
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
 
-    # Несколько магазинов — выбор
-    parts = []
-    for store in stores:
-        store_id = _extract_store_id(store)
-        if not store_id:
-            continue
-        store_name = _extract_store_name(store, store_id)
-        parts.append(f"""
-        <div class="store">
-            <p><strong>{html.escape(store_name)}</strong></p>
-            <p style="margin:4px 0 12px;color:#5b6475;font-size:13px;">ID: <code>{html.escape(store_id)}</code></p>
-            <form method="post" action="/onboarding/tenants/{html.escape(tenant_id)}/evotor/store">
-                <input type="hidden" name="evotor_token" value="{html.escape(evotor_token)}" />
-                <input type="hidden" name="store_id" value="{html.escape(store_id)}" />
-                <input type="hidden" name="store_name" value="{html.escape(store_name)}" />
-                <input type="hidden" name="ms_organization_id" value="{html.escape(ms_organization_id)}" />
-                <input type="hidden" name="ms_store_id" value="{html.escape(ms_store_id)}" />
-                <input type="hidden" name="ms_agent_id" value="{html.escape(ms_agent_id)}" />
-                <button type="submit" class="ob-btn">Выбрать →</button>
-            </form>
-        </div>""")
+        if account_type == "new":
+            # Новый аккаунт — удаляем все магазины и маппинги
+            ms_store = MappingStore()
+            stores_list = _load_tenant_stores(tenant_id)
+            for s in stores_list:
+                ms_store.delete_by_store(tenant_id, s["evotor_store_id"])
 
-    return HTMLResponse(_ob_layout("Выберите магазин Эвотор", "".join(parts),
-        back_url=f"/onboarding/tenants/{tenant_id}/evotor"))
+            cur.execute(aq("DELETE FROM product_group_mappings WHERE tenant_id = ?"), (tenant_id,))
+            cur.execute(aq("DELETE FROM tenant_stores WHERE tenant_id = ?"), (tenant_id,))
+            cur.execute(
+                aq("UPDATE tenants SET evotor_token = ?, evotor_store_id = NULL, sync_completed_at = NULL, updated_at = ? WHERE id = ?"),
+                (evotor_token, now, tenant_id),
+            )
+            log.info("evotor_submit: new account — cleared all stores and mappings tenant_id=%s", tenant_id)
+        else:
+            # Тот же аккаунт — просто обновляем токен
+            cur.execute(
+                aq("UPDATE tenants SET evotor_token = ?, updated_at = ? WHERE id = ?"),
+                (evotor_token, now, tenant_id),
+            )
+            log.info("evotor_submit: updated token tenant_id=%s", tenant_id)
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Создаём сессию и редиректим на выбор магазина
+    session_id = str(uuid.uuid4())
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("INSERT INTO evotor_onboarding_sessions (id, evotor_token, stores_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"),
+            (session_id, evotor_token, json.dumps(stores, ensure_ascii=False), now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return RedirectResponse(
+        url=f"/onboarding/wizard/{tenant_id}/step2/{session_id}",
+        status_code=303,
+    )
 
 
 @router.post("/onboarding/tenants/{tenant_id}/evotor/store", response_class=HTMLResponse)
