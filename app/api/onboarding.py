@@ -1455,7 +1455,7 @@ def lk_overview(tenant_id: str):
         <div class="lk-row"><span class="lk-row-label">Telegram</span>{_badge(tg_ok, "Подключён", "Не подключён")}</div>
         <div class="lk-row"><span class="lk-row-label">Email</span>{_badge(email_ok, html.escape(tenant.get("alert_email") or "Активен"), "Не настроен")}</div>
     </div>
-    <div class="lk-card">
+    <div class="lk-card" style="margin-top:16px;">
         <div class="lk-card-title">События</div>
         <div class="stats-grid">
             <div class="stat-card"><div class="stat-value" style="color:#059669;">{done}</div><div class="stat-label">Обработано</div></div>
@@ -1495,7 +1495,7 @@ def lk_overview(tenant_id: str):
             </div>"""
 
         content += f"""
-    <div class="lk-card">
+    <div class="lk-card" style="margin-top:16px;">
         <div class="lk-card-title" style="display:flex;justify-content:space-between;align-items:center;">
             <span>Магазины</span>
             <a href="/onboarding/tenants/{html.escape(tenant_id)}/stores"
@@ -1961,58 +1961,31 @@ def onboarding_tenant_sync(tenant_id: str):
 
 @router.post("/onboarding/tenants/{tenant_id}/reconcile", response_class=HTMLResponse)
 def onboarding_tenant_reconcile(tenant_id: str):
-    from app.clients.evotor_client import EvotorClient
-    from app.clients.moysklad_client import MoySkladClient
-
-    tenant = _load_tenant(tenant_id)
-    if not tenant.get("sync_completed_at"):
-        return RedirectResponse(
-            url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus('Сначала выполните первичную синхронизацию.')}",
-            status_code=303,
-        )
-
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            aq("SELECT evotor_id, ms_id FROM mappings WHERE tenant_id=? AND entity_type='product'"),
-            (tenant_id,),
-        )
-        mappings = cur.fetchall()
-    finally:
-        conn.close()
-
-    if not mappings:
-        return RedirectResponse(
-            url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus('Нет маппингов товаров.')}",
-            status_code=303,
-        )
-
-    ms_client = MoySkladClient(tenant_id)
-    evotor_client = EvotorClient(tenant_id)
-    synced = 0
-    failed = 0
-
-    for row in mappings:
+    from app.api.sync import reconcile_stock_store
+    from urllib.parse import quote_plus
+    stores = _load_tenant_stores(tenant_id)
+    total_synced = total_failed = 0
+    for store in stores:
+        if not store.get("sync_completed_at"):
+            continue
         try:
-            quantity = ms_client.get_product_stock(row["ms_id"])
-            evotor_client.update_product_stock(row["evotor_id"], quantity)
-            synced += 1
+            result = reconcile_stock_store(tenant_id, store["evotor_store_id"])
+            total_synced += result.get("synced", 0)
+            total_failed += result.get("failed", 0)
         except Exception as e:
-            log.error("reconcile stock failed ms_id=%s err=%s", row["ms_id"], e)
-            failed += 1
-
-    msg = f"Остатки синхронизированы: товаров — {synced}, ошибок — {failed}."
-    if failed > 0:
+            log.error("reconcile store=%s err=%s", store["evotor_store_id"], e)
+            total_failed += 1
+    msg = f"Остатки синхронизированы: товаров — {total_synced}, ошибок — {total_failed}."
+    if total_failed > 0:
         return RedirectResponse(
             url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(msg)}",
             status_code=303,
         )
-
     return RedirectResponse(
         url=f"/onboarding/tenants/{tenant_id}/actions?msg={quote_plus(msg)}",
         status_code=303,
     )
+
 
 @router.post("/onboarding/tenants/{tenant_id}/sync-ms-to-evotor", response_class=HTMLResponse)
 def onboarding_tenant_sync_ms_to_evotor(tenant_id: str):
