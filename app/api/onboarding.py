@@ -973,6 +973,19 @@ def wizard_step3_submit(
                 aq("UPDATE tenants SET fiscal_token=?, fiscal_client_uid=?, fiscal_device_uid=? WHERE id=?"),
                 (fiscal_token.strip(), fiscal_client_uid.strip(), fiscal_device_uid.strip(), tenant_id),
             )
+        # Если это основной магазин — обновляем поля в tenants тоже
+        if primary_val:
+            cur.execute(
+                aq("""UPDATE tenants SET
+                    ms_organization_id = ?,
+                    ms_store_id = ?,
+                    ms_agent_id = ?,
+                    evotor_store_id = ?,
+                    updated_at = ?
+                WHERE id = ?"""),
+                (ms_organization_id.strip(), ms_store_id.strip(), ms_agent_id.strip(),
+                 store_id, now, tenant_id),
+            )
         conn.commit()
     except Exception as e:
         conn.rollback()
