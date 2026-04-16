@@ -319,6 +319,7 @@ def delete_tenant(tenant_id: str):
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     try:
+        cur.execute(aq("DELETE FROM product_group_mappings WHERE tenant_id = ?"), (tenant_id,))
         cur.execute(aq("DELETE FROM tenant_stores WHERE tenant_id = ?"), (tenant_id,))
         deleted_tenant_stores = cur.rowcount
 
