@@ -2602,6 +2602,64 @@ def get_fiscal_clients(tenant_id: str):
 
     return {"count": len(clients), "clients": clients}
 
+def _import_evotor_stock_to_ms(ms_token: str, tenant_id: str, evotor_store_id: str, products: list) -> dict:
+    """Создаёт оприходование в МС с остатками из Эвотор после initial_sync."""
+    from app.stores.mapping_store import MappingStore
+    products_with_stock = [p for p in products if float(p.get("quantity") or 0) > 0]
+    if not products_with_stock:
+        return {"status": "ok", "entered": 0, "skipped": len(products)}
+    ms_map = MappingStore()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        aq("SELECT ms_store_id, ms_organization_id FROM tenant_stores WHERE tenant_id = ? AND evotor_store_id = ?"),
+        (tenant_id, evotor_store_id),
+    )
+    store_row = cur.fetchone()
+    conn.close()
+    if not store_row or not store_row["ms_store_id"] or not store_row["ms_organization_id"]:
+        log.warning("_import_evotor_stock_to_ms: ms_store_id or ms_organization_id not set store=%s", evotor_store_id)
+        return {"status": "skipped", "reason": "ms_store_id or ms_organization_id not configured"}
+    ms_store_id = store_row["ms_store_id"]
+    ms_org_id = store_row["ms_organization_id"]
+    positions = []
+    for product in products_with_stock:
+        evotor_id = product.get("id")
+        quantity = float(product.get("quantity") or 0)
+        if not evotor_id or quantity <= 0:
+            continue
+        ms_id = ms_map.get_by_evotor_id(
+            tenant_id=tenant_id, entity_type="product",
+            evotor_id=evotor_id, evotor_store_id=evotor_store_id,
+        )
+        if not ms_id:
+            continue
+        cost_price = float(product.get("cost_price") or 0)
+        positions.append({
+            "quantity": quantity,
+            "price": round(cost_price * 100),
+            "assortment": {"meta": {"href": f"{MS_BASE}/entity/product/{ms_id}", "type": "product"}},
+        })
+    if not positions:
+        return {"status": "ok", "entered": 0, "skipped": len(products)}
+    r = requests.post(
+        f"{MS_BASE}/entity/enter",
+        headers=_ms_headers(ms_token),
+        json={
+            "organization": {"meta": {"href": f"{MS_BASE}/entity/organization/{ms_org_id}", "type": "organization"}},
+            "store": {"meta": {"href": f"{MS_BASE}/entity/store/{ms_store_id}", "type": "store"}},
+            "positions": positions,
+        },
+        timeout=30,
+    )
+    if r.ok:
+        log.info("_import_evotor_stock_to_ms: created enter doc store=%s positions=%d", evotor_store_id, len(positions))
+        return {"status": "ok", "entered": len(positions), "skipped": len(products) - len(positions)}
+    else:
+        log.error("_import_evotor_stock_to_ms: failed status=%s body=%s", r.status_code, r.text[:200])
+        return {"status": "error", "error": r.text[:200]}
+
+
 @router.post("/sync/{tenant_id}/stores/{evotor_store_id}/initial")
 def initial_sync_store(tenant_id: str, evotor_store_id: str):
     """Первичная синхронизация конкретного магазина Эвотор -> МойСклад."""
@@ -2670,6 +2728,16 @@ def initial_sync_store(tenant_id: str, evotor_store_id: str):
             )
             skipped += 1
 
+    # Импортируем остатки из Эвотор в МС через оприходование
+    if failed == 0 and products:
+        try:
+            stock_result = _import_evotor_stock_to_ms(
+                tenant["moysklad_token"], tenant_id, evotor_store_id, products,
+            )
+            log.info("Evotor stock import store=%s result=%s", evotor_store_id, stock_result)
+        except Exception as e:
+            log.warning("Evotor stock import failed store=%s err=%s", evotor_store_id, e)
+
     # Обновляем папки для всех товаров с parent_id (включая уже существующие)
     ms_map_for_folders = MappingStore()
     for product in products:
@@ -2704,6 +2772,19 @@ def initial_sync_store(tenant_id: str, evotor_store_id: str):
             )
         conn.commit()
         conn.close()
+
+    # Автоматически синхронизируем остатки после первичной синхронизации
+    if failed == 0:
+        try:
+            reconcile_result = reconcile_stock_store(tenant_id, evotor_store_id)
+            log.info(
+                "Auto reconcile after initial_sync store=%s synced=%s failed=%s",
+                evotor_store_id,
+                reconcile_result.get("synced", 0),
+                reconcile_result.get("failed", 0),
+            )
+        except Exception as e:
+            log.warning("Auto reconcile failed store=%s err=%s", evotor_store_id, e)
 
     return {
         "status": "ok" if failed == 0 else "partial",
