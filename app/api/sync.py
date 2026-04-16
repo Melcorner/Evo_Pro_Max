@@ -1205,6 +1205,94 @@ def _get_ms_uom_meta(ms_token: str, measure_name: str) -> dict | None:
     return None
 
 
+def _update_ms_product_folder(
+    ms_token: str,
+    ms_product_id: str,
+    evotor_product: dict,
+    evotor_token: str,
+    evotor_store_id: str,
+) -> None:
+    """Обновляет папку товара в МС если товар в группе Эвотор."""
+    parent_id = evotor_product.get("parent_id")
+    if not parent_id:
+        return
+    try:
+        # Ищем название группы в маппинге или через Эвотор API
+        folder_name = None
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            aq("SELECT ms_folder_name FROM product_group_mappings WHERE evotor_group_id = ? LIMIT 1"),
+            (parent_id,),
+        )
+        pgm = cur.fetchone()
+        conn.close()
+        if pgm and pgm["ms_folder_name"]:
+            folder_name = pgm["ms_folder_name"]
+        else:
+            # Получаем название группы из Эвотор API
+            _r = requests.get(
+                f"{EVOTOR_BASE}/stores/{evotor_store_id}/product-groups/{parent_id}",
+                headers=_evotor_headers(evotor_token),
+                timeout=15,
+            )
+            if _r.ok:
+                folder_name = _r.json().get("name")
+
+        if not folder_name:
+            return
+
+        folder_meta = _get_or_create_ms_folder(ms_token, folder_name)
+        if not folder_meta:
+            return
+
+        # Обновляем папку товара в МС
+        r = requests.put(
+            f"{MS_BASE}/entity/product/{ms_product_id}",
+            headers=_ms_headers(ms_token),
+            json={"productFolder": {"meta": folder_meta}},
+            timeout=20,
+        )
+        if r.ok:
+            log.info("Updated MS product folder=%s ms_id=%s", folder_name, ms_product_id)
+        else:
+            log.warning("Failed to update MS product folder ms_id=%s status=%s", ms_product_id, r.status_code)
+    except Exception as e:
+        log.warning("_update_ms_product_folder failed ms_id=%s err=%s", ms_product_id, e)
+
+
+def _get_or_create_ms_folder(ms_token: str, folder_name: str) -> dict | None:
+    """
+    Находит или создаёт папку в МС по названию.
+    Возвращает meta объект папки.
+    """
+    # Ищем существующую папку
+    r = requests.get(
+        f"{MS_BASE}/entity/productfolder",
+        headers=_ms_headers(ms_token),
+        params={"filter": f"name={folder_name}"},
+        timeout=20,
+    )
+    if r.ok:
+        rows = r.json().get("rows", [])
+        if rows:
+            return rows[0].get("meta")
+
+    # Создаём новую папку
+    r2 = requests.post(
+        f"{MS_BASE}/entity/productfolder",
+        headers=_ms_headers(ms_token),
+        json={"name": folder_name},
+        timeout=20,
+    )
+    if r2.ok:
+        log.info("Created MS folder name=%s", folder_name)
+        return r2.json().get("meta")
+
+    log.error("Failed to create MS folder name=%s status=%s", folder_name, r2.status_code)
+    return None
+
+
 def _create_ms_product(ms_token: str, product: dict) -> str:
     price_type_meta = _get_default_price_type_meta(ms_token)
     currency_meta = _get_default_currency_meta(ms_token)
@@ -1265,6 +1353,43 @@ def _create_ms_product(ms_token: str, product: dict) -> str:
             for bc in barcodes
             if str(bc).strip()
         ]
+
+    # --- Папка (группа) из Эвотор parent_id ---
+    evotor_parent_id = product.get("parent_id") or product.get("parentId")
+    if evotor_parent_id:
+        try:
+            folder_name = None
+            # Сначала ищем в маппинге
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                aq("SELECT ms_folder_name FROM product_group_mappings WHERE evotor_group_id = ? LIMIT 1"),
+                (evotor_parent_id,),
+            )
+            pgm = cur.fetchone()
+            conn.close()
+            if pgm and pgm["ms_folder_name"]:
+                folder_name = pgm["ms_folder_name"]
+            else:
+                # Получаем название группы из Эвотор по parent_id
+                # Ищем store_id через product
+                _store_id = product.get("store_id")
+                if _store_id and product.get("_evotor_token"):
+                    _r = requests.get(
+                        f"{EVOTOR_BASE}/stores/{_store_id}/product-groups/{evotor_parent_id}",
+                        headers=_evotor_headers(product["_evotor_token"]),
+                        timeout=15,
+                    )
+                    if _r.ok:
+                        folder_name = _r.json().get("name")
+
+            if folder_name:
+                folder_meta = _get_or_create_ms_folder(ms_token, folder_name)
+                if folder_meta:
+                    payload["productFolder"] = {"meta": folder_meta}
+                    log.info("Set MS folder=%s for product=%s", folder_name, product.get("name"))
+        except Exception as e:
+            log.warning("Failed to set MS folder for product err=%s", e)
 
     url = f"{MS_BASE}/entity/product"
     r = requests.post(url, headers=_ms_headers(ms_token), json=payload, timeout=20)
@@ -1355,6 +1480,11 @@ def initial_sync(tenant_id: str):
                     evotor_id,
                     ms_id,
                 )
+                # Обновляем папку если товар в группе Эвотор
+                _update_ms_product_folder(
+                    tenant["moysklad_token"], ms_id, product,
+                    tenant["evotor_token"], evotor_store_id,
+                )
             else:
                 # Ищем по названию — защита от дублей при переустановке
                 ms_id = _find_ms_product_by_name(tenant["moysklad_token"], product.get("name", ""))
@@ -1365,7 +1495,15 @@ def initial_sync(tenant_id: str):
                         ms_id,
                         product.get("name"),
                     )
+                    # Обновляем папку если товар в группе Эвотор
+                    _update_ms_product_folder(
+                        tenant["moysklad_token"], ms_id, product,
+                        tenant["evotor_token"], evotor_store_id,
+                    )
                 else:
+                    # Передаём evotor_token и store_id для резолва группы
+                    product["_evotor_token"] = tenant["evotor_token"]
+                    product["store_id"] = evotor_store_id
                     ms_id = _create_ms_product(tenant["moysklad_token"], product)
                 log.info(
                     "Created MS product evotor_id=%s ms_id=%s name=%s tax=%s type=%s",
@@ -2531,6 +2669,25 @@ def initial_sync_store(tenant_id: str, evotor_store_id: str):
                 evotor_id, ms_id, evotor_store_id,
             )
             skipped += 1
+
+    # Обновляем папки для всех товаров с parent_id (включая уже существующие)
+    ms_map_for_folders = MappingStore()
+    for product in products:
+        if not product.get("parent_id"):
+            continue
+        evotor_id = product.get("id")
+        ms_id = ms_map_for_folders.get_by_evotor_id(
+            tenant_id=tenant_id, entity_type="product",
+            evotor_id=evotor_id, evotor_store_id=evotor_store_id,
+        )
+        if ms_id:
+            try:
+                _update_ms_product_folder(
+                    tenant["moysklad_token"], ms_id, product,
+                    tenant["evotor_token"], evotor_store_id,
+                )
+            except Exception as e:
+                log.warning("Failed to update folder evotor_id=%s err=%s", evotor_id, e)
 
     if failed == 0:
         now = _now()
