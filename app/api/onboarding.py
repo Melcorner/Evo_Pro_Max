@@ -3062,10 +3062,35 @@ def store_add(
     finally:
         conn.close()
 
-    return RedirectResponse(
-        url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg=Магазин+добавлен",
-        status_code=303,
-    )
+    # Автоматически запускаем первичную синхронизацию нового магазина
+    try:
+        from app.api.sync import initial_sync_store
+        sync_result = initial_sync_store(tenant_id, evotor_store_id)
+        synced = sync_result.get("synced", 0)
+        skipped = sync_result.get("skipped", 0)
+        failed = sync_result.get("failed", 0)
+        log.info(
+            "store_add auto sync store=%s synced=%s skipped=%s failed=%s",
+            evotor_store_id, synced, skipped, failed,
+        )
+        from urllib.parse import quote_plus
+        msg = f"Магазин добавлен. Синхронизация: {synced + skipped} товаров, {failed} ошибок."
+        if failed > 0:
+            return RedirectResponse(
+                url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(msg)}",
+                status_code=303,
+            )
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={quote_plus(msg)}",
+            status_code=303,
+        )
+    except Exception as e:
+        log.exception("store_add auto sync failed store=%s", evotor_store_id)
+        from urllib.parse import quote_plus
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(f'Магазин добавлен, но синхронизация не выполнена: {e}')}",
+            status_code=303,
+        )
 
 
 @router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/sync", response_class=HTMLResponse)
