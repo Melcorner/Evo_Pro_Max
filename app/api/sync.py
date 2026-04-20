@@ -328,7 +328,7 @@ def _map_ms_tax_to_evotor(ms_product: dict, current_tax: str | None = None) -> s
         7.0: "VAT_7",
         10.0: "VAT_10",
         18.0: "VAT_18",
-        20.0: "VAT_20",
+        20.0: "VAT_22",  # С 2026 года НДС 20% -> VAT_22 в Эвотор
         22.0: "VAT_22",
     }
 
@@ -359,20 +359,33 @@ def _map_ms_tracking_type_to_evotor_type(ms_product: dict, current_type: str | N
         return current_type or "NORMAL"
 
     mapping = {
-        "MILK":           "DAIRY_MARKED",
-        "TOBACCO":        "TOBACCO_MARKED",
-        "SHOES":          "SHOES_MARKED",
-        "LP_CLOTHES":     "LIGHT_INDUSTRY_MARKED",
-        "LP_LINENS":      "LIGHT_INDUSTRY_MARKED",
-        "PERFUMERY":      "PERFUME_MARKED",
-        "ELECTRONICS":    "RADIO_MARKED",
-        "TIRES":          "TYRES_MARKED",
-        "CAMERA_PHOTO":   "PHOTOS_MARKED",
-        "WATER":          "WATER_MARKED",
-        "OTP":            "TOBACCO_PRODUCTS_MARKED",
-        "BICYCLE":        "BIKE_MARKED",
-        "WHEELCHAIRS":    "WHEELCHAIRS_MARKED",
-        "ALCOHOL":        "ALCOHOL_MARKED",
+        "MILK":                 "DAIRY_MARKED",
+        "TOBACCO":              "TOBACCO_MARKED",
+        "SHOES":                "SHOES_MARKED",
+        "LP_CLOTHES":           "LIGHT_INDUSTRY_MARKED",
+        "LP_LINENS":            "LIGHT_INDUSTRY_MARKED",
+        "PERFUMERY":            "PERFUME_MARKED",
+        "ELECTRONICS":          "PHOTOS_MARKED",
+        "TIRES":                "TYRES_MARKED",
+        "CAMERA_PHOTO":         "PHOTOS_MARKED",
+        "WATER":                "WATER_MARKED",
+        "OTP":                  "TOBACCO_PRODUCTS_MARKED",
+        "BICYCLE":              "BIKE_MARKED",
+        "WHEELCHAIRS":          "WHEELCHAIRS_MARKED",
+        "ALCOHOL":              "ALCOHOL_MARKED",
+        "MEDICINE":             "MEDICINE_MARKED",
+        "DIETARY_SUPPLEMENT":   "DIETARY_SUPPLEMENTS_MARKED",
+        "ANTISEPTIC":           "ANTISEPTIC_MARKED",
+        "JUICE":                "JUICE_MARKED",
+        "MEDICAL_DEVICES":      "MEDICAL_DEVICES_MARKED",
+        "VETERINARY":           "VETERINARY_MARKED",
+        "CAVIAR":               "CAVIAR_MARKED",
+        "PET_FOOD":             "PET_FOOD_MARKED",
+        "VEGETABLE_OIL":        "VEGETABLE_OIL_MARKED",
+        "FUR":                  "FUR_MARKED",
+        "AUTO_FLUIDS":          "AUTO_FLUIDS_MARKED",
+        "CHEMICALS":            "CHEMICALS_MARKED",
+        "JEWELRY":              "JEWELRY_MARKED",
         "MEDICINE":       "MEDICINE_MARKED",
         "NABEER":         "NOT_ALCOHOL_BEER_MARKED",
         "NICOTINE":        "TOBACCO_STICKS_MARKED",
@@ -465,8 +478,40 @@ def _get_or_create_evotor_group(
     finally:
         conn.close()
 
-    # Создаём группу в Эвотор
+    # Ищем существующую группу в Эвотор по имени
     headers = _evotor_headers(evotor_token)
+    r_list = _req.get(
+        f"{EVOTOR_BASE}/stores/{evotor_store_id}/product-groups",
+        headers=headers,
+        timeout=20,
+    )
+    if r_list.ok:
+        existing_groups = r_list.json().get("items", [])
+        for g in existing_groups:
+            if g.get("name") == ms_folder_name:
+                evotor_group_id = g["id"]
+                log.info("Found existing Evotor group name=%s id=%s", ms_folder_name, evotor_group_id)
+                # Сохраняем маппинг
+                now = _now()
+                conn = get_connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        aq("""
+                        INSERT INTO product_group_mappings
+                            (tenant_id, evotor_store_id, ms_folder_id, ms_folder_name, evotor_group_id, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (tenant_id, evotor_store_id, ms_folder_id)
+                        DO UPDATE SET evotor_group_id = EXCLUDED.evotor_group_id, updated_at = EXCLUDED.updated_at
+                        """),
+                        (tenant_id, evotor_store_id, ms_folder_id, ms_folder_name, evotor_group_id, now, now),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                return evotor_group_id
+
+    # Создаём группу в Эвотор
     r = _req.post(
         f"{EVOTOR_BASE}/stores/{evotor_store_id}/product-groups",
         headers=headers,
@@ -1072,6 +1117,7 @@ EVOTOR_TAX_TO_MS: dict[str, dict] = {
     "VAT_10":  {"vat": 10, "vatEnabled": True},
     "VAT_18":  {"vat": 18, "vatEnabled": True},
     "VAT_20":  {"vat": 20, "vatEnabled": True},
+    "VAT_22":  {"vat": 20, "vatEnabled": True},  # VAT_22 в Эвотор = 20% НДС в МС
     "VAT_22":  {"vat": 22, "vatEnabled": True},
 }
 
@@ -1079,11 +1125,34 @@ EVOTOR_TAX_TO_MS: dict[str, dict] = {
 # NORMAL намеренно отсутствует — МС ставит NOT_TRACKED по умолчанию,
 # явная передача NOT_TRACKED вызывает ошибку валидации для ряда товаров.
 EVOTOR_TYPE_TO_MS_TRACKING: dict[str, str] = {
-    "DAIRY_MARKED":    "MILK",
-    "TOBACCO_MARKED":  "TOBACCO",
-    "SHOES_MARKED":    "SHOES",
-    "MEDICINE_MARKED": "MEDICINE",
-    "WATER":           "WATER",
+    "DAIRY_MARKED":                 "MILK",
+    "TOBACCO_MARKED":               "TOBACCO",
+    "SHOES_MARKED":                 "SHOES",
+    "MEDICINE_MARKED":              "MEDICINE",
+    "WATER_MARKED":                 "WATER",
+    "LIGHT_INDUSTRY_MARKED":        "LP_CLOTHES",
+    "TOBACCO_PRODUCTS_MARKED":      "OTP",
+    "PERFUME_MARKED":               "PERFUMERY",
+    "ALCOHOL_MARKED":               "ALCOHOL",
+    "PHOTOS_MARKED":                "CAMERA_PHOTO",
+    "TYRES_MARKED":                 "TIRES",
+    "BIKE_MARKED":                  "BICYCLE",
+    "WHEELCHAIRS_MARKED":           "WHEELCHAIRS",
+    "DIETARY_SUPPLEMENTS_MARKED":   "DIETARY_SUPPLEMENT",
+    "ANTISEPTIC_MARKED":            "ANTISEPTIC",
+    "JUICE_MARKED":                 "JUICE",
+    "MEDICAL_DEVICES_MARKED":       "MEDICAL_DEVICES",
+    "VETERINARY_MARKED":            "VETERINARY",
+    "CAVIAR_MARKED":                "CAVIAR",
+    "PET_FOOD_MARKED":              "PET_FOOD",
+    "VEGETABLE_OIL_MARKED":         "VEGETABLE_OIL",
+    "FUR_MARKED":                   "FUR",
+    "AUTO_FLUIDS_MARKED":           "AUTO_FLUIDS",
+    "CHEMICALS_MARKED":             "CHEMICALS",
+    "JEWELRY_MARKED":               "JEWELRY",
+    "ALCOHOL_NOT_MARKED":           "ALCOHOL",
+    "BEER_MARKED":                  "ALCOHOL",
+    "FUR_MARKED":                   "FUR",
 }
 
 # Fix 7: кэш для мета дефолтного priceType и валюты
