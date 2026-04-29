@@ -64,7 +64,9 @@ def setup_logging() -> None:
     root.addHandler(stdout_handler)
 
     if log_to_file and log_file_path:
-        os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+        log_dir = os.path.dirname(log_file_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
         file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)

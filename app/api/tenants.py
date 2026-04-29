@@ -1,3 +1,4 @@
+import logging
 import time
 import uuid
 from typing import Optional
@@ -8,6 +9,7 @@ from pydantic import BaseModel
 from app.db import get_connection, adapt_query as aq
 
 router = APIRouter(tags=["Tenants"])
+log = logging.getLogger("api.tenants")
 
 
 class TenantCreate(BaseModel):
@@ -128,21 +130,32 @@ def configure_moysklad(tenant_id: str, body: TenantMoySkladConfig):
     # Upsert в tenant_stores если evotor_store_id задан
     if body.evotor_store_id and body.evotor_store_id.strip():
         import uuid as _uuid_mod, time as _time_mod
+        now = int(_time_mod.time())
         cursor.execute(
             aq("""
-            INSERT INTO tenant_stores (id, tenant_id, evotor_store_id, ms_store_id, ms_organization_id, is_primary, created_at)
-            VALUES (?, ?, ?, ?, ?, 1, ?)
+            INSERT INTO tenant_stores (
+                id, tenant_id, evotor_store_id,
+                ms_store_id, ms_organization_id, ms_agent_id,
+                is_primary, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
             ON CONFLICT (evotor_store_id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
                 ms_store_id = EXCLUDED.ms_store_id,
-                ms_organization_id = EXCLUDED.ms_organization_id
+                ms_organization_id = EXCLUDED.ms_organization_id,
+                ms_agent_id = EXCLUDED.ms_agent_id,
+                is_primary = 1,
+                updated_at = EXCLUDED.updated_at
             """),
             (
-                str(_uuid_mod.uuid4()), tenant_id,
+                str(_uuid_mod.uuid4()),
+                tenant_id,
                 body.evotor_store_id.strip(),
                 body.ms_store_id or None,
                 body.ms_organization_id or None,
-                int(_time_mod.time()),
+                body.ms_agent_id or None,
+                now,
+                now,
             ),
         )
 
@@ -184,34 +197,53 @@ def complete_sync(tenant_id: str):
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute(aq("SELECT id, sync_completed_at FROM tenants WHERE id = ?"), (tenant_id,))
-    row = cursor.fetchone()
-
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Tenant not found")
-
-    if row["sync_completed_at"]:
-        conn.close()
-        return {
-            "status": "already_completed",
-            "sync_completed_at": row["sync_completed_at"],
-            "sync_mode": "moysklad",
-        }
-
-    now = int(time.time())
-    cursor.execute(aq("UPDATE tenants SET sync_completed_at = ? WHERE id = ?"), (now, tenant_id))
-
-    conn.commit()
-    conn.close()
-
-# Уведомляем МойСклад что настройка завершена
     try:
-        from app.api.vendor import _notify_ms_activated
-        cursor.execute(aq("SELECT ms_account_id, moysklad_token FROM tenants WHERE id = ?"), (tenant_id,))
-        t = cursor.fetchone()
-        if t and t["ms_account_id"] and t["moysklad_token"]:
-            _notify_ms_activated(t["ms_account_id"], t["moysklad_token"])
+        cursor.execute(
+            aq("SELECT id, sync_completed_at, ms_account_id FROM tenants WHERE id = ?"),
+            (tenant_id,),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+        if row["sync_completed_at"]:
+            return {
+                "status": "already_completed",
+                "sync_completed_at": row["sync_completed_at"],
+                "sync_mode": "moysklad",
+            }
+
+        now = int(time.time())
+        cursor.execute(
+            aq("UPDATE tenants SET sync_completed_at = ?, updated_at = ? WHERE id = ?"),
+            (now, now, tenant_id),
+        )
+
+        # Для legacy tenant-level завершения отмечаем primary store, если он есть.
+        cursor.execute(
+            aq("UPDATE tenant_stores SET sync_completed_at = ?, updated_at = ? WHERE tenant_id = ? AND is_primary = 1"),
+            (now, now, tenant_id),
+        )
+
+        conn.commit()
+        ms_account_id = row["ms_account_id"]
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        log.exception("complete_sync failed tenant_id=%s", tenant_id)
+        raise
+    finally:
+        conn.close()
+
+    # Уведомляем МойСклад, что настройка завершена.
+    try:
+        if ms_account_id:
+            from app.api.vendor import _notify_ms_activated
+            _notify_ms_activated(ms_account_id)
     except Exception as e:
         log.warning("complete_sync: notify_ms_activated failed err=%s", e)
 
@@ -234,6 +266,10 @@ def reset_sync(tenant_id: str):
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     cursor.execute(aq("UPDATE tenants SET sync_completed_at = NULL WHERE id = ?"), (tenant_id,))
+    cursor.execute(
+        aq("UPDATE tenant_stores SET sync_completed_at = NULL, updated_at = ? WHERE tenant_id = ?"),
+        (int(time.time()), tenant_id),
+    )
 
     conn.commit()
     conn.close()

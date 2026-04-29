@@ -11,7 +11,7 @@ log = logging.getLogger("mappings_endpoint")
 
 router = APIRouter(
     prefix="/mappings",
-    tags=["Mappings"]
+    tags=["Mappings"],
 )
 
 
@@ -21,6 +21,7 @@ router = APIRouter(
 
 class MappingItem(BaseModel):
     tenant_id: str
+    evotor_store_id: Optional[str] = None
     entity_type: str
     evotor_id: str
     ms_id: str
@@ -40,6 +41,7 @@ class MappingCreate(BaseModel):
     entity_type: str
     evotor_id: str
     ms_id: str
+    evotor_store_id: Optional[str] = None
 
 
 # ==============================================================================
@@ -56,6 +58,7 @@ store = MappingStore()
 @router.get("", response_model=MappingsResponse)
 def list_mappings(
     tenant_id: Optional[str] = Query(None),
+    evotor_store_id: Optional[str] = Query(None),
     entity_type: Optional[str] = Query(None),
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -65,6 +68,7 @@ def list_mappings(
 
     Можно фильтровать по:
     - tenant_id
+    - evotor_store_id
     - entity_type
     """
     conn = get_connection()
@@ -74,6 +78,7 @@ def list_mappings(
         base_query = """
         SELECT
             tenant_id,
+            evotor_store_id,
             entity_type,
             evotor_id,
             ms_id,
@@ -88,6 +93,10 @@ def list_mappings(
         if tenant_id:
             conditions.append("tenant_id = ?")
             params.append(tenant_id)
+
+        if evotor_store_id:
+            conditions.append("evotor_store_id = ?")
+            params.append(evotor_store_id)
 
         if entity_type:
             conditions.append("entity_type = ?")
@@ -108,8 +117,14 @@ def list_mappings(
         items = [dict(r) for r in rows]
 
         log.info(
-            "List mappings returned=%s total=%s limit=%s offset=%s tenant_id=%s entity_type=%s",
-            len(items), total, limit, offset, tenant_id, entity_type,
+            "List mappings returned=%s total=%s limit=%s offset=%s tenant_id=%s evotor_store_id=%s entity_type=%s",
+            len(items),
+            total,
+            limit,
+            offset,
+            tenant_id,
+            evotor_store_id,
+            entity_type,
         )
 
         return {
@@ -134,23 +149,30 @@ def list_mappings(
 def create_mapping(data: MappingCreate):
     """
     Создать или обновить маппинг Evotor <-> MS.
+
+    Для store-aware схемы evotor_store_id обязателен.
     """
+    if not data.evotor_store_id:
+        raise HTTPException(status_code=400, detail="evotor_store_id is required for mappings")
+
     ok = store.upsert_mapping(
-        data.tenant_id,
-        data.entity_type,
-        data.evotor_id,
-        data.ms_id,
+        tenant_id=data.tenant_id,
+        entity_type=data.entity_type,
+        evotor_id=data.evotor_id,
+        ms_id=data.ms_id,
+        evotor_store_id=data.evotor_store_id,
     )
 
     if not ok:
         raise HTTPException(
             status_code=409,
-            detail="ms_id already mapped to another evotor_id",
+            detail="mapping conflict: ms_id already mapped to another evotor_id in this store",
         )
 
     return {
         "status": "ok",
         "tenant_id": data.tenant_id,
+        "evotor_store_id": data.evotor_store_id,
         "entity_type": data.entity_type,
         "evotor_id": data.evotor_id,
         "ms_id": data.ms_id,
@@ -166,30 +188,62 @@ def create_mapping(data: MappingCreate):
     "/{tenant_id}/{entity_type}/{evotor_id}",
     summary="Удалить маппинг по evotor_id",
 )
-def delete_mapping(tenant_id: str, entity_type: str, evotor_id: str):
+def delete_mapping(
+    tenant_id: str,
+    entity_type: str,
+    evotor_id: str,
+    evotor_store_id: Optional[str] = Query(None),
+):
     """
-    Удаляет один маппинг по `tenant_id` + `entity_type` + `evotor_id`.
+    Удаляет один маппинг.
 
-    Пример:
-    DELETE /mappings/my-tenant/product/evotor-uuid-123
+    Если evotor_store_id передан — удаляет только mapping конкретного магазина.
+    Если evotor_store_id не передан — сохраняется legacy-поведение и удаляются
+    mappings этого tenant/entity_type/evotor_id во всех магазинах.
     """
     conn = get_connection()
+
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            aq("DELETE FROM mappings WHERE tenant_id = ? AND entity_type = ? AND evotor_id = ?"),
-            (tenant_id, entity_type, evotor_id),
-        )
+
+        if evotor_store_id:
+            cursor.execute(
+                aq("""
+                DELETE FROM mappings
+                WHERE tenant_id = ?
+                  AND evotor_store_id = ?
+                  AND entity_type = ?
+                  AND evotor_id = ?
+                """),
+                (tenant_id, evotor_store_id, entity_type, evotor_id),
+            )
+        else:
+            cursor.execute(
+                aq("""
+                DELETE FROM mappings
+                WHERE tenant_id = ?
+                  AND entity_type = ?
+                  AND evotor_id = ?
+                """),
+                (tenant_id, entity_type, evotor_id),
+            )
+
         conn.commit()
 
         deleted = cursor.rowcount or 0
+
         if deleted == 0:
             raise HTTPException(status_code=404, detail="Маппинг не найден")
 
         log.info(
-            "Mapping deleted tenant_id=%s entity_type=%s evotor_id=%s",
-            tenant_id, entity_type, evotor_id,
+            "Mapping deleted tenant_id=%s evotor_store_id=%s entity_type=%s evotor_id=%s count=%s",
+            tenant_id,
+            evotor_store_id,
+            entity_type,
+            evotor_id,
+            deleted,
         )
+
         return {"status": "ok", "deleted": deleted}
 
     except HTTPException:
@@ -210,27 +264,55 @@ def delete_mapping(tenant_id: str, entity_type: str, evotor_id: str):
     "/{tenant_id}/{entity_type}",
     summary="Удалить все маппинги тенанта по типу сущности",
 )
-def delete_mappings_by_type(tenant_id: str, entity_type: str):
+def delete_mappings_by_type(
+    tenant_id: str,
+    entity_type: str,
+    evotor_store_id: Optional[str] = Query(None),
+):
     """
-    Удаляет все маппинги для `tenant_id` + `entity_type`.
+    Удаляет mappings для tenant_id + entity_type.
 
-    Полезно для сброса маппингов товаров перед повторным initial sync.
+    Если evotor_store_id передан — удаляет mappings только конкретного магазина.
+    Если evotor_store_id не передан — сохраняется legacy-поведение и удаляются
+    mappings этого типа по всему tenant.
     """
     conn = get_connection()
+
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            aq("DELETE FROM mappings WHERE tenant_id = ? AND entity_type = ?"),
-            (tenant_id, entity_type),
-        )
+
+        if evotor_store_id:
+            cursor.execute(
+                aq("""
+                DELETE FROM mappings
+                WHERE tenant_id = ?
+                  AND evotor_store_id = ?
+                  AND entity_type = ?
+                """),
+                (tenant_id, evotor_store_id, entity_type),
+            )
+        else:
+            cursor.execute(
+                aq("""
+                DELETE FROM mappings
+                WHERE tenant_id = ?
+                  AND entity_type = ?
+                """),
+                (tenant_id, entity_type),
+            )
+
         conn.commit()
 
         deleted = cursor.rowcount or 0
 
         log.info(
-            "Mappings deleted tenant_id=%s entity_type=%s count=%s",
-            tenant_id, entity_type, deleted,
+            "Mappings deleted tenant_id=%s evotor_store_id=%s entity_type=%s count=%s",
+            tenant_id,
+            evotor_store_id,
+            entity_type,
+            deleted,
         )
+
         return {"status": "ok", "deleted": deleted}
 
     except Exception as e:
@@ -249,25 +331,51 @@ def delete_mappings_by_type(tenant_id: str, entity_type: str):
     "/{tenant_id}",
     summary="Удалить все маппинги тенанта",
 )
-def delete_all_tenant_mappings(tenant_id: str):
+def delete_all_tenant_mappings(
+    tenant_id: str,
+    evotor_store_id: Optional[str] = Query(None),
+):
     """
-    Удаляет все маппинги для указанного `tenant_id`.
+    Удаляет mappings tenant.
+
+    Если evotor_store_id передан — удаляет mappings только конкретного магазина.
+    Если evotor_store_id не передан — сохраняется legacy-поведение и удаляются
+    все mappings tenant.
     """
     conn = get_connection()
+
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            aq("DELETE FROM mappings WHERE tenant_id = ?"),
-            (tenant_id,),
-        )
+
+        if evotor_store_id:
+            cursor.execute(
+                aq("""
+                DELETE FROM mappings
+                WHERE tenant_id = ?
+                  AND evotor_store_id = ?
+                """),
+                (tenant_id, evotor_store_id),
+            )
+        else:
+            cursor.execute(
+                aq("""
+                DELETE FROM mappings
+                WHERE tenant_id = ?
+                """),
+                (tenant_id,),
+            )
+
         conn.commit()
 
         deleted = cursor.rowcount or 0
 
         log.info(
-            "All mappings deleted tenant_id=%s count=%s",
-            tenant_id, deleted,
+            "All mappings deleted tenant_id=%s evotor_store_id=%s count=%s",
+            tenant_id,
+            evotor_store_id,
+            deleted,
         )
+
         return {"status": "ok", "deleted": deleted}
 
     except Exception as e:

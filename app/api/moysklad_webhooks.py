@@ -9,7 +9,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from app.api.sync import _upsert_stock_status
+from app.api.sync import _get_ms_product_stock_for_store, _upsert_stock_status
 from app.db import get_connection, adapt_query as aq
 from app.stores.mapping_store import MappingStore
 from app.clients.moysklad_client import MoySkladClient
@@ -84,13 +84,45 @@ def _get_ms_webhook_secret() -> str:
     return os.getenv("MS_WEBHOOK_SECRET", "").strip()
 
 
-def _verify_signature(body: bytes, signature: str | None) -> bool:
-    secret = _get_ms_webhook_secret()
-    if not secret:
-        log.warning("MS_WEBHOOK_SECRET not set - skipping signature verification")
-        return True
+def _normalize_signature(signature: str | None) -> str | None:
+    """
+    Нормализует подпись из заголовка X-Lognex-Signature.
 
+    Поддерживает:
+    - обычный hex digest;
+    - значение с префиксом sha256=...
+    """
     if not signature:
+        return None
+
+    value = signature.strip()
+
+    if value.lower().startswith("sha256="):
+        value = value.split("=", 1)[1].strip()
+
+    return value.lower() or None
+
+
+def _verify_signature(body: bytes, signature: str | None) -> bool:
+    """
+    Проверяет подпись webhook от МойСклад через HMAC-SHA256.
+
+    Важно:
+    - без MS_WEBHOOK_SECRET запрос не принимаем;
+    - значение подписи не логируем;
+    - сравнение выполняем через hmac.compare_digest.
+    """
+    secret = _get_ms_webhook_secret()
+
+    if not secret:
+        log.error("moysklad.webhook.signature: MS_WEBHOOK_SECRET is not set")
+        return False
+
+    normalized_signature = _normalize_signature(signature)
+
+    log.info("moysklad.webhook.signature: present=%s", bool(normalized_signature))
+
+    if not normalized_signature:
         return False
 
     expected = hmac.new(
@@ -99,7 +131,7 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
         hashlib.sha256,
     ).hexdigest()
 
-    return hmac.compare_digest(expected, signature)
+    return hmac.compare_digest(expected, normalized_signature)
 
 
 def _get_document_positions(ms_client: MoySkladClient, doc_type: str, doc_id: str) -> List[str]:
@@ -116,7 +148,10 @@ def _get_document_positions(ms_client: MoySkladClient, doc_type: str, doc_id: st
     if not r.ok:
         log.error(
             "Failed to fetch positions doc_type=%s doc_id=%s status=%s body=%s",
-            doc_type, doc_id, r.status_code, r.text,
+            doc_type,
+            doc_id,
+            r.status_code,
+            r.text[:300],
         )
         r.raise_for_status()
 
@@ -135,57 +170,129 @@ def _get_document_positions(ms_client: MoySkladClient, doc_type: str, doc_id: st
     return product_ids
 
 
+def _load_stock_sync_stores(tenant_id: str) -> list[dict]:
+    """Возвращает магазины, для которых можно обновлять остатки МойСклад → Эвотор."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            aq("""
+            SELECT evotor_store_id, ms_store_id
+            FROM tenant_stores
+            WHERE tenant_id = ?
+              AND sync_completed_at IS NOT NULL
+            ORDER BY is_primary DESC, created_at ASC
+            """),
+            (tenant_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        if rows:
+            return rows
+
+        # Fallback для старой tenant-level конфигурации.
+        cur.execute(
+            aq("""
+            SELECT evotor_store_id, ms_store_id
+            FROM tenants
+            WHERE id = ? AND evotor_store_id IS NOT NULL AND TRIM(evotor_store_id) <> ''
+            """),
+            (tenant_id,),
+        )
+        row = cur.fetchone()
+        return [dict(row)] if row else []
+    finally:
+        conn.close()
+
+
 def _sync_stock_for_products(
     tenant_id: str,
     ms_product_ids: List[str],
 ) -> dict:
     """
     Синхронизирует остатки для списка товаров МойСклад → Эвотор.
-    Возвращает статистику.
+
+    В multi-store режиме один ms_id может иметь разные остатки для разных складов
+    МойСклад, поэтому mapping и EvotorClient выбираются строго по evotor_store_id.
     """
-    store = MappingStore()
+    mapping_store = MappingStore()
     ms_client = MoySkladClient(tenant_id)
-    evotor_client = EvotorClient(tenant_id)
+    stores = _load_stock_sync_stores(tenant_id)
 
     synced = 0
     skipped = 0
     failed = 0
     errors = []
 
-    for ms_id in ms_product_ids:
-        evotor_id = store.get_by_ms_id(
-            tenant_id=tenant_id,
-            entity_type="product",
-            ms_id=ms_id,
-        )
+    if not stores:
+        log.warning("No synced stores for tenant_id=%s — skipping stock sync", tenant_id)
+        return {"synced": 0, "skipped": len(ms_product_ids), "failed": 0, "errors": []}
 
-        if not evotor_id:
+    for ms_id in ms_product_ids:
+        product_had_mapping = False
+
+        for store_row in stores:
+            evotor_store_id = store_row.get("evotor_store_id")
+            ms_store_id = store_row.get("ms_store_id")
+            if not evotor_store_id:
+                continue
+
+            evotor_id = mapping_store.get_by_ms_id(
+                tenant_id=tenant_id,
+                entity_type="product",
+                ms_id=ms_id,
+                evotor_store_id=evotor_store_id,
+            )
+
+            if not evotor_id:
+                continue
+
+            product_had_mapping = True
+
+            try:
+                if ms_store_id:
+                    quantity = _get_ms_product_stock_for_store(ms_client.token, ms_id, ms_store_id)
+                else:
+                    quantity = ms_client.get_product_stock(ms_id)
+            except Exception as e:
+                log.error(
+                    "Failed to get stock ms_id=%s store=%s ms_store=%s err=%s",
+                    ms_id, evotor_store_id, ms_store_id, e,
+                )
+                failed += 1
+                errors.append({
+                    "ms_id": ms_id,
+                    "evotor_store_id": evotor_store_id,
+                    "error": str(e),
+                })
+                continue
+
+            try:
+                evotor_client = EvotorClient(tenant_id, store_id=evotor_store_id)
+                evotor_client.update_product_stock(evotor_id, quantity)
+                log.info(
+                    "Stock synced ms_id=%s evotor_id=%s store=%s ms_store=%s quantity=%s",
+                    ms_id, evotor_id, evotor_store_id, ms_store_id, quantity,
+                )
+                synced += 1
+            except Exception as e:
+                log.error(
+                    "Failed to update Evotor stock evotor_id=%s store=%s err=%s",
+                    evotor_id, evotor_store_id, e,
+                )
+                failed += 1
+                errors.append({
+                    "ms_id": ms_id,
+                    "evotor_id": evotor_id,
+                    "evotor_store_id": evotor_store_id,
+                    "error": str(e),
+                })
+
+        if not product_had_mapping:
             log.warning(
-                "No mapping for ms_id=%s tenant_id=%s — skipping stock sync",
+                "No store-aware mapping for ms_id=%s tenant_id=%s — skipping stock sync",
                 ms_id, tenant_id,
             )
             skipped += 1
-            continue
-
-        try:
-            quantity = ms_client.get_product_stock(ms_id)
-        except Exception as e:
-            log.error("Failed to get stock ms_id=%s err=%s", ms_id, e)
-            failed += 1
-            errors.append({"ms_id": ms_id, "error": str(e)})
-            continue
-
-        try:
-            evotor_client.update_product_stock(evotor_id, quantity)
-            log.info(
-                "Stock synced ms_id=%s evotor_id=%s quantity=%s",
-                ms_id, evotor_id, quantity,
-            )
-            synced += 1
-        except Exception as e:
-            log.error("Failed to update Evotor stock evotor_id=%s err=%s", evotor_id, e)
-            failed += 1
-            errors.append({"ms_id": ms_id, "evotor_id": evotor_id, "error": str(e)})
 
     return {
         "synced": synced,
@@ -258,25 +365,41 @@ async def moysklad_webhook(
             # Обработка создания/обновления товара
             if doc_type == "product" and doc_id:
                 log.info("MoySklad product event tenant_id=%s product_id=%s", tenant_id, doc_id)
+                
                 try:
                     from app.api.sync import sync_ms_to_evotor_store
                     from app.db import get_connection as _gc, adapt_query as _aq
+
                     _conn = _gc()
-                    _cur = _conn.cursor()
-                    _cur.execute(
-                        _aq("SELECT evotor_store_id FROM tenant_stores WHERE tenant_id = ? AND sync_completed_at IS NOT NULL"),
-                        (tenant_id,),
-                    )
-                    store_ids = [r["evotor_store_id"] for r in _cur.fetchall()]
-                    _conn.close()
+                    try:
+                        _cur = _conn.cursor()
+                        _cur.execute(
+                            _aq("""
+                            SELECT evotor_store_id
+                            FROM tenant_stores
+                            WHERE tenant_id = ?
+                              AND sync_completed_at IS NOT NULL
+                            """),
+                            (tenant_id,),
+                        )
+                        store_ids = [r["evotor_store_id"] for r in _cur.fetchall()]
+                    finally:
+                        _conn.close()
+
                     for _sid in store_ids:
                         try:
                             _res = sync_ms_to_evotor_store(tenant_id, _sid)
-                            log.info("Product sync after MS webhook store=%s synced=%s", _sid, _res.get("synced", 0))
+                            log.info(
+                                "Product sync after MS webhook store=%s synced=%s",
+                                _sid,
+                                _res.get("synced", 0),
+                            )
                         except Exception as _e:
                             log.error("Product sync failed store=%s err=%s", _sid, _e)
+                
                 except Exception as e:
                     log.error("Failed to handle product webhook err=%s", e)
+                
                 continue
 
             if not doc_type or doc_type not in STOCK_TRIGGER_TYPES:

@@ -17,11 +17,13 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 SCHEMA_TABLES = (
     "tenants",
+    "tenant_stores",
     "evotor_connections",
     "evotor_onboarding_sessions",
     "event_store",
     "processed_events",
     "mappings",
+    "product_group_mappings",
     "errors",
     "stock_sync_status",
     "fiscalization_checks",
@@ -69,11 +71,15 @@ INDEX_DEFINITIONS = [
     ),
     (
         "idx_mappings_evotor",
-        "CREATE INDEX IF NOT EXISTS idx_mappings_evotor ON mappings(tenant_id, entity_type, evotor_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mappings_evotor ON mappings(tenant_id, evotor_store_id, entity_type, evotor_id)",
     ),
     (
         "idx_mappings_ms",
-        "CREATE INDEX IF NOT EXISTS idx_mappings_ms ON mappings(tenant_id, entity_type, ms_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mappings_ms ON mappings(tenant_id, evotor_store_id, entity_type, ms_id)",
+    ),
+    (
+        "idx_product_group_mappings_store",
+        "CREATE INDEX IF NOT EXISTS idx_product_group_mappings_store ON product_group_mappings(tenant_id, evotor_store_id)",
     ),
     (
         "idx_tenants_evotor_user_id_lookup",
@@ -156,6 +162,145 @@ def _create_index(conn, ddl: str, index_name: str) -> None:
         log.info("  + index %s", index_name)
 
 
+def _create_mappings_table(cur, table_name: str = "mappings") -> None:
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            tenant_id        TEXT NOT NULL,
+            evotor_store_id TEXT NOT NULL DEFAULT '',
+            entity_type      TEXT NOT NULL,
+            evotor_id        TEXT NOT NULL,
+            ms_id            TEXT NOT NULL,
+            created_at       INTEGER NOT NULL,
+            updated_at       INTEGER NOT NULL,
+
+            UNIQUE (tenant_id, evotor_store_id, entity_type, evotor_id),
+            UNIQUE (tenant_id, evotor_store_id, entity_type, ms_id),
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        )
+        """
+    )
+
+
+def _sqlite_index_columns(conn, table: str) -> list[tuple[str, ...]]:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA index_list({table})")
+    result = []
+    for row in cur.fetchall():
+        index_name = row[1]
+        is_unique = bool(row[2])
+        if not is_unique:
+            continue
+        cur.execute(f"PRAGMA index_info({index_name})")
+        result.append(tuple(col[2] for col in cur.fetchall()))
+    return result
+
+
+def _mappings_store_unique_ready(conn) -> bool:
+    if not _col_exists(conn, "mappings", "evotor_store_id"):
+        return False
+
+    backend = db_backend()
+    expected_evotor = ("tenant_id", "evotor_store_id", "entity_type", "evotor_id")
+    expected_ms = ("tenant_id", "evotor_store_id", "entity_type", "ms_id")
+
+    if backend == "sqlite":
+        unique_indexes = set(_sqlite_index_columns(conn, "mappings"))
+        return expected_evotor in unique_indexes and expected_ms in unique_indexes
+
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT indexdef
+        FROM pg_indexes
+        WHERE tablename = 'mappings'
+        """
+    )
+    index_defs = "\n".join(row["indexdef"] for row in cur.fetchall())
+    compact = index_defs.replace(" ", "").lower()
+    return (
+        "(tenant_id,evotor_store_id,entity_type,evotor_id)" in compact
+        and "(tenant_id,evotor_store_id,entity_type,ms_id)" in compact
+    )
+
+
+def _rebuild_sqlite_mappings(conn) -> None:
+    cur = conn.cursor()
+    log.info("Rebuilding mappings table for store-aware unique constraints")
+    cur.execute("ALTER TABLE mappings RENAME TO mappings_legacy")
+    _create_mappings_table(cur, "mappings")
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO mappings (
+            tenant_id, evotor_store_id, entity_type, evotor_id, ms_id, created_at, updated_at
+        )
+        SELECT tenant_id,
+               COALESCE(evotor_store_id, ''),
+               entity_type,
+               evotor_id,
+               ms_id,
+               created_at,
+               updated_at
+        FROM mappings_legacy
+        """
+    )
+    cur.execute("DROP TABLE mappings_legacy")
+
+
+def _ensure_mappings_store_schema(conn) -> None:
+    """
+    Приводит mappings к store-aware схеме. Это нужно, потому что простого
+    ADD COLUMN недостаточно: старые UNIQUE(tenant_id, entity_type, ...)
+    ломают мультимагазинность и ON CONFLICT по evotor_store_id.
+    """
+    cur = conn.cursor()
+    backend = db_backend()
+
+    # На чистой БД таблицы mappings ещё может не быть.
+    _create_mappings_table(cur, "mappings")
+
+    if backend == "sqlite":
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mappings'")
+        if cur.fetchone() is None:
+            _create_mappings_table(cur, "mappings")
+            return
+        if not _mappings_store_unique_ready(conn):
+            if not _col_exists(conn, "mappings", "evotor_store_id"):
+                cur.execute("ALTER TABLE mappings ADD COLUMN evotor_store_id TEXT NOT NULL DEFAULT ''")
+            _rebuild_sqlite_mappings(conn)
+        return
+
+    if not _col_exists(conn, "mappings", "evotor_store_id"):
+        cur.execute("ALTER TABLE mappings ADD COLUMN evotor_store_id TEXT NOT NULL DEFAULT ''")
+        log.info("  + mappings.evotor_store_id")
+
+    cur.execute(
+        """
+        SELECT conname
+        FROM pg_constraint
+        WHERE conrelid = 'mappings'::regclass
+          AND contype = 'u'
+        """
+    )
+    for row in cur.fetchall():
+        conname = row["conname"]
+        cur.execute(f'ALTER TABLE mappings DROP CONSTRAINT IF EXISTS "{conname}"')
+        log.info("  - old unique constraint mappings.%s", conname)
+
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mappings_unique_evotor_store
+        ON mappings(tenant_id, evotor_store_id, entity_type, evotor_id)
+        """
+    )
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mappings_unique_ms_store
+        ON mappings(tenant_id, evotor_store_id, entity_type, ms_id)
+        """
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -200,6 +345,28 @@ def init_db():
             ms_account_id       TEXT,
             ms_status           TEXT DEFAULT 'active',
             updated_at          INTEGER
+        )
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # tenant_stores
+    # ------------------------------------------------------------------
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tenant_stores (
+            id                  TEXT PRIMARY KEY,
+            tenant_id           TEXT NOT NULL,
+            evotor_store_id     TEXT NOT NULL UNIQUE,
+            name                TEXT,
+            ms_store_id         TEXT,
+            ms_organization_id  TEXT,
+            ms_agent_id         TEXT,
+            is_primary          INTEGER NOT NULL DEFAULT 0,
+            sync_completed_at   INTEGER,
+            created_at          INTEGER NOT NULL,
+            updated_at          INTEGER,
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
         )
         """
     )
@@ -279,18 +446,24 @@ def init_db():
     # ------------------------------------------------------------------
     # mappings
     # ------------------------------------------------------------------
+    _ensure_mappings_store_schema(conn)
+
+    # ------------------------------------------------------------------
+    # product_group_mappings
+    # ------------------------------------------------------------------
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS mappings (
-            tenant_id       TEXT NOT NULL,
-            entity_type     TEXT NOT NULL,
-            evotor_id       TEXT NOT NULL,
-            ms_id           TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS product_group_mappings (
+            tenant_id        TEXT NOT NULL,
+            evotor_store_id TEXT NOT NULL,
+            ms_folder_id    TEXT NOT NULL,
+            ms_folder_name  TEXT NOT NULL,
+            evotor_group_id TEXT NOT NULL,
             created_at      INTEGER NOT NULL,
             updated_at      INTEGER NOT NULL,
 
-            UNIQUE (tenant_id, entity_type, evotor_id),
-            UNIQUE (tenant_id, entity_type, ms_id)
+            UNIQUE (tenant_id, evotor_store_id, ms_folder_id),
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
         )
         """
     )
@@ -414,12 +587,6 @@ def init_db():
     )
 
     # ------------------------------------------------------------------
-    # Индексы
-    # ------------------------------------------------------------------
-    for index_name, ddl in INDEX_DEFINITIONS:
-        _create_index(conn, ddl, index_name)
-
-    # ------------------------------------------------------------------
     # Миграции: добавляем колонки которых может не быть в старой БД
     # ------------------------------------------------------------------
     log.info("Applying migrations...")
@@ -442,6 +609,14 @@ def init_db():
         ("tenants", "alerts_email_enabled", "INTEGER NOT NULL DEFAULT 1"),
         ("tenants", "telegram_chat_id", "TEXT"),
         ("tenants", "alerts_telegram_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        # tenant_stores
+        ("tenant_stores", "name", "TEXT"),
+        ("tenant_stores", "ms_store_id", "TEXT"),
+        ("tenant_stores", "ms_organization_id", "TEXT"),
+        ("tenant_stores", "ms_agent_id", "TEXT"),
+        ("tenant_stores", "is_primary", "INTEGER NOT NULL DEFAULT 0"),
+        ("tenant_stores", "sync_completed_at", "INTEGER"),
+        ("tenant_stores", "updated_at", "INTEGER"),
         # stock_sync_status
         ("stock_sync_status", "started_at", "INTEGER"),
         ("stock_sync_status", "updated_at", "INTEGER NOT NULL DEFAULT 0"),
@@ -465,6 +640,13 @@ def init_db():
 
     for table, column, definition in migrations:
         _add_column_if_missing(conn, table, column, definition)
+
+    # ------------------------------------------------------------------
+    # Индексы создаём после миграций, иначе старые БД падают на индексах
+    # по колонкам, которые ещё не добавлены.
+    # ------------------------------------------------------------------
+    for index_name, ddl in INDEX_DEFINITIONS:
+        _create_index(conn, ddl, index_name)
 
     conn.commit()
     conn.close()

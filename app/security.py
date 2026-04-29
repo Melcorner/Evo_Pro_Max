@@ -15,20 +15,34 @@ def _get_admin_api_token() -> str:
     return os.getenv("ADMIN_API_TOKEN", "").strip()
 
 
+def _get_app_env() -> str:
+    return os.getenv("APP_ENV", "").strip().lower()
+
+
+def _is_production() -> bool:
+    return _get_app_env() in {"prod", "production"}
+
+
 def require_admin_api_token(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ) -> None:
     """
-    Простая Bearer-auth защита для внутренних/admin endpoint'ов.
+    Bearer-auth защита для внутренних/admin endpoint'ов.
 
     Логика:
-    - если ADMIN_API_TOKEN не задан, защита отключается
-    - если токен задан, нужен Bearer token
+    - если ADMIN_API_TOKEN задан, нужен Authorization: Bearer <token>;
+    - если ADMIN_API_TOKEN не задан в production, доступ запрещён;
+    - если ADMIN_API_TOKEN не задан вне production, auth остаётся отключённой
+      для локальной разработки и старых тестов.
     """
     expected = _get_admin_api_token()
 
     if not expected:
-        log.debug("ADMIN_API_TOKEN not set - admin API auth is disabled")
+        if _is_production():
+            log.error("ADMIN_API_TOKEN is not set in production - admin API is disabled")
+            raise HTTPException(status_code=500, detail="Admin API is not configured")
+
+        log.warning("ADMIN_API_TOKEN not set - admin API auth is disabled outside production")
         return
 
     if credentials is None:

@@ -118,9 +118,12 @@ def _extract_discount_percent(item: dict, base_sum: float, final_sum: float) -> 
     for src in (position_discount, doc_distributed_discount):
         if not isinstance(src, dict):
             continue
+
         raw_percent = src.get("discount_percent", src.get("discountPercent"))
+
         if raw_percent is None:
             continue
+
         try:
             total_percent += float(raw_percent)
             found_explicit_percent = True
@@ -143,31 +146,68 @@ def _extract_discount_percent(item: dict, base_sum: float, final_sum: float) -> 
 def _extract_vat_fields(item: dict) -> dict:
     """
     Поддерживает два сценария:
-    1) Реальный ReceiptCreated: taxPercent = 0 / 10 / 20
+    1) Реальный ReceiptCreated: taxPercent = 0 / 10 / 20 / 22
     2) Легаси-формат: tax = {type: NO_VAT/VAT_10/VAT_20}
     """
     raw_tax_percent = _to_float(item.get("tax_percent", item.get("taxPercent")))
+
     if raw_tax_percent is not None:
         rounded = int(round(raw_tax_percent))
+
         if rounded == 0:
             return {"vat": 0, "vatEnabled": False}
+
         if rounded in (10, 20, 22):
             return {"vat": rounded, "vatEnabled": True}
-        log.warning(f"Unsupported Evotor taxPercent={raw_tax_percent}")
+
+        log.warning("Unsupported Evotor taxPercent=%s", raw_tax_percent)
         return {}
 
     tax = item.get("tax")
+
     if isinstance(tax, dict):
         tax_type = tax.get("type")
+
         if not tax_type:
             return {}
+
         result = LEGACY_VAT_MAP.get(tax_type)
+
         if result is None:
-            log.warning(f"Unsupported Evotor tax.type={tax_type}")
+            log.warning("Unsupported Evotor tax.type=%s", tax_type)
             return {}
+
         return result
 
     return {}
+
+
+def _extract_evotor_store_id(payload: dict, explicit_store_id: str | None = None) -> str | None:
+    """
+    Определяет магазин Эвотор для store-aware поиска mappings.
+
+    Основной нормализованный payload содержит store_id.
+    На всякий случай поддерживаем storeId, evotor_store_id и source_data.storeId.
+    """
+    if explicit_store_id:
+        return explicit_store_id
+
+    store_id = (
+        payload.get("store_id")
+        or payload.get("storeId")
+        or payload.get("evotor_store_id")
+    )
+
+    if store_id:
+        return str(store_id)
+
+    source_data = payload.get("source_data") or {}
+    if isinstance(source_data, dict):
+        source_store_id = source_data.get("storeId") or source_data.get("store_id")
+        if source_store_id:
+            return str(source_store_id)
+
+    return None
 
 
 def map_sale_to_ms(
@@ -178,6 +218,7 @@ def map_sale_to_ms(
     ms_store_id: str = None,
     ms_agent_id: str = None,
     counterparty_resolution_source: str | None = None,
+    evotor_store_id: str | None = None,
 ) -> dict:
     log.info("Mapping sale payload")
 
@@ -187,6 +228,7 @@ def map_sale_to_ms(
     body = payload.get("body", {}) or {}
     effective_sync_id = sync_id or event_id
     raw_positions = body.get("positions", [])
+    effective_evotor_store_id = _extract_evotor_store_id(payload, evotor_store_id)
 
     store = MappingStore() if tenant_id else None
     ms_positions = []
@@ -201,19 +243,27 @@ def map_sale_to_ms(
         final_sum = float(result_sum_raw) if result_sum_raw is not None else base_sum
 
         ms_product_id = None
+
         if store and tenant_id and evotor_product_id:
             ms_product_id = store.get_by_evotor_id(
                 tenant_id=tenant_id,
                 entity_type="product",
                 evotor_id=evotor_product_id,
+                evotor_store_id=effective_evotor_store_id,
             )
+
             if ms_product_id:
                 log.info(
-                    f"Position[{i}]: mapping found {evotor_product_id} -> {ms_product_id}"
+                    "Position[%s]: mapping found store=%s %s -> %s",
+                    i,
+                    effective_evotor_store_id,
+                    evotor_product_id,
+                    ms_product_id,
                 )
             else:
                 raise MappingNotFoundError(
                     f"Mapping not found for product_id={evotor_product_id} "
+                    f"store_id={effective_evotor_store_id} "
                     f"name={item.get('product_name')}"
                 )
 
@@ -224,10 +274,12 @@ def map_sale_to_ms(
         }
 
         discount_percent = _extract_discount_percent(item, base_sum, final_sum)
+
         if discount_percent is not None and discount_percent > 0:
             ms_position["discount"] = round(discount_percent, 2)
 
         tax_fields = _extract_vat_fields(item)
+
         if tax_fields:
             ms_position.update(tax_fields)
 
@@ -237,12 +289,15 @@ def map_sale_to_ms(
         ms_positions.append(ms_position)
 
     document_sum_raw = body.get("sum")
+
     if document_sum_raw is not None:
         total_sum = float(document_sum_raw)
     else:
         total_sum = 0.0
+
         for item in raw_positions:
             result_sum_raw = item.get("result_sum", item.get("resultSum"))
+
             if result_sum_raw is not None:
                 total_sum += float(result_sum_raw)
             else:
@@ -261,13 +316,19 @@ def map_sale_to_ms(
 
     if ms_organization_id:
         ms_payload["organization"] = _meta("organization", ms_organization_id)
+
     if ms_store_id:
         ms_payload["store"] = _meta("store", ms_store_id)
+
     if ms_agent_id:
         ms_payload["agent"] = _meta("counterparty", ms_agent_id)
 
     log.info(
-        f"Mapped sale payload syncId={effective_sync_id} positions={len(ms_positions)} sum={total_sum}"
+        "Mapped sale payload syncId=%s store=%s positions=%s sum=%s",
+        effective_sync_id,
+        effective_evotor_store_id,
+        len(ms_positions),
+        total_sum,
     )
 
     return ms_payload
