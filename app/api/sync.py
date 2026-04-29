@@ -1168,6 +1168,91 @@ def _find_ms_product_by_name(ms_token: str, name: str) -> str | None:
         log.warning("_find_ms_product_by_name failed name=%s err=%s", name, e)
         return None
 
+
+def _ms_retry_wait_seconds(response, retry: int) -> float:
+    """
+    Вычисляет паузу для повторного запроса к МойСклад.
+    Поддерживает стандартный Retry-After и заголовки Lognex.
+    """
+    headers = getattr(response, "headers", {}) or {}
+
+    for header_name, divider in (
+        ("X-Lognex-Retry-After", 1000.0),
+        ("X-Lognex-Reset", 1000.0),
+        ("Retry-After", 1.0),
+    ):
+        raw = headers.get(header_name)
+        if raw:
+            try:
+                wait = float(raw) / divider
+                return max(1.0, min(wait, 30.0))
+            except Exception:
+                pass
+
+    return max(1.0, min(float(2 ** retry), 10.0))
+
+
+def _request_with_ms_retry(
+    method: str,
+    url: str,
+    *,
+    headers=None,
+    params=None,
+    json=None,
+    timeout: int = 20,
+    retries: int = 4,
+    context: str = "moysklad",
+):
+    """
+    Единая обёртка для запросов к МойСклад.
+    Повторяет 429 и временные 5xx с паузой.
+    Не бросает исключение сама — возвращает последний response.
+    """
+    last_response = None
+
+    for retry in range(retries + 1):
+        response = requests.request(
+            method,
+            url,
+            headers=headers,
+            params=params,
+            json=json,
+            timeout=timeout,
+        )
+        last_response = response
+
+        if response.status_code == 429 and retry < retries:
+            wait = _ms_retry_wait_seconds(response, retry)
+            log.warning(
+                "%s: MoySklad 429, retry=%s/%s wait=%.1fs url=%s",
+                context,
+                retry + 1,
+                retries,
+                wait,
+                url,
+            )
+            time.sleep(wait)
+            continue
+
+        if response.status_code in (500, 502, 503, 504) and retry < retries:
+            wait = max(1.0, min(float(2 ** retry), 10.0))
+            log.warning(
+                "%s: MoySklad transient status=%s, retry=%s/%s wait=%.1fs url=%s",
+                context,
+                response.status_code,
+                retry + 1,
+                retries,
+                wait,
+                url,
+            )
+            time.sleep(wait)
+            continue
+
+        return response
+
+    return last_response
+
+
 def _detect_barcode_format(value: str) -> str:
     value = str(value).strip()
     digits_only = value.isdigit()
@@ -1253,7 +1338,14 @@ def _get_default_price_type_meta(ms_token: str) -> dict:
         return cached
 
     url = f"{MS_BASE}/context/companysettings/pricetype"
-    r = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
+    r = _request_with_ms_retry(
+        "GET",
+        url,
+        headers=_ms_headers(ms_token),
+        timeout=20,
+        retries=4,
+        context="fetch MS priceType list",
+    )
     if not r.ok:
         log.error("Failed to fetch priceType list status=%s body=%s", r.status_code, r.text)
         r.raise_for_status()
@@ -1277,11 +1369,14 @@ def _get_default_currency_meta(ms_token: str) -> dict:
         return cached
 
     url = f"{MS_BASE}/entity/currency"
-    r = requests.get(
+    r = _request_with_ms_retry(
+        "GET",
         url,
         headers=_ms_headers(ms_token),
         params={"filter": "default=true"},
         timeout=20,
+        retries=4,
+        context="fetch MS default currency",
     )
     if not r.ok:
         log.error("Failed to fetch currency list status=%s body=%s", r.status_code, r.text)
@@ -1290,7 +1385,14 @@ def _get_default_currency_meta(ms_token: str) -> dict:
     rows = _extract_rows_from_ms_response(r.json())
 
     if not rows:
-        r2 = requests.get(url, headers=_ms_headers(ms_token), timeout=20)
+        r2 = _request_with_ms_retry(
+            "GET",
+            url,
+            headers=_ms_headers(ms_token),
+            timeout=20,
+            retries=4,
+            context="fetch MS fallback currency list",
+        )
         if not r2.ok:
             log.error("Failed to fetch fallback currency list status=%s body=%s", r2.status_code, r2.text)
             r2.raise_for_status()
@@ -1325,11 +1427,14 @@ def _get_ms_uom_meta(ms_token: str, measure_name: str) -> dict | None:
         return None
     if ms_token not in _uom_cache:
         try:
-            r = requests.get(
+            r = _request_with_ms_retry(
+                "GET",
                 f"{MS_BASE}/entity/uom",
                 headers=_ms_headers(ms_token),
                 params={"limit": 100},
                 timeout=20,
+                retries=4,
+                context="fetch MS UOM list",
             )
             if r.ok:
                 _uom_cache[ms_token] = r.json().get("rows", [])
@@ -1359,84 +1464,128 @@ def _update_ms_product_folder(
     evotor_token: str,
     evotor_store_id: str,
 ) -> None:
-    """Обновляет папку товара в МС если товар в группе Эвотор."""
+    """
+    Обновляет папку товара в МС, если товар находится в группе Эвотор.
+    429/5xx от МойСклад повторяются через _request_with_ms_retry.
+    Ошибка обновления папки не должна ломать mapping товара.
+    """
     parent_id = evotor_product.get("parent_id")
     if not parent_id:
         return
+
     try:
-        # Ищем название группы в маппинге или через Эвотор API
         folder_name = None
+
         conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(
-            aq("SELECT ms_folder_name FROM product_group_mappings WHERE evotor_group_id = ? LIMIT 1"),
-            (parent_id,),
-        )
-        pgm = cur.fetchone()
-        conn.close()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                aq("SELECT ms_folder_name FROM product_group_mappings WHERE evotor_group_id = ? LIMIT 1"),
+                (parent_id,),
+            )
+            pgm = cur.fetchone()
+        finally:
+            conn.close()
+
         if pgm and pgm["ms_folder_name"]:
             folder_name = pgm["ms_folder_name"]
         else:
-            # Получаем название группы из Эвотор API
-            _r = requests.get(
+            # Получаем название группы из Эвотор API.
+            # Это не МойСклад, поэтому оставляем обычный request.
+            evotor_response = requests.get(
                 f"{EVOTOR_BASE}/stores/{evotor_store_id}/product-groups/{parent_id}",
                 headers=_evotor_headers(evotor_token),
                 timeout=15,
             )
-            if _r.ok:
-                folder_name = _r.json().get("name")
+            if evotor_response.ok:
+                folder_name = evotor_response.json().get("name")
 
         if not folder_name:
             return
 
         folder_meta = _get_or_create_ms_folder(ms_token, folder_name)
         if not folder_meta:
+            log.warning(
+                "_update_ms_product_folder skipped: cannot resolve folder_meta folder=%s ms_id=%s",
+                folder_name,
+                ms_product_id,
+            )
             return
 
-        # Обновляем папку товара в МС
-        r = requests.put(
+        response = _request_with_ms_retry(
+            "PUT",
             f"{MS_BASE}/entity/product/{ms_product_id}",
             headers=_ms_headers(ms_token),
             json={"productFolder": {"meta": folder_meta}},
             timeout=20,
+            retries=4,
+            context="update MS product folder",
         )
-        if r.ok:
+
+        if response.ok:
             log.info("Updated MS product folder=%s ms_id=%s", folder_name, ms_product_id)
         else:
-            log.warning("Failed to update MS product folder ms_id=%s status=%s", ms_product_id, r.status_code)
+            log.warning(
+                "Failed to update MS product folder ms_id=%s status=%s body=%s",
+                ms_product_id,
+                response.status_code,
+                response.text[:500],
+            )
+
     except Exception as e:
         log.warning("_update_ms_product_folder failed ms_id=%s err=%s", ms_product_id, e)
 
 
 def _get_or_create_ms_folder(ms_token: str, folder_name: str, _retry: int = 0) -> dict | None:
-    """Находит или создаёт папку в МС по названию. Возвращает meta объект папки."""
-    r = requests.get(
+    """
+    Находит или создаёт папку в МС по названию.
+    Использует общий retry-wrapper для 429/5xx.
+    """
+    response = _request_with_ms_retry(
+        "GET",
         f"{MS_BASE}/entity/productfolder",
         headers=_ms_headers(ms_token),
         params={"filter": f"name={folder_name}"},
         timeout=20,
+        retries=4,
+        context="find MS product folder",
     )
-    if r.status_code == 429 and _retry < 3:
-        time.sleep(2 ** _retry)
-        return _get_or_create_ms_folder(ms_token, folder_name, _retry + 1)
-    if r.ok:
-        rows = r.json().get("rows", [])
+
+    if response.ok:
+        rows = response.json().get("rows", [])
         if rows:
             return rows[0].get("meta")
-    r2 = requests.post(
+    else:
+        log.warning(
+            "Failed to find MS folder name=%s status=%s body=%s",
+            folder_name,
+            response.status_code,
+            response.text[:500],
+        )
+        return None
+
+    create_response = _request_with_ms_retry(
+        "POST",
         f"{MS_BASE}/entity/productfolder",
         headers=_ms_headers(ms_token),
         json={"name": folder_name},
         timeout=20,
+        retries=4,
+        context="create MS product folder",
     )
-    if r2.status_code == 429 and _retry < 3:
-        time.sleep(2 ** _retry)
-        return _get_or_create_ms_folder(ms_token, folder_name, _retry + 1)
-    if r2.ok:
+
+    if create_response.ok:
         log.info("Created MS folder name=%s", folder_name)
-        return r2.json().get("meta")
-    log.error("Failed to create MS folder name=%s status=%s", folder_name, r2.status_code)
+        return create_response.json().get("meta")
+
+    log.error(
+        "Failed to create MS folder name=%s status=%s body=%s",
+        folder_name,
+        create_response.status_code,
+        create_response.text[:500],
+    )
     return None
+
 
 def _create_ms_product(ms_token: str, product: dict, _retry: int = 0) -> str:
     price_type_meta = _get_default_price_type_meta(ms_token)
