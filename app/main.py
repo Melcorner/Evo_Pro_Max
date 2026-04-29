@@ -322,7 +322,7 @@ def metrics() -> Response:
 # ---------------------------------------------------------------------
 from starlette.responses import Response as _LkUiResponse
 
-_LK_UI_HELPERS_HTML = """
+_LK_UI_HELPERS_HTML = r"""
 <!-- LK injected wait overlay and toast -->
 <div id="globalSyncWaitOverlay" style="
     display:none;
@@ -568,6 +568,7 @@ _LK_UI_HELPERS_HTML = """
     } catch (e) {}
 })();
 </script>
+
 """
 
 
