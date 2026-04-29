@@ -1,3 +1,4 @@
+import urllib.parse as _urlparse
 import html
 import json
 import logging
@@ -21,6 +22,12 @@ from app.stores.telegram_link_token_store import (
     mark_telegram_link_token_linked,
 )
 
+
+from app.services.product_snapshot_service import (
+    create_product_snapshot,
+    get_last_product_snapshot,
+    rollback_evotor_catalog_from_snapshot,
+)
 router = APIRouter(tags=["Onboarding"])
 log = logging.getLogger("api.onboarding")
 
@@ -2292,6 +2299,36 @@ def lk_actions(tenant_id: str, msg: str | None = None, err: str | None = None):
                         Используйте когда добавили новые товары в МойСклад и хотите чтобы они появились на кассе.
                     </div>
                 </div>
+
+    <div class="card" style="margin-top:16px;border:1px solid #fde68a;background:#fffbeb;">
+        <h3 style="margin-top:0;">Точки восстановления товаров</h3>
+        <p style="color:#92400e;font-size:14px;line-height:1.5;">
+            Перед тестовой синхронизацией можно сохранить текущие карточки товаров Эвотор.
+            Если синхронизация изменит карточки неправильно, их можно откатить из последней точки.
+            Остатки при откате не перетираются.
+        </p>
+
+        <form method="post" action="/onboarding/tenants/{tenant_id}/product-snapshot" style="display:inline-block;margin-right:8px;">
+            <button type="submit" class="btn btn-outline">
+                Создать точку восстановления товаров
+            </button>
+        </form>
+
+        <form method="post"
+              action="/onboarding/tenants/{tenant_id}/product-rollback-latest"
+              style="display:inline-block;margin-right:8px;"
+              onsubmit="return confirm('Откатить карточки товаров Эвотор из последней точки восстановления? Остатки не будут перезаписаны. После отката рекомендуется синхронизировать остатки.');">
+            <button type="submit" class="btn btn-danger">
+                Откатить карточки из последней точки
+            </button>
+        </form>
+
+        <div style="font-size:12px;color:#92400e;margin-top:8px;">
+            После отката нажмите «Синхронизировать остатки», чтобы подтянуть актуальные остатки из МойСклад.
+        </div>
+    </div>
+
+
             </div>
 
         </div>
@@ -3431,3 +3468,66 @@ def store_set_primary(tenant_id: str, evotor_store_id: str):
         url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={quote_plus('Магазин назначен основным')}",
         status_code=303,
     )
+
+
+# ---------------------------------------------------------------------
+# Product snapshot / rollback actions for LK
+# ---------------------------------------------------------------------
+@router.post("/onboarding/tenants/{tenant_id}/product-snapshot")
+def lk_create_product_snapshot(tenant_id: str):
+    try:
+        snapshot_path = create_product_snapshot(
+            tenant_id=tenant_id,
+            evotor_store_id="all",
+            reason="manual_lk",
+        )
+        msg = f"Точка восстановления товаров создана: {snapshot_path}"
+        return RedirectResponse(
+            f"/onboarding/tenants/{tenant_id}/actions?ok={_urlparse.quote(msg)}",
+            status_code=303,
+        )
+    except Exception as e:
+        msg = f"Не удалось создать точку восстановления товаров: {e}"
+        return RedirectResponse(
+            f"/onboarding/tenants/{tenant_id}/actions?err={_urlparse.quote(msg)}",
+            status_code=303,
+        )
+
+
+@router.post("/onboarding/tenants/{tenant_id}/product-rollback-latest")
+def lk_rollback_latest_product_snapshot(tenant_id: str):
+    try:
+        snapshot_path = get_last_product_snapshot(tenant_id)
+        if not snapshot_path:
+            msg = "Нет доступной точки восстановления товаров для этого клиента"
+            return RedirectResponse(
+                f"/onboarding/tenants/{tenant_id}/actions?err={_urlparse.quote(msg)}",
+                status_code=303,
+            )
+
+        result = rollback_evotor_catalog_from_snapshot(
+            tenant_id=tenant_id,
+            snapshot_dir=snapshot_path,
+            evotor_store_id="all",
+        )
+
+        if result["failed"] == 0:
+            msg = f"Карточки товаров восстановлены из последней точки: восстановлено — {result['restored']}, ошибок — 0. Теперь рекомендуется синхронизировать остатки."
+            return RedirectResponse(
+                f"/onboarding/tenants/{tenant_id}/actions?ok={_urlparse.quote(msg)}",
+                status_code=303,
+            )
+
+        msg = f"Откат выполнен частично: восстановлено — {result['restored']}, ошибок — {result['failed']}."
+        return RedirectResponse(
+            f"/onboarding/tenants/{tenant_id}/actions?err={_urlparse.quote(msg)}",
+            status_code=303,
+        )
+
+    except Exception as e:
+        msg = f"Не удалось откатить карточки товаров: {e}"
+        return RedirectResponse(
+            f"/onboarding/tenants/{tenant_id}/actions?err={_urlparse.quote(msg)}",
+            status_code=303,
+        )
+
