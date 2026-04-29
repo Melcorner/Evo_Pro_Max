@@ -315,3 +315,300 @@ def metrics() -> Response:
     _refresh_prometheus_db_metrics()
     payload, content_type = metrics_response()
     return StarletteResponse(content=payload, media_type=content_type)
+
+
+# ---------------------------------------------------------------------
+# LK UI injection: wait overlay + toast notifications
+# ---------------------------------------------------------------------
+from starlette.responses import Response as _LkUiResponse
+
+_LK_UI_HELPERS_HTML = """
+<!-- LK injected wait overlay and toast -->
+<div id="globalSyncWaitOverlay" style="
+    display:none;
+    position:fixed;
+    inset:0;
+    z-index:99999;
+    background:rgba(15,23,42,.55);
+    backdrop-filter:blur(4px);
+    align-items:center;
+    justify-content:center;
+">
+    <div style="
+        width:min(420px, calc(100vw - 32px));
+        background:#ffffff;
+        border-radius:18px;
+        box-shadow:0 24px 80px rgba(15,23,42,.28);
+        padding:26px 28px;
+        text-align:center;
+        font-family:Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    ">
+        <div style="
+            width:46px;
+            height:46px;
+            margin:0 auto 16px;
+            border-radius:999px;
+            border:4px solid #e5e7eb;
+            border-top-color:#2563eb;
+            animation:globalSyncWaitSpin .8s linear infinite;
+        "></div>
+
+        <div id="globalSyncWaitTitle" style="font-size:18px;font-weight:700;color:#0f172a;margin-bottom:8px;">
+            Выполняем операцию...
+        </div>
+
+        <div id="globalSyncWaitText" style="font-size:14px;line-height:1.5;color:#475569;">
+            Не закрывайте страницу. Операция может занять до нескольких минут.
+        </div>
+    </div>
+</div>
+
+<div id="lkGlobalToast" style="
+    display:none;
+    position:fixed;
+    right:24px;
+    top:24px;
+    z-index:100000;
+    max-width:min(520px, calc(100vw - 48px));
+    border-radius:16px;
+    box-shadow:0 20px 60px rgba(15,23,42,.22);
+    padding:16px 18px;
+    font-family:Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+">
+    <div style="display:flex;gap:12px;align-items:flex-start;">
+        <div id="lkGlobalToastIcon" style="
+            flex:0 0 auto;
+            width:28px;
+            height:28px;
+            border-radius:999px;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            font-weight:800;
+            font-size:16px;
+        ">✓</div>
+
+        <div style="min-width:0;flex:1;">
+            <div id="lkGlobalToastTitle" style="font-size:15px;font-weight:800;margin-bottom:4px;">Готово</div>
+            <div id="lkGlobalToastText" style="font-size:14px;line-height:1.45;word-break:break-word;"></div>
+        </div>
+
+        <button type="button" id="lkGlobalToastClose" style="
+            border:0;background:transparent;cursor:pointer;color:inherit;opacity:.7;
+            font-size:20px;line-height:1;padding:0 0 0 8px;
+        ">×</button>
+    </div>
+</div>
+
+<style>
+@keyframes globalSyncWaitSpin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+@keyframes lkToastSlideIn {
+    from { transform: translateY(-10px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+}
+</style>
+
+<script>
+(function () {
+    function getWaitMessage(action) {
+        action = String(action || '');
+
+        if (action.includes('cleanup-stale-mappings')) {
+            return {
+                title: 'Очищаем устаревшие связи...',
+                text: 'Проверяем товары МойСклад и удаляем только локальные связи, которые больше не актуальны.'
+            };
+        }
+
+        if (action.includes('product-rollback')) {
+            return {
+                title: 'Восстанавливаем карточки товаров...',
+                text: 'Откатываем карточки из последней точки восстановления. Остатки не перезаписываются.'
+            };
+        }
+
+        if (action.includes('product-snapshot')) {
+            return {
+                title: 'Создаём точку восстановления...',
+                text: 'Сохраняем текущие карточки товаров Эвотор перед синхронизацией.'
+            };
+        }
+
+        if (action.includes('sync-ms-to-evotor') || action.includes('ms-to-evotor')) {
+            return {
+                title: 'Синхронизируем товары...',
+                text: 'Выгружаем товары из МойСклад в Эвотор. Не закрывайте страницу.'
+            };
+        }
+
+        if (action.includes('reconcile')) {
+            return {
+                title: 'Синхронизируем остатки...',
+                text: 'Обновляем остатки товаров в Эвотор по данным МойСклад.'
+            };
+        }
+
+        if (action.includes('/sync') || action.includes('/initial')) {
+            return {
+                title: 'Выполняем синхронизацию...',
+                text: 'Обрабатываем товары и связи между Эвотор и МойСклад.'
+            };
+        }
+
+        return {
+            title: 'Выполняем операцию...',
+            text: 'Не закрывайте страницу. Операция может занять до нескольких минут.'
+        };
+    }
+
+    function shouldShowOverlay(form) {
+        if (!form || !form.action) return false;
+
+        var action = String(form.action);
+
+        return (
+            action.includes('/sync') ||
+            action.includes('/reconcile') ||
+            action.includes('/sync-ms-to-evotor') ||
+            action.includes('/ms-to-evotor') ||
+            action.includes('/initial') ||
+            action.includes('/product-snapshot') ||
+            action.includes('/product-rollback') ||
+            action.includes('/cleanup-stale-mappings')
+        );
+    }
+
+    function showOverlay(form) {
+        var overlay = document.getElementById('globalSyncWaitOverlay');
+        var title = document.getElementById('globalSyncWaitTitle');
+        var text = document.getElementById('globalSyncWaitText');
+
+        if (!overlay) return;
+
+        var message = getWaitMessage(form.action);
+
+        if (title) title.textContent = message.title;
+        if (text) text.textContent = message.text;
+
+        overlay.style.display = 'flex';
+
+        var button = form.querySelector('button[type="submit"], button:not([type])');
+        if (button) {
+            button.disabled = true;
+            button.textContent = '⏳ Выполняется...';
+        }
+    }
+
+    function showToast(type, message) {
+        var toast = document.getElementById('lkGlobalToast');
+        var icon = document.getElementById('lkGlobalToastIcon');
+        var title = document.getElementById('lkGlobalToastTitle');
+        var text = document.getElementById('lkGlobalToastText');
+        var close = document.getElementById('lkGlobalToastClose');
+
+        if (!toast || !text) return;
+
+        var isError = type === 'err';
+
+        toast.style.display = 'block';
+        toast.style.animation = 'lkToastSlideIn .22s ease-out';
+        toast.style.background = isError ? '#fef2f2' : '#ecfdf5';
+        toast.style.border = isError ? '1px solid #fecaca' : '1px solid #bbf7d0';
+        toast.style.color = isError ? '#991b1b' : '#065f46';
+
+        if (icon) {
+            icon.textContent = isError ? '!' : '✓';
+            icon.style.background = isError ? '#fee2e2' : '#d1fae5';
+            icon.style.color = isError ? '#b91c1c' : '#047857';
+        }
+
+        if (title) title.textContent = isError ? 'Ошибка' : 'Готово';
+
+        text.textContent = message || '';
+
+        function hide() {
+            toast.style.display = 'none';
+        }
+
+        if (close) close.onclick = hide;
+
+        if (!isError) {
+            setTimeout(hide, 8000);
+        }
+    }
+
+    document.addEventListener('submit', function (event) {
+        var form = event.target;
+
+        if (!shouldShowOverlay(form)) return;
+
+        if (form.dataset.submitting === '1') {
+            event.preventDefault();
+            return false;
+        }
+
+        form.dataset.submitting = '1';
+
+        setTimeout(function () {
+            showOverlay(form);
+        }, 10);
+    }, true);
+
+    try {
+        var params = new URLSearchParams(window.location.search);
+        var ok = params.get('ok') || params.get('msg');
+        var err = params.get('err');
+
+        if (ok) showToast('ok', ok);
+        else if (err) showToast('err', err);
+    } catch (e) {}
+})();
+</script>
+"""
+
+
+@app.middleware("http")
+async def lk_ui_injection_middleware(request, call_next):
+    response = await call_next(request)
+
+    path = request.url.path
+    if not path.startswith("/onboarding/tenants/"):
+        return response
+
+    if response.status_code != 200:
+        return response
+
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+
+    html = body.decode("utf-8", errors="replace")
+
+    if "<html" not in html.lower():
+        return _LkUiResponse(
+            content=body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
+        )
+
+    if "globalSyncWaitOverlay" not in html:
+        if "</body>" in html:
+            html = html.replace("</body>", _LK_UI_HELPERS_HTML + "\n</body>", 1)
+        else:
+            html = html + _LK_UI_HELPERS_HTML
+
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+
+    return _LkUiResponse(
+        content=html,
+        status_code=response.status_code,
+        headers=headers,
+        media_type="text/html",
+    )
+
