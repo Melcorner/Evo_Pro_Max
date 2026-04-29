@@ -513,6 +513,167 @@ def _lk_layout(tenant: dict, active_tab: str, content: str,
         {alerts}
         {content}
     </div>
+
+
+<!-- Global wait overlay for LK actions -->
+<div id="globalSyncWaitOverlay" style="
+    display:none;
+    position:fixed;
+    inset:0;
+    z-index:99999;
+    background:rgba(15,23,42,.55);
+    backdrop-filter:blur(4px);
+    align-items:center;
+    justify-content:center;
+">
+    <div style="
+        width:min(420px, calc(100vw - 32px));
+        background:#ffffff;
+        border-radius:18px;
+        box-shadow:0 24px 80px rgba(15,23,42,.28);
+        padding:26px 28px;
+        text-align:center;
+        font-family:Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    ">
+        <div style="
+            width:46px;
+            height:46px;
+            margin:0 auto 16px;
+            border-radius:999px;
+            border:4px solid #e5e7eb;
+            border-top-color:#2563eb;
+            animation:globalSyncWaitSpin .8s linear infinite;
+        "></div>
+
+        <div id="globalSyncWaitTitle" style="
+            font-size:18px;
+            font-weight:700;
+            color:#0f172a;
+            margin-bottom:8px;
+        ">
+            Выполняем операцию...
+        </div>
+
+        <div id="globalSyncWaitText" style="
+            font-size:14px;
+            line-height:1.5;
+            color:#475569;
+        ">
+            Не закрывайте страницу. Операция может занять до нескольких минут.
+        </div>
+    </div>
+</div>
+
+<style>
+@keyframes globalSyncWaitSpin {{
+    from {{ transform: rotate(0deg); }}
+    to {{ transform: rotate(360deg); }}
+}}
+</style>
+
+<script>
+(function () {{
+    function getWaitMessage(action) {{
+        action = String(action || '');
+
+        if (action.includes('product-rollback')) {{
+            return {{
+                title: 'Восстанавливаем карточки товаров...',
+                text: 'Откатываем карточки из последней точки восстановления. Остатки не перезаписываются.'
+            }};
+        }}
+
+        if (action.includes('product-snapshot')) {{
+            return {{
+                title: 'Создаём точку восстановления...',
+                text: 'Сохраняем текущие карточки товаров Эвотор перед синхронизацией.'
+            }};
+        }}
+
+        if (action.includes('sync-ms-to-evotor') || action.includes('ms-to-evotor')) {{
+            return {{
+                title: 'Синхронизируем товары...',
+                text: 'Выгружаем товары из МойСклад в Эвотор. Не закрывайте страницу.'
+            }};
+        }}
+
+        if (action.includes('reconcile')) {{
+            return {{
+                title: 'Синхронизируем остатки...',
+                text: 'Обновляем остатки товаров в Эвотор по данным МойСклад.'
+            }};
+        }}
+
+        if (action.includes('/sync') || action.includes('/initial')) {{
+            return {{
+                title: 'Выполняем синхронизацию...',
+                text: 'Обрабатываем товары и связи между Эвотор и МойСклад.'
+            }};
+        }}
+
+        return {{
+            title: 'Выполняем операцию...',
+            text: 'Не закрывайте страницу. Операция может занять до нескольких минут.'
+        }};
+    }}
+
+    function shouldShowOverlay(form) {{
+        if (!form || !form.action) return false;
+
+        var action = String(form.action);
+
+        return (
+            action.includes('/sync') ||
+            action.includes('/reconcile') ||
+            action.includes('/sync-ms-to-evotor') ||
+            action.includes('/ms-to-evotor') ||
+            action.includes('/initial') ||
+            action.includes('/product-snapshot') ||
+            action.includes('/product-rollback')
+        );
+    }}
+
+    function showOverlay(form) {{
+        var overlay = document.getElementById('globalSyncWaitOverlay');
+        var title = document.getElementById('globalSyncWaitTitle');
+        var text = document.getElementById('globalSyncWaitText');
+
+        if (!overlay) return;
+
+        var message = getWaitMessage(form.action);
+
+        if (title) title.textContent = message.title;
+        if (text) text.textContent = message.text;
+
+        overlay.style.display = 'flex';
+
+        var button = form.querySelector('button[type="submit"], button:not([type])');
+        if (button) {{
+            button.dataset.originalText = button.textContent;
+            button.disabled = true;
+            button.textContent = '⏳ Выполняется...';
+        }}
+    }}
+
+    document.addEventListener('submit', function (event) {{
+        var form = event.target;
+
+        if (!shouldShowOverlay(form)) return;
+
+        if (form.dataset.submitting === '1') {{
+            event.preventDefault();
+            return false;
+        }}
+
+        form.dataset.submitting = '1';
+
+        setTimeout(function () {{
+            showOverlay(form);
+        }}, 10);
+    }}, true);
+}})();
+</script>
+
 </body>
 </html>"""
     return HTMLResponse(page)
@@ -540,6 +701,167 @@ def _ob_layout(title: str, body: str, back_url: str | None = None) -> str:
         <h2 style="font-size:20px;font-weight:700;margin-bottom:20px;">{html.escape(title)}</h2>
         {body}
     </div>
+
+
+<!-- Global wait overlay for LK actions -->
+<div id="globalSyncWaitOverlay" style="
+    display:none;
+    position:fixed;
+    inset:0;
+    z-index:99999;
+    background:rgba(15,23,42,.55);
+    backdrop-filter:blur(4px);
+    align-items:center;
+    justify-content:center;
+">
+    <div style="
+        width:min(420px, calc(100vw - 32px));
+        background:#ffffff;
+        border-radius:18px;
+        box-shadow:0 24px 80px rgba(15,23,42,.28);
+        padding:26px 28px;
+        text-align:center;
+        font-family:Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    ">
+        <div style="
+            width:46px;
+            height:46px;
+            margin:0 auto 16px;
+            border-radius:999px;
+            border:4px solid #e5e7eb;
+            border-top-color:#2563eb;
+            animation:globalSyncWaitSpin .8s linear infinite;
+        "></div>
+
+        <div id="globalSyncWaitTitle" style="
+            font-size:18px;
+            font-weight:700;
+            color:#0f172a;
+            margin-bottom:8px;
+        ">
+            Выполняем операцию...
+        </div>
+
+        <div id="globalSyncWaitText" style="
+            font-size:14px;
+            line-height:1.5;
+            color:#475569;
+        ">
+            Не закрывайте страницу. Операция может занять до нескольких минут.
+        </div>
+    </div>
+</div>
+
+<style>
+@keyframes globalSyncWaitSpin {{
+    from {{ transform: rotate(0deg); }}
+    to {{ transform: rotate(360deg); }}
+}}
+</style>
+
+<script>
+(function () {{
+    function getWaitMessage(action) {{
+        action = String(action || '');
+
+        if (action.includes('product-rollback')) {{
+            return {{
+                title: 'Восстанавливаем карточки товаров...',
+                text: 'Откатываем карточки из последней точки восстановления. Остатки не перезаписываются.'
+            }};
+        }}
+
+        if (action.includes('product-snapshot')) {{
+            return {{
+                title: 'Создаём точку восстановления...',
+                text: 'Сохраняем текущие карточки товаров Эвотор перед синхронизацией.'
+            }};
+        }}
+
+        if (action.includes('sync-ms-to-evotor') || action.includes('ms-to-evotor')) {{
+            return {{
+                title: 'Синхронизируем товары...',
+                text: 'Выгружаем товары из МойСклад в Эвотор. Не закрывайте страницу.'
+            }};
+        }}
+
+        if (action.includes('reconcile')) {{
+            return {{
+                title: 'Синхронизируем остатки...',
+                text: 'Обновляем остатки товаров в Эвотор по данным МойСклад.'
+            }};
+        }}
+
+        if (action.includes('/sync') || action.includes('/initial')) {{
+            return {{
+                title: 'Выполняем синхронизацию...',
+                text: 'Обрабатываем товары и связи между Эвотор и МойСклад.'
+            }};
+        }}
+
+        return {{
+            title: 'Выполняем операцию...',
+            text: 'Не закрывайте страницу. Операция может занять до нескольких минут.'
+        }};
+    }}
+
+    function shouldShowOverlay(form) {{
+        if (!form || !form.action) return false;
+
+        var action = String(form.action);
+
+        return (
+            action.includes('/sync') ||
+            action.includes('/reconcile') ||
+            action.includes('/sync-ms-to-evotor') ||
+            action.includes('/ms-to-evotor') ||
+            action.includes('/initial') ||
+            action.includes('/product-snapshot') ||
+            action.includes('/product-rollback')
+        );
+    }}
+
+    function showOverlay(form) {{
+        var overlay = document.getElementById('globalSyncWaitOverlay');
+        var title = document.getElementById('globalSyncWaitTitle');
+        var text = document.getElementById('globalSyncWaitText');
+
+        if (!overlay) return;
+
+        var message = getWaitMessage(form.action);
+
+        if (title) title.textContent = message.title;
+        if (text) text.textContent = message.text;
+
+        overlay.style.display = 'flex';
+
+        var button = form.querySelector('button[type="submit"], button:not([type])');
+        if (button) {{
+            button.dataset.originalText = button.textContent;
+            button.disabled = true;
+            button.textContent = '⏳ Выполняется...';
+        }}
+    }}
+
+    document.addEventListener('submit', function (event) {{
+        var form = event.target;
+
+        if (!shouldShowOverlay(form)) return;
+
+        if (form.dataset.submitting === '1') {{
+            event.preventDefault();
+            return false;
+        }}
+
+        form.dataset.submitting = '1';
+
+        setTimeout(function () {{
+            showOverlay(form);
+        }}, 10);
+    }}, true);
+}})();
+</script>
+
 </body>
 </html>"""
 
@@ -701,6 +1023,167 @@ def _ob_step_layout(step: int, total: int, title: str, body: str, back_url: str 
         <h2 style="font-size:20px;font-weight:700;margin-bottom:20px;">{html.escape(title)}</h2>
         {body}
     </div>
+
+
+<!-- Global wait overlay for LK actions -->
+<div id="globalSyncWaitOverlay" style="
+    display:none;
+    position:fixed;
+    inset:0;
+    z-index:99999;
+    background:rgba(15,23,42,.55);
+    backdrop-filter:blur(4px);
+    align-items:center;
+    justify-content:center;
+">
+    <div style="
+        width:min(420px, calc(100vw - 32px));
+        background:#ffffff;
+        border-radius:18px;
+        box-shadow:0 24px 80px rgba(15,23,42,.28);
+        padding:26px 28px;
+        text-align:center;
+        font-family:Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    ">
+        <div style="
+            width:46px;
+            height:46px;
+            margin:0 auto 16px;
+            border-radius:999px;
+            border:4px solid #e5e7eb;
+            border-top-color:#2563eb;
+            animation:globalSyncWaitSpin .8s linear infinite;
+        "></div>
+
+        <div id="globalSyncWaitTitle" style="
+            font-size:18px;
+            font-weight:700;
+            color:#0f172a;
+            margin-bottom:8px;
+        ">
+            Выполняем операцию...
+        </div>
+
+        <div id="globalSyncWaitText" style="
+            font-size:14px;
+            line-height:1.5;
+            color:#475569;
+        ">
+            Не закрывайте страницу. Операция может занять до нескольких минут.
+        </div>
+    </div>
+</div>
+
+<style>
+@keyframes globalSyncWaitSpin {{
+    from {{ transform: rotate(0deg); }}
+    to {{ transform: rotate(360deg); }}
+}}
+</style>
+
+<script>
+(function () {{
+    function getWaitMessage(action) {{
+        action = String(action || '');
+
+        if (action.includes('product-rollback')) {{
+            return {{
+                title: 'Восстанавливаем карточки товаров...',
+                text: 'Откатываем карточки из последней точки восстановления. Остатки не перезаписываются.'
+            }};
+        }}
+
+        if (action.includes('product-snapshot')) {{
+            return {{
+                title: 'Создаём точку восстановления...',
+                text: 'Сохраняем текущие карточки товаров Эвотор перед синхронизацией.'
+            }};
+        }}
+
+        if (action.includes('sync-ms-to-evotor') || action.includes('ms-to-evotor')) {{
+            return {{
+                title: 'Синхронизируем товары...',
+                text: 'Выгружаем товары из МойСклад в Эвотор. Не закрывайте страницу.'
+            }};
+        }}
+
+        if (action.includes('reconcile')) {{
+            return {{
+                title: 'Синхронизируем остатки...',
+                text: 'Обновляем остатки товаров в Эвотор по данным МойСклад.'
+            }};
+        }}
+
+        if (action.includes('/sync') || action.includes('/initial')) {{
+            return {{
+                title: 'Выполняем синхронизацию...',
+                text: 'Обрабатываем товары и связи между Эвотор и МойСклад.'
+            }};
+        }}
+
+        return {{
+            title: 'Выполняем операцию...',
+            text: 'Не закрывайте страницу. Операция может занять до нескольких минут.'
+        }};
+    }}
+
+    function shouldShowOverlay(form) {{
+        if (!form || !form.action) return false;
+
+        var action = String(form.action);
+
+        return (
+            action.includes('/sync') ||
+            action.includes('/reconcile') ||
+            action.includes('/sync-ms-to-evotor') ||
+            action.includes('/ms-to-evotor') ||
+            action.includes('/initial') ||
+            action.includes('/product-snapshot') ||
+            action.includes('/product-rollback')
+        );
+    }}
+
+    function showOverlay(form) {{
+        var overlay = document.getElementById('globalSyncWaitOverlay');
+        var title = document.getElementById('globalSyncWaitTitle');
+        var text = document.getElementById('globalSyncWaitText');
+
+        if (!overlay) return;
+
+        var message = getWaitMessage(form.action);
+
+        if (title) title.textContent = message.title;
+        if (text) text.textContent = message.text;
+
+        overlay.style.display = 'flex';
+
+        var button = form.querySelector('button[type="submit"], button:not([type])');
+        if (button) {{
+            button.dataset.originalText = button.textContent;
+            button.disabled = true;
+            button.textContent = '⏳ Выполняется...';
+        }}
+    }}
+
+    document.addEventListener('submit', function (event) {{
+        var form = event.target;
+
+        if (!shouldShowOverlay(form)) return;
+
+        if (form.dataset.submitting === '1') {{
+            event.preventDefault();
+            return false;
+        }}
+
+        form.dataset.submitting = '1';
+
+        setTimeout(function () {{
+            showOverlay(form);
+        }}, 10);
+    }}, true);
+}})();
+</script>
+
 </body>
 </html>"""
 
@@ -1974,7 +2457,7 @@ def lk_overview(tenant_id: str):
         new_products_banner = f'''
             <div class="lk-row" style="background:#fffbeb;margin:0 -24px;padding:10px 24px;border-radius:0;">
                 <span class="lk-row-label" style="color:#92400e;">
-                    ⚠️ Товаров МойСклад без связки с Эвотор: {diff}
+                    ℹ️ Не выгружено в Эвотор: {diff} товар(ов). Обычно причина — нет остатка на связанных складах или товар не проходит фильтр синхронизации.
                 </span>
                 <form method="post" action="/onboarding/tenants/{tenant_id}/sync-ms-to-evotor" style="margin:0;">
                     <button type="submit" class="btn btn-outline" style="padding:5px 12px;font-size:12px;">
@@ -1990,7 +2473,7 @@ def lk_overview(tenant_id: str):
         diff = mappings_count - ms_products_count
         deleted_products_banner = f'''<div class="lk-row" style="background:#fef2f2;margin:0 -24px;padding:10px 24px;border-radius:0;">
             <span class="lk-row-label" style="color:#991b1b;">🗑️ Удалённых товаров в маппинге: {diff}</span>
-            <form method="post" action="/onboarding/tenants/{tenant_id}/sync-ms-to-evotor" style="margin:0;"
+            <form method="post" action="/onboarding/tenants/{tenant_id}/cleanup-stale-mappings" style="margin:0;"
                   onsubmit="
                     var btn = this.querySelector('button');
                     btn.disabled = true;
@@ -3526,6 +4009,155 @@ def lk_rollback_latest_product_snapshot(tenant_id: str):
 
     except Exception as e:
         msg = f"Не удалось откатить карточки товаров: {e}"
+        return RedirectResponse(
+            f"/onboarding/tenants/{tenant_id}/actions?err={_urlparse.quote(msg)}",
+            status_code=303,
+        )
+
+
+# ---------------------------------------------------------------------
+# Cleanup stale product mappings from LK
+# ---------------------------------------------------------------------
+@router.post("/onboarding/tenants/{tenant_id}/cleanup-stale-mappings")
+def lk_cleanup_stale_mappings(tenant_id: str):
+    """
+    Удаляет локальные mappings, которые ссылаются на товары МойСклад,
+    которых больше нет в списке товаров МС.
+
+    Внешние системы не трогает:
+    - не удаляет товары Эвотор;
+    - не удаляет товары МойСклад;
+    - чистит только нашу таблицу mappings.
+    """
+    import os
+    import time
+    import requests
+
+    try:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(aq("SELECT moysklad_token FROM tenants WHERE id = ?"), (tenant_id,))
+            tenant = cur.fetchone()
+
+            if not tenant:
+                msg = "Клиент не найден"
+                return RedirectResponse(
+                    f"/onboarding/tenants/{tenant_id}/actions?err={_urlparse.quote(msg)}",
+                    status_code=303,
+                )
+
+            ms_token = tenant["moysklad_token"]
+
+            if not ms_token:
+                msg = "Не настроен токен МойСклад"
+                return RedirectResponse(
+                    f"/onboarding/tenants/{tenant_id}/actions?err={_urlparse.quote(msg)}",
+                    status_code=303,
+                )
+
+            cur.execute(
+                aq("""
+                SELECT tenant_id, evotor_store_id, entity_type, evotor_id, ms_id
+                FROM mappings
+                WHERE tenant_id = ?
+                  AND entity_type = 'product'
+                """),
+                (tenant_id,),
+            )
+            mapping_rows = [dict(r) for r in cur.fetchall()]
+
+        finally:
+            conn.close()
+
+        ms_base = os.getenv("MS_BASE", "https://api.moysklad.ru/api/remap/1.2").rstrip("/")
+        headers = {
+            "Authorization": f"Bearer {ms_token}",
+            "Accept": "application/json;charset=utf-8",
+            "Content-Type": "application/json",
+            "Accept-Encoding": "gzip",
+        }
+
+        ms_product_ids = set()
+        offset = 0
+        limit = 100
+
+        while True:
+            response = requests.get(
+                f"{ms_base}/entity/product",
+                headers=headers,
+                params={"limit": limit, "offset": offset},
+                timeout=30,
+            )
+
+            if response.status_code == 429:
+                time.sleep(1)
+                response = requests.get(
+                    f"{ms_base}/entity/product",
+                    headers=headers,
+                    params={"limit": limit, "offset": offset},
+                    timeout=30,
+                )
+
+            if not response.ok:
+                msg = f"Не удалось получить товары МойСклад: status={response.status_code}"
+                return RedirectResponse(
+                    f"/onboarding/tenants/{tenant_id}/actions?err={_urlparse.quote(msg)}",
+                    status_code=303,
+                )
+
+            rows = response.json().get("rows", [])
+
+            for product in rows:
+                if product.get("id"):
+                    ms_product_ids.add(product["id"])
+
+            if len(rows) < limit:
+                break
+
+            offset += limit
+
+        stale = [m for m in mapping_rows if m["ms_id"] not in ms_product_ids]
+
+        deleted = 0
+
+        if stale:
+            conn = get_connection()
+            try:
+                cur = conn.cursor()
+
+                for m in stale:
+                    cur.execute(
+                        aq("""
+                        DELETE FROM mappings
+                        WHERE tenant_id = ?
+                          AND evotor_store_id = ?
+                          AND entity_type = ?
+                          AND evotor_id = ?
+                          AND ms_id = ?
+                        """),
+                        (
+                            m["tenant_id"],
+                            m["evotor_store_id"],
+                            m["entity_type"],
+                            m["evotor_id"],
+                            m["ms_id"],
+                        ),
+                    )
+                    deleted += cur.rowcount or 0
+
+                conn.commit()
+            finally:
+                conn.close()
+
+        msg = f"Очистка завершена: удалено устаревших связей — {deleted}."
+        return RedirectResponse(
+            f"/onboarding/tenants/{tenant_id}/actions?ok={_urlparse.quote(msg)}",
+            status_code=303,
+        )
+
+    except Exception as e:
+        msg = f"Ошибка очистки устаревших связей: {e}"
         return RedirectResponse(
             f"/onboarding/tenants/{tenant_id}/actions?err={_urlparse.quote(msg)}",
             status_code=303,
