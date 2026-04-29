@@ -13,6 +13,7 @@ from app.observability.metrics import (
 )
 from app.db import get_connection, adapt_query as aq
 from app.stores.mapping_store import MappingStore
+from app.services.stale_mapping_service import cleanup_stale_product_mappings
 
 log = logging.getLogger("api.sync")
 
@@ -1729,6 +1730,23 @@ def initial_sync(tenant_id: str):
 
     if not tenant.get("moysklad_token"):
         raise HTTPException(status_code=400, detail="moysklad_token not configured")
+
+    try:
+        cleanup_result = cleanup_stale_product_mappings(tenant_id, evotor_store_id)
+        if cleanup_result.get("deleted"):
+            log.warning(
+                "initial_sync_store: cleaned stale mappings tenant_id=%s store=%s deleted=%s",
+                tenant_id,
+                evotor_store_id,
+                cleanup_result.get("deleted"),
+            )
+    except Exception as e:
+        log.warning(
+            "initial_sync_store: stale mapping cleanup skipped tenant_id=%s store=%s err=%s",
+            tenant_id,
+            evotor_store_id,
+            e,
+        )
 
     try:
         products = _get_evotor_products(tenant["evotor_token"], evotor_store_id)

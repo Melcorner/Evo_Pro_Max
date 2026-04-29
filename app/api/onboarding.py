@@ -498,6 +498,7 @@ def _lk_layout(tenant: dict, active_tab: str, content: str,
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Личный кабинет — {name}</title>
     {LK_STYLE}
+
 </head>
 <body>
     <header class="lk-header">
@@ -513,7 +514,6 @@ def _lk_layout(tenant: dict, active_tab: str, content: str,
         {alerts}
         {content}
     </div>
-
 
 
 </body>
@@ -545,7 +545,6 @@ def _ob_layout(title: str, body: str, back_url: str | None = None) -> str:
     </div>
 
 
-
 </body>
 </html>"""
 
@@ -563,6 +562,22 @@ def _select(name: str, items: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 def _run_initial_sync(tenant_id: str) -> dict:
+    try:
+        cleanup_result = cleanup_stale_product_mappings(tenant_id)
+
+        if cleanup_result.get("deleted"):
+            log.warning(
+                "_run_initial_sync: stale mapping cleanup tenant_id=%s deleted=%s",
+                tenant_id,
+                cleanup_result.get("deleted"),
+            )
+    except Exception as e:
+        log.warning(
+            "_run_initial_sync: stale mapping cleanup skipped tenant_id=%s err=%s",
+            tenant_id,
+            e,
+        )
+
     """
     Запускает первичную синхронизацию для всех магазинов тенанта.
     Использует store-level sync для каждого магазина.
@@ -707,7 +722,6 @@ def _ob_step_layout(step: int, total: int, title: str, body: str, back_url: str 
         <h2 style="font-size:20px;font-weight:700;margin-bottom:20px;">{html.escape(title)}</h2>
         {body}
     </div>
-
 
 
 </body>
@@ -2249,94 +2263,401 @@ def lk_actions(tenant_id: str, msg: str | None = None, err: str | None = None):
 
     content = f"""
     <style>
-    .btn-ghost:disabled {{ opacity: 0.6; cursor: not-allowed; pointer-events: none; }}
-    .btn-ghost.loading::after {{ content: ' ⏳'; }}
-    .confirm-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.4);
-        z-index:1000; align-items:center; justify-content:center; }}
-    .confirm-overlay.visible {{ display:flex; }}
-    .confirm-box {{ background:#fff; border-radius:14px; padding:28px 32px; max-width:400px;
-        width:90%; box-shadow:0 8px 40px rgba(0,0,0,0.15); }}
-    .confirm-title {{ font-size:17px; font-weight:700; color:#1a1d2e; margin-bottom:8px; }}
-    .confirm-desc {{ font-size:14px; color:#6b7280; line-height:1.5; margin-bottom:24px; }}
-    .confirm-btns {{ display:flex; gap:10px; justify-content:flex-end; }}
-    .confirm-cancel {{ background:#f3f4f8; color:#1a1d2e; border:none; border-radius:8px;
-        padding:10px 20px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; }}
-    .confirm-ok {{ background:#dc2626; color:#fff; border:none; border-radius:8px;
-        padding:10px 20px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; }}
-    .confirm-ok:hover {{ background:#b91c1c; }}
+    .lk-actions-list {{
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        margin-top: 6px;
+    }}
+
+    .lk-action-form {{
+        margin: 0;
+    }}
+
+    .lk-action-button {{
+        width: 100%;
+        border: 1px solid #e4e8f0;
+        background: #fff;
+        border-radius: 14px;
+        padding: 14px 16px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        text-align: left;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }}
+
+    .lk-action-button:hover {{
+        border-color: #d7ddea;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+        background: #fbfcff;
+    }}
+
+    .lk-action-icon {{
+        width: 40px;
+        height: 40px;
+        min-width: 40px;
+        border-radius: 12px;
+        background: #eef3ff;
+        color: #3b6ff5;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 18px;
+        font-weight: 700;
+    }}
+
+    .lk-action-content {{
+        flex: 1;
+        min-width: 0;
+    }}
+
+    .lk-action-title {{
+        display: block;
+        font-size: 15px;
+        font-weight: 700;
+        color: #1a1d2e;
+        line-height: 1.25;
+        margin-bottom: 3px;
+    }}
+
+    .lk-action-desc {{
+        display: block;
+        font-size: 13px;
+        color: #6b7280;
+        line-height: 1.45;
+    }}
+
+    .lk-action-arrow {{
+        color: #3b6ff5;
+        font-size: 20px;
+        font-weight: 700;
+        line-height: 1;
+        margin-left: 8px;
+    }}
+
+    .lk-recovery-panel {{
+        border: 1px solid #f2dfb1;
+        background: #fffaf0;
+        border-radius: 14px;
+        padding: 16px;
+        margin-top: 2px;
+    }}
+
+    .lk-recovery-title {{
+        font-size: 15px;
+        font-weight: 700;
+        color: #1a1d2e;
+        margin-bottom: 6px;
+    }}
+
+    .lk-recovery-text {{
+        font-size: 13px;
+        color: #9a6700;
+        line-height: 1.5;
+        margin-bottom: 12px;
+    }}
+
+    .lk-recovery-actions {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-bottom: 8px;
+    }}
+
+    .lk-btn-outline {{
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        height: 38px;
+        padding: 0 16px;
+        border-radius: 10px;
+        border: 1px solid #3b6ff5;
+        background: #fff;
+        color: #3b6ff5;
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }}
+
+    .lk-btn-outline:hover {{
+        background: #f7faff;
+    }}
+
+    .lk-btn-soft {{
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        height: 38px;
+        padding: 0 16px;
+        border-radius: 10px;
+        border: 1px solid #e5e7eb;
+        background: #f3f4f6;
+        color: #1f2937;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }}
+
+    .lk-btn-soft:hover {{
+        background: #eaecef;
+    }}
+
+    .lk-recovery-note {{
+        font-size: 12px;
+        color: #a16207;
+        line-height: 1.45;
+    }}
+
+    @media (max-width: 720px) {{
+        .lk-action-button {{
+            padding: 13px 14px;
+            gap: 12px;
+        }}
+
+        .lk-action-icon {{
+            width: 36px;
+            height: 36px;
+            min-width: 36px;
+            font-size: 16px;
+            border-radius: 10px;
+        }}
+
+        .lk-action-title {{
+            font-size: 14px;
+        }}
+
+        .lk-action-desc {{
+            font-size: 12px;
+        }}
+
+        .lk-recovery-panel {{
+            padding: 14px;
+        }}
+
+        .lk-recovery-actions {{
+            flex-direction: column;
+            align-items: stretch;
+        }}
+
+        .lk-btn-outline,
+        .lk-btn-soft {{
+            width: 100%;
+        }}
+    }}
     </style>
 
     <div class="lk-card">
-        <div class="lk-card-title">Синхронизация</div>
-        <div class="actions-list">
-
-            <div class="action-row">
-                <form method="post" action="/onboarding/tenants/{tid}/sync" id="formResync">
-                    <button type="submit" class="btn btn-ghost"
-                            onclick="return confirm('Повторная синхронизация пересоздаст маппинг всех товаров. Текущие связи будут сброшены. Продолжить?')">Повторная синхронизация товаров</button>
-                </form>
-                <div class="tooltip-wrap">
-                    <button class="tooltip-btn">?</button>
-                    <div class="tooltip-popup">
-                        Пересоздаёт маппинг всех товаров из Эвотор в МойСклад.<br><br>
-                        Используйте если товары пропали или данные расходятся между системами.
-                    </div>
-                </div>
-            </div>
-
-            <div class="action-row">
-                <form method="post" action="/onboarding/tenants/{tid}/reconcile">
-                    <button type="submit" class="btn btn-ghost">Синхронизировать остатки</button>
-                </form>
-                <div class="tooltip-wrap">
-                    <button class="tooltip-btn">?</button>
-                    <div class="tooltip-popup">
-                        Обновляет количество товаров в Эвотор на основе текущих остатков в МойСклад.<br><br>
-                        Используйте если остатки на кассе не совпадают с МойСклад.
-                    </div>
-                </div>
-            </div>
-
-            <div class="action-row">
-                <form method="post" action="/onboarding/tenants/{tid}/sync-ms-to-evotor">
-                    <button type="submit" class="btn btn-ghost">Синхронизировать новые товары из МойСклад</button>
-                </form>
-                <div class="tooltip-wrap">
-                    <button class="tooltip-btn">?</button>
-                    <div class="tooltip-popup">
-                        Создаёт в Эвотор товары, которые были добавлены в МойСклад после первичной синхронизации.<br><br>
-                        Используйте когда добавили новые товары в МойСклад и хотите чтобы они появились на кассе.
-                    </div>
-                </div>
+    <div class="lk-card-title">СИНХРОНИЗАЦИЯ</div>
 
     
-<div class="card" style="margin-top:16px;border:1px solid #fde68a;background:#fffbeb;">
-        <h3 style="margin-top:0;">Точки восстановления товаров</h3>
-        <p style="color:#92400e;font-size:14px;line-height:1.5;">
-            Перед тестовой синхронизацией можно сохранить текущие карточки товаров Эвотор.
-            Если синхронизация изменит карточки неправильно, их можно откатить из последней точки.
-            Остатки при откате не перетираются.
-        </p>
+<style id="lk-actions-clean-style">
+.lk-actions-list {{
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 6px;
+}}
 
-        <form method="post" action="/onboarding/tenants/{tenant_id}/product-snapshot" style="display:inline-block;margin-right:8px;">
-            <button type="submit" class="btn btn-outline">
-                Создать точку восстановления товаров
+.lk-action-form {{
+    margin: 0;
+}}
+
+.lk-action-button {{
+    width: 100%;
+    border: 1px solid #e4e8f0;
+    background: #fff;
+    border-radius: 14px;
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    text-align: left;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}}
+
+.lk-action-button:hover {{
+    border-color: #d7ddea;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+    background: #fbfcff;
+}}
+
+.lk-action-icon {{
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    border-radius: 12px;
+    background: #eef3ff;
+    color: #3b6ff5;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    font-weight: 700;
+}}
+
+.lk-action-content {{
+    flex: 1;
+    min-width: 0;
+}}
+
+.lk-action-title {{
+    display: block;
+    font-size: 15px;
+    font-weight: 700;
+    color: #1a1d2e;
+    line-height: 1.25;
+    margin-bottom: 3px;
+}}
+
+.lk-action-desc {{
+    display: block;
+    font-size: 13px;
+    color: #6b7280;
+    line-height: 1.45;
+    font-weight: 500;
+}}
+
+.lk-action-arrow {{
+    color: #3b6ff5;
+    font-size: 20px;
+    font-weight: 700;
+    line-height: 1;
+    margin-left: 8px;
+}}
+
+.lk-recovery-panel {{
+    border: 1px solid #f2dfb1;
+    background: #fffaf0;
+    border-radius: 14px;
+    padding: 16px;
+    margin-top: 2px;
+}}
+
+.lk-recovery-title {{
+    font-size: 15px;
+    font-weight: 700;
+    color: #1a1d2e;
+    margin-bottom: 6px;
+}}
+
+.lk-recovery-text {{
+    font-size: 13px;
+    color: #9a6700;
+    line-height: 1.5;
+    margin-bottom: 12px;
+}}
+
+.lk-recovery-actions {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 8px;
+}}
+
+.lk-btn-outline {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 38px;
+    padding: 0 16px;
+    border-radius: 10px;
+    border: 1px solid #3b6ff5;
+    background: #fff;
+    color: #3b6ff5;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+}}
+
+.lk-btn-soft {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 38px;
+    padding: 0 16px;
+    border-radius: 10px;
+    border: 1px solid #e5e7eb;
+    background: #f3f4f6;
+    color: #1f2937;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+}}
+
+.lk-recovery-note {{
+    font-size: 12px;
+    color: #a16207;
+    line-height: 1.45;
+}}
+</style>
+
+<div class="lk-actions-list">
+
+        <form method="post" action="/onboarding/tenants/{tenant_id}/sync" class="lk-action-form">
+            <button type="submit" class="lk-action-button">
+                <span class="lk-action-icon">↻</span>
+                <span class="lk-action-content">
+                    <span class="lk-action-title">Повторная синхронизация товаров</span>
+                    <span class="lk-action-desc">Повторно выгрузить связанные товары из МойСклад в Эвотор.</span>
+                </span>
+                <span class="lk-action-arrow">→</span>
             </button>
         </form>
 
-        <form method="post"
-              action="/onboarding/tenants/{tenant_id}/product-rollback-latest"
-              style="display:inline-block;margin-right:8px;"
-              onsubmit="return confirm('Откатить карточки товаров Эвотор из последней точки восстановления? Остатки не будут перезаписаны. После отката рекомендуется синхронизировать остатки.');">
-            <button type="submit" class="btn btn-danger">
-                Откатить карточки из последней точки
+        <form method="post" action="/onboarding/tenants/{tenant_id}/reconcile" class="lk-action-form">
+            <button type="submit" class="lk-action-button">
+                <span class="lk-action-icon">◇</span>
+                <span class="lk-action-content">
+                    <span class="lk-action-title">Синхронизировать остатки</span>
+                    <span class="lk-action-desc">Обновить остатки товаров в Эвотор по данным МойСклад.</span>
+                </span>
+                <span class="lk-action-arrow">→</span>
             </button>
         </form>
 
-        <div style="font-size:12px;color:#92400e;margin-top:8px;">
-            После отката нажмите «Синхронизировать остатки», чтобы подтянуть актуальные остатки из МойСклад.
+        <form method="post" action="/onboarding/tenants/{tenant_id}/sync-ms-to-evotor" class="lk-action-form">
+            <button type="submit" class="lk-action-button">
+                <span class="lk-action-icon">＋</span>
+                <span class="lk-action-content">
+                    <span class="lk-action-title">Синхронизировать новые товары из МойСклад</span>
+                    <span class="lk-action-desc">Добавить в Эвотор товары, которых ещё нет в кассе.</span>
+                </span>
+                <span class="lk-action-arrow">→</span>
+            </button>
+        </form>
+
+        <div class="lk-recovery-panel">
+            <div class="lk-recovery-title">Точки восстановления товаров</div>
+            <div class="lk-recovery-text">
+                Перед тестовой синхронизацией можно сохранить текущие карточки товаров Эвотор.
+                Если синхронизация изменит карточки неправильно, их можно откатить из последней точки.
+                Остатки при откате не перетираются.
+            </div>
+
+            <div class="lk-recovery-actions">
+                <form method="post" action="/onboarding/tenants/{tenant_id}/product-snapshot" style="margin:0;">
+                    <button type="submit" class="lk-btn-outline">Создать точку восстановления товаров</button>
+                </form>
+
+                <form method="post" action="/onboarding/tenants/{tenant_id}/product-rollback-latest" style="margin:0;">
+                    <button type="submit" class="lk-btn-soft">Откатить карточки из последней точки</button>
+                </form>
+            </div>
+
+            <div class="lk-recovery-note">
+                После отката нажмите «Синхронизировать остатки», чтобы подтянуть актуальные остатки из МойСклад.
+            </div>
         </div>
+
     </div>
+</div>
+    
 
 
             </div>
@@ -2350,63 +2671,9 @@ def lk_actions(tenant_id: str, msg: str | None = None, err: str | None = None):
         <div class="sync-sublabel">Это может занять до 30 секунд</div>
     </div>
 
-    <script>
-    var _pendingForm = null;
-    document.querySelectorAll('.action-row form').forEach(function(form) {{
-        form.addEventListener('submit', function(e) {{
-            var btn = form.querySelector('button');
-            var label = btn ? btn.textContent.trim() : 'Синхронизация';
-            btn && btn.classList.add('loading');
-            btn && (btn.disabled = true);
-            document.getElementById('syncLabel').textContent = label + '...';
-            document.getElementById('syncOverlay').classList.add('visible');
-        }});
-    }});
-    </script>
-    <div class="confirm-overlay" id="confirmOverlay">
-        <div class="confirm-box">
-            <div class="confirm-title" id="confirmTitle"></div>
-            <div class="confirm-desc" id="confirmDesc"></div>
-            <div class="confirm-btns">
-                <button class="confirm-cancel" onclick="hideConfirm()">Отмена</button>
-                <button class="confirm-ok" id="confirmOkBtn">Продолжить</button>
-            </div>
-        </div>
-    </div>
 
-    <script>
-    function showConfirm(title, desc, form) {{
-        document.getElementById('confirmTitle').textContent = title;
-        document.getElementById('confirmDesc').textContent = desc;
-        _pendingForm = form;
-        document.getElementById('confirmOverlay').classList.add('visible');
-    }}
-    function hideConfirm() {{
-        document.getElementById('confirmOverlay').classList.remove('visible');
-        _pendingForm = null;
-    }}
-    document.addEventListener('DOMContentLoaded', function() {{
-        var okBtn = document.getElementById('confirmOkBtn');
-        if (okBtn) {{
-            okBtn.addEventListener('click', function() {{
-                hideConfirm();
-                if (_pendingForm) {{
-                    var overlay = document.getElementById('syncOverlay');
-                    if (overlay) overlay.classList.add('visible');
-                    setTimeout(function() {{
-                        _pendingForm.submit();
-                    }}, 50);
-                }}
-            }});
-        }}
-        var overlay = document.getElementById('confirmOverlay');
-        if (overlay) {{
-            overlay.addEventListener('click', function(e) {{
-                if (e.target === this) hideConfirm();
-            }});
-        }}
-    }});
-    </script>
+    
+
     """
 
     return _lk_layout(tenant, "actions", content, info_message=msg, error_message=err)
