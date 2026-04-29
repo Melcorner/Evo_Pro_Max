@@ -63,8 +63,12 @@ def _extract_telegram_link_token_from_text(text: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _ms_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip", "Content-Type": "application/json"}
-
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json;charset=utf-8",
+        "Accept-Encoding": "gzip",
+    }
 
 def _ms_fetch(path: str, token: str, params: dict | None = None) -> dict:
     url = f"{MS_BASE}{path}"
@@ -264,17 +268,43 @@ def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None, int, dic
         tenant = dict(row)
 
         # Считаем уникальные ms_id — один товар МС может быть в нескольких магазинах
+        # Считаем уникальные ms_id — один товар МС может быть в нескольких магазинах
         cur.execute(
             aq("SELECT COUNT(DISTINCT ms_id) as cnt FROM mappings WHERE tenant_id = ? AND entity_type = 'product'"),
             (tenant_id,),
         )
         mappings_count = cur.fetchone()["cnt"]
 
+        # Считаем все store-level связки:
+        # один товар МС может быть выгружен в несколько магазинов Эвотор
+        cur.execute(
+            aq("SELECT COUNT(*) as cnt FROM mappings WHERE tenant_id = ? AND entity_type = 'product'"),
+            (tenant_id,),
+        )
+        store_mappings_count = cur.fetchone()["cnt"]
+
         cur.execute(aq("SELECT * FROM stock_sync_status WHERE tenant_id = ?"), (tenant_id,))
         stock = cur.fetchone()
         stock_row = dict(stock) if stock else None
 
-        cur.execute(aq("SELECT status, COUNT(*) as cnt FROM event_store WHERE tenant_id = ? GROUP BY status"), (tenant_id,))
+        cur.execute(
+            aq("""
+            SELECT status, COUNT(*) as cnt
+            FROM (
+                SELECT
+                    status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(NULLIF(event_key, ''), id)
+                        ORDER BY created_at DESC, id DESC
+                    ) as rn
+                FROM event_store
+                WHERE tenant_id = ?
+            ) t
+            WHERE rn = 1
+            GROUP BY status
+            """),
+            (tenant_id,),
+        )
         event_counts = {r["status"]: r["cnt"] for r in cur.fetchall()}
 
         cur.execute(aq("""
@@ -303,7 +333,7 @@ def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None, int, dic
         except Exception:
             pass
 
-    return tenant, event_counts, mappings_count, stock_row, ms_products_count, last_event
+    return tenant, event_counts, mappings_count, store_mappings_count, stock_row, ms_products_count, last_event
 
 
 def _is_valid_email(email: str) -> bool:
@@ -316,7 +346,6 @@ def _is_valid_email(email: str) -> bool:
 
 LK_STYLE = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: 'Inter', -apple-system, sans-serif; background: #f0f2f7; color: #1a1d2e; min-height: 100vh; }
 .lk-header { background: #fff; border-bottom: 1px solid #e4e8f0; padding: 0 32px; position: sticky; top: 0; z-index: 100; }
@@ -472,7 +501,7 @@ def _lk_layout(tenant: dict, active_tab: str, content: str,
     </header>
     <div class="lk-container">
         <div class="lk-page-title">Личный кабинет</div>
-        <div class="lk-page-subtitle"></code></div>
+            <div class="lk-page-subtitle">Tenant ID: <code>{html.escape(tenant_id)}</code></div>
         <div class="lk-tabs">{tabs_html}</div>
         {alerts}
         {content}
@@ -559,18 +588,25 @@ def _run_initial_sync(tenant_id: str) -> dict:
             total_failed += 1
             all_errors.append({"store": store_id, "error": str(e)})
 
-    # Уведомляем МойСклад что настройка завершена
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(aq("SELECT ms_account_id, moysklad_token FROM tenants WHERE id = ?"), (tenant_id,))
-        t = cur.fetchone()
-        conn.close()
-        if t and t["ms_account_id"] and t["moysklad_token"]:
-            _notify_ms_activated(t["ms_account_id"], t["moysklad_token"])
-    except Exception as notify_err:
-        log.warning("_run_initial_sync: notify_ms_activated failed err=%s", notify_err)
+    # Уведомляем МойСклад, что настройка завершена, только если синхронизация прошла без ошибок
+    if total_failed == 0:
+        try:
+            conn = get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    aq("SELECT ms_account_id, moysklad_token FROM tenants WHERE id = ?"),
+                    (tenant_id,),
+                )
+                t = cur.fetchone()
+            finally:
+                conn.close()
 
+            if t and t["ms_account_id"] and t["moysklad_token"]:
+                _notify_ms_activated(t["ms_account_id"])
+
+        except Exception as notify_err:
+                log.warning("_run_initial_sync: notify_ms_activated failed err=%s", notify_err)
     return {
         "status": "ok" if total_failed == 0 else "partial",
         "synced": total_synced,
@@ -602,7 +638,8 @@ def _render_sync_result(result: dict) -> str:
                 <tr><td>Ошибок</td><td>{failed}</td></tr>
             </table>
             {errors_html}
-        </div>"""
+        </div>
+    </div>"""
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +796,7 @@ def wizard_step1(tenant_id: str, err: str | None = None):
             </div>
         </div>
     </div>"""
-    return HTMLResponse(_ob_step_layout(1, 4, "Подключение Эвотор", body))
+    return HTMLResponse(_ob_step_layout(1, 5, "Подключение Эвотор", body))
 
 
 @router.post("/onboarding/wizard/{tenant_id}/step1", response_class=HTMLResponse)
@@ -847,7 +884,7 @@ def wizard_step2(tenant_id: str, session_id: str):
         parts.append('<div class="ob-success">Все магазины уже подключены.</div>')
         parts.append(f'<a href="/onboarding/tenants/{html.escape(tenant_id)}" class="ob-btn" style="display:inline-block;text-decoration:none;margin-top:12px;">Перейти в личный кабинет →</a>')
 
-    return HTMLResponse(_ob_step_layout(2, 4, "Выберите магазин Эвотор", "".join(parts),
+    return HTMLResponse(_ob_step_layout(2, 5, "Выберите магазин Эвотор", "".join(parts),
                         back_url=f"/onboarding/wizard/{tenant_id}/step1"))
 
 
@@ -858,7 +895,7 @@ def wizard_step3(tenant_id: str, session_id: str, store_id: str, err: str | None
     session = _load_session(session_id)
     store = _get_session_store(session, store_id)
     if not store:
-        return HTMLResponse(_ob_step_layout(3, 4, "Ошибка", '<div class="ob-error">Магазин не найден.</div>'))
+        return HTMLResponse(_ob_step_layout(3, 5, "Ошибка", '<div class="ob-error">Магазин не найден.</div>'))
 
     store_name = _extract_store_name(store, store_id)
 
@@ -906,7 +943,7 @@ def wizard_step3(tenant_id: str, session_id: str, store_id: str, err: str | None
         <button type="submit" class="ob-btn" style="margin-top:8px;">Синхронизировать →</button>
     </form>"""
 
-    return HTMLResponse(_ob_step_layout(3, 4, "Настройка магазина", body,
+    return HTMLResponse(_ob_step_layout(3, 5, "Настройка магазина", body,
                         back_url=f"/onboarding/wizard/{tenant_id}/step2/{session_id}"))
 
 
@@ -929,7 +966,7 @@ def wizard_step3_submit(
     session = _load_session(session_id)
     store = _get_session_store(session, store_id)
     if not store:
-        return HTMLResponse(_ob_step_layout(3, 4, "Ошибка", '<div class="ob-error">Магазин не найден.</div>'))
+        return HTMLResponse(_ob_step_layout(3, 5, "Ошибка", '<div class="ob-error">Магазин не найден.</div>'))
 
     store_name = _extract_store_name(store, store_id)
     final_name = name.strip() or store_name
@@ -1051,19 +1088,38 @@ def wizard_step4(tenant_id: str, session_id: str, store_id: str):
                 '<div class="ob-error">Ошибка при синхронизации: ' + err + '</div>';
         }});
     </script>"""
-    return HTMLResponse(_ob_step_layout(4, 4, "Синхронизация товаров", body))
+    return HTMLResponse(_ob_step_layout(4, 5, "Синхронизация товаров", body))
 
 
 @router.post("/onboarding/wizard/{tenant_id}/step4/{session_id}/{store_id}/run")
 def wizard_step4_run(tenant_id: str, session_id: str, store_id: str):
     from app.api.sync import initial_sync_store
+    from app.api.vendor import _notify_ms_activated
+
     try:
         result = initial_sync_store(tenant_id, store_id)
+
+        failed = result.get("failed", 0)
+        if failed == 0:
+            conn = get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    aq("SELECT ms_account_id, moysklad_token FROM tenants WHERE id = ?"),
+                    (tenant_id,),
+                )
+                t = cur.fetchone()
+            finally:
+                conn.close()
+
+            if t and t["ms_account_id"] and t["moysklad_token"]:
+                _notify_ms_activated(t["ms_account_id"])
+
         return result
+
     except Exception as e:
         log.exception("wizard_step4_run failed")
         return {"status": "error", "error": str(e), "synced": 0, "skipped": 0, "failed": 1}
-
 
 # Шаг 5 — готово
 @router.get("/onboarding/wizard/{tenant_id}/step5/{session_id}/{store_id}", response_class=HTMLResponse)
@@ -1102,7 +1158,7 @@ def wizard_step5(tenant_id: str, session_id: str, store_id: str):
         Перейти в личный кабинет →
     </a>"""
 
-    return HTMLResponse(_ob_step_layout(4, 4, "Готово", body))
+    return HTMLResponse(_ob_step_layout(5, 5, "Готово", body))
 
 
 # ---------------------------------------------------------------------------
@@ -1888,7 +1944,7 @@ def _save_evotor_and_sync(
 
 @router.get("/onboarding/tenants/{tenant_id}", response_class=HTMLResponse)
 def lk_overview(tenant_id: str):
-    tenant, event_counts, mappings_count, stock_row, ms_products_count, last_event = _get_lk_data(tenant_id)
+    tenant, event_counts, mappings_count, store_mappings_count, stock_row, ms_products_count, last_event = _get_lk_data(tenant_id)
     ms_ok = bool(tenant.get("moysklad_token"))
     evotor_ok = bool(tenant.get("evotor_token"))
     sync_ok = bool(tenant.get("sync_completed_at"))
@@ -1905,26 +1961,21 @@ def lk_overview(tenant_id: str):
     done = event_counts.get("DONE", 0)
     new_ev = event_counts.get("NEW", 0)
 
-    # Баннер новых товаров
     new_products_banner = ""
     if ms_products_count > mappings_count:
         diff = ms_products_count - mappings_count
-        new_products_banner = f'''<div class="lk-row" style="background:#fffbeb;margin:0 -24px;padding:10px 24px;border-radius:0;">
-            <span class="lk-row-label" style="color:#92400e;">⚠️ Новых товаров в МойСклад: {diff}</span>
-            <form method="post" action="/onboarding/tenants/{tenant_id}/sync-ms-to-evotor" style="margin:0;"
-                  onsubmit="
-                    var btn = this.querySelector('button');
-                    btn.disabled = true;
-                    btn.textContent = '⏳ Синхронизация...';
-                    document.getElementById('syncOverlay') && document.getElementById('syncOverlay').classList.add('visible');
-                    var lbl = document.getElementById('syncLabel');
-                    if(lbl) lbl.textContent = 'Синхронизируем новые товары...';
-                  ">
-                <button type="submit" class="btn btn-outline" style="padding:5px 12px;font-size:12px;">
-                    Синхронизировать →
-                </button>
-            </form>
-        </div>'''
+        new_products_banner = f'''
+            <div class="lk-row" style="background:#fffbeb;margin:0 -24px;padding:10px 24px;border-radius:0;">
+                <span class="lk-row-label" style="color:#92400e;">
+                    ⚠️ Товаров МойСклад без связки с Эвотор: {diff}
+                </span>
+                <form method="post" action="/onboarding/tenants/{tenant_id}/sync-ms-to-evotor" style="margin:0;">
+                    <button type="submit" class="btn btn-outline" style="padding:5px 12px;font-size:12px;">
+                        Синхронизировать →
+                    </button>
+                </form>
+            </div>
+        '''
         
     # Баннер удалённых товаров
     deleted_products_banner = ""
@@ -1971,8 +2022,8 @@ def lk_overview(tenant_id: str):
         <div class="lk-row"><span class="lk-row-label">Эвотор</span>{_badge(evotor_ok, "Подключён", "Не подключён")}</div>
         <div class="lk-row"><span class="lk-row-label">Первичная синхронизация</span>{_badge(sync_ok, f"Выполнена {_format_ts(tenant.get('sync_completed_at'))}", "Не выполнена")}</div>
         <div class="lk-row">
-            <span class="lk-row-label">Товаров синхронизировано</span>
-            <span class="lk-row-value">{mappings_count}{"/" + str(ms_products_count) if ms_products_count else ""}</span>
+            <span class="lk-row-label">Товаров с остатком выгружено в Эвотор</span>
+            <span class="lk-row-value">{store_mappings_count} связи / {mappings_count}{"/" + str(ms_products_count) if ms_products_count else ""} товаров МС</span>
         </div>
         {new_products_banner}
         {deleted_products_banner}
@@ -2463,17 +2514,14 @@ def onboarding_tenant_sync(tenant_id: str):
         conn.commit()
     finally:
         conn.close()
-    # Сбрасываем маппинги всех магазинов
-    stores = _load_tenant_stores(tenant_id)
-    ms_store = MappingStore()
-    for store in stores:
-        deleted = ms_store.delete_by_store(tenant_id, store["evotor_store_id"])
-        log.info("tenant_sync: deleted %d mappings store=%s", deleted, store["evotor_store_id"])
+    # Не удаляем mappings перед повторной синхронизацией.
+    # Повторный sync должен только добирать/обновлять связи, но не ломать рабочие mappings
+    # при частичной ошибке или rate limit 429 от МойСклад.
     # Запускаем синхронизацию
     result = _run_initial_sync(tenant_id)
     synced = result.get("synced", 0)
     failed = result.get("failed", 0)
-    msg = f"Синхронизация завершена: новых товаров — {synced}, ошибок — {failed}."
+    msg = f"Синхронизация завершена: связей восстановлено — {synced}, ошибок — {failed}."
     if failed > 0:
         return RedirectResponse(
             url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(msg)}",
@@ -2518,16 +2566,46 @@ def onboarding_tenant_sync_ms_to_evotor(tenant_id: str):
     from app.api.sync import sync_ms_to_evotor_store
     from urllib.parse import quote_plus
     stores = _load_tenant_stores(tenant_id)
-    total_synced = total_failed = 0
+
+    total_synced = 0
+    total_failed = 0
+    total_products_total = 0
+    total_products_with_stock = 0
+    total_products_without_stock = 0
+    total_stock_check_failed = 0
+
     for store in stores:
         try:
             result = sync_ms_to_evotor_store(tenant_id, store["evotor_store_id"])
-            total_synced += result.get("synced", 0)
-            total_failed += result.get("failed", 0)
+            total_synced += int(result.get("synced", 0) or 0)
+            total_failed += int(result.get("failed", 0) or 0)
+
+            products_total = int(result.get("products_total", result.get("checked_products", 0)) or 0)
+            products_with_stock = int(result.get("products_with_stock", 0) or 0)
+            products_without_stock = int(
+                result.get(
+                    "products_without_stock",
+                    max(products_total - products_with_stock, 0),
+                ) or 0
+            )
+
+            total_products_total += products_total
+            total_products_with_stock += products_with_stock
+            total_products_without_stock += products_without_stock
+            total_stock_check_failed += int(result.get("stock_check_failed", 0) or 0)
+
         except Exception as e:
             log.error("sync_ms_to_evotor store=%s err=%s", store["evotor_store_id"], e)
             total_failed += 1
-    msg = f"МС→Эвотор: добавлено/обновлено — {total_synced}, ошибок — {total_failed}."
+
+    msg = (
+        f"МС→Эвотор: товаров с остатком синхронизировано — "
+        f"{total_products_with_stock}/{total_products_total}; "
+        f"без остатка на складе — {total_products_without_stock}; "
+        f"добавлено/обновлено — {total_synced}; ошибок — {total_failed}."
+    )
+    if total_stock_check_failed > 0:
+        msg += f" Не удалось проверить остаток — {total_stock_check_failed}."
     if total_failed > 0:
         return RedirectResponse(
             url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(msg)}",
@@ -3051,6 +3129,29 @@ def store_add(
                 now,
             ),
         )
+
+        if final_primary:
+            cur.execute(
+                aq("""
+                UPDATE tenants
+                SET evotor_store_id = ?,
+                    ms_store_id = ?,
+                    ms_organization_id = ?,
+                    ms_agent_id = ?,
+                    sync_completed_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """),
+                (
+                    evotor_store_id,
+                    ms_store_id.strip() or None,
+                    ms_organization_id.strip() or None,
+                    ms_agent_id.strip() or None,
+                    now,
+                    tenant_id,
+                ),
+            )
+
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -3096,84 +3197,237 @@ def store_add(
 @router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/sync", response_class=HTMLResponse)
 def store_sync(tenant_id: str, evotor_store_id: str):
     from app.api.sync import initial_sync_store
+    from app.stores.mapping_store import MappingStore
+    from urllib.parse import quote_plus
+
+    now = int(time.time())
+
     conn = get_connection()
     try:
         cur = conn.cursor()
+
         cur.execute(
-            aq("UPDATE tenant_stores SET sync_completed_at = NULL, updated_at = ? WHERE tenant_id = ? AND evotor_store_id = ?"),
-            (int(time.time()), tenant_id, evotor_store_id),
+            aq("""
+            UPDATE tenant_stores
+            SET sync_completed_at = NULL,
+                updated_at = ?
+            WHERE tenant_id = ?
+              AND evotor_store_id = ?
+            """),
+            (now, tenant_id, evotor_store_id),
         )
+
+        cur.execute(
+            aq("""
+            UPDATE tenants
+            SET sync_completed_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+              AND evotor_store_id = ?
+            """),
+            (now, tenant_id, evotor_store_id),
+        )
+
         conn.commit()
     finally:
         conn.close()
+
     try:
+        ms_store = MappingStore()
+        deleted = ms_store.delete_by_store(tenant_id, evotor_store_id)
+        log.info(
+            "store_sync: deleted %s mappings tenant_id=%s store=%s",
+            deleted,
+            tenant_id,
+            evotor_store_id,
+        )
+
         result = initial_sync_store(tenant_id, evotor_store_id)
+
         synced = result.get("synced", 0)
+        skipped = result.get("skipped", 0)
         failed = result.get("failed", 0)
-        msg = f"Синхронизация завершена: {synced} товаров, {failed} ошибок."
+
+        msg = f"Синхронизация завершена: {synced + skipped} товаров, {failed} ошибок."
+
         if failed > 0:
-            return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={msg}", status_code=303)
-        return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={msg}", status_code=303)
+            return RedirectResponse(
+                url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(msg)}",
+                status_code=303,
+            )
+
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={quote_plus(msg)}",
+            status_code=303,
+        )
+
     except Exception as e:
-        return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={e}", status_code=303)
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(str(e))}",
+            status_code=303,
+        )
 
 
 @router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/reconcile", response_class=HTMLResponse)
 def store_reconcile(tenant_id: str, evotor_store_id: str):
     from app.api.sync import reconcile_stock_store
+    from urllib.parse import quote_plus
+
     try:
         result = reconcile_stock_store(tenant_id, evotor_store_id)
         synced = result.get("synced", 0)
         failed = result.get("failed", 0)
         msg = f"Остатки синхронизированы: {synced} товаров, {failed} ошибок."
-        if failed > 0:
-            return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={msg}", status_code=303)
-        return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={msg}", status_code=303)
-    except Exception as e:
-        return RedirectResponse(url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={e}", status_code=303)
-
-
-@router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/sync-ms-to-evotor", response_class=HTMLResponse)
-def store_sync_ms_to_evotor(tenant_id: str, evotor_store_id: str):
-    from app.api.sync import sync_ms_to_evotor_store
-
-    try:
-        result = sync_ms_to_evotor_store(tenant_id, evotor_store_id)
-        synced = result.get("synced", 0)
-        failed = result.get("failed", 0)
-        deleted = result.get("deleted", 0)
-        msg = f"МС→Эвотор: добавлено/обновлено — {synced}, удалено — {deleted}, ошибок — {failed}."
 
         if failed > 0:
             return RedirectResponse(
-                url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={msg}",
+                url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(msg)}",
                 status_code=303,
             )
 
         return RedirectResponse(
-            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={msg}",
-            status_code=303,
-        )
-    except Exception as e:
-        return RedirectResponse(
-            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={e}",
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={quote_plus(msg)}",
             status_code=303,
         )
 
+    except Exception as e:
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(str(e))}",
+            status_code=303,
+        )
+
+@router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/sync-ms-to-evotor", response_class=HTMLResponse)
+def store_sync_ms_to_evotor(tenant_id: str, evotor_store_id: str):
+    from app.api.sync import sync_ms_to_evotor_store
+    from urllib.parse import quote_plus
+
+    try:
+        result = sync_ms_to_evotor_store(tenant_id, evotor_store_id)
+
+        synced = int(result.get("synced", 0) or 0)
+        failed = int(result.get("failed", 0) or 0)
+        deleted = int(result.get("deleted", 0) or 0)
+
+        products_total = int(result.get("products_total", result.get("checked_products", 0)) or 0)
+        products_with_stock = int(result.get("products_with_stock", 0) or 0)
+        products_without_stock = int(
+            result.get(
+                "products_without_stock",
+                max(products_total - products_with_stock, 0),
+            ) or 0
+        )
+        stock_check_failed = int(result.get("stock_check_failed", 0) or 0)
+
+        msg = (
+            f"МС→Эвотор: товаров с остатком синхронизировано — "
+            f"{products_with_stock}/{products_total}; "
+            f"без остатка на складе — {products_without_stock}; "
+            f"добавлено/обновлено — {synced}, удалено — {deleted}, ошибок — {failed}."
+        )
+        if stock_check_failed > 0:
+            msg += f" Не удалось проверить остаток — {stock_check_failed}."
+
+        if failed > 0:
+            return RedirectResponse(
+                url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(msg)}",
+                status_code=303,
+            )
+
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={quote_plus(msg)}",
+            status_code=303,
+        )
+
+    except Exception as e:
+        log.exception(
+            "store_sync_ms_to_evotor failed tenant_id=%s store=%s",
+            tenant_id,
+            evotor_store_id,
+        )
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(str(e))}",
+            status_code=303,
+        )
+        
 @router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/set-primary", response_class=HTMLResponse)
 def store_set_primary(tenant_id: str, evotor_store_id: str):
+    from urllib.parse import quote_plus
+
+    now = int(time.time())
+
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute(aq("UPDATE tenant_stores SET is_primary = 0 WHERE tenant_id = ?"), (tenant_id,))
+
         cur.execute(
-            aq("UPDATE tenant_stores SET is_primary = 1, updated_at = ? WHERE tenant_id = ? AND evotor_store_id = ?"),
-            (int(time.time()), tenant_id, evotor_store_id),
+            aq("""
+            SELECT evotor_store_id, ms_store_id, ms_organization_id, ms_agent_id, sync_completed_at
+            FROM tenant_stores
+            WHERE tenant_id = ?
+              AND evotor_store_id = ?
+            """),
+            (tenant_id, evotor_store_id),
         )
+        store = cur.fetchone()
+
+        if not store:
+            return RedirectResponse(
+                url=f"/onboarding/tenants/{tenant_id}/stores?err={quote_plus('Магазин не найден')}",
+                status_code=303,
+            )
+
+        cur.execute(
+            aq("UPDATE tenant_stores SET is_primary = 0 WHERE tenant_id = ?"),
+            (tenant_id,),
+        )
+
+        cur.execute(
+            aq("""
+            UPDATE tenant_stores
+            SET is_primary = 1,
+                updated_at = ?
+            WHERE tenant_id = ?
+              AND evotor_store_id = ?
+            """),
+            (now, tenant_id, evotor_store_id),
+        )
+
+        cur.execute(
+            aq("""
+            UPDATE tenants
+            SET evotor_store_id = ?,
+                ms_store_id = ?,
+                ms_organization_id = ?,
+                ms_agent_id = ?,
+                sync_completed_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """),
+            (
+                store["evotor_store_id"],
+                store["ms_store_id"],
+                store["ms_organization_id"],
+                store["ms_agent_id"],
+                store["sync_completed_at"],
+                now,
+                tenant_id,
+            ),
+        )
+
         conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        log.exception("store_set_primary failed tenant_id=%s store=%s", tenant_id, evotor_store_id)
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(str(e))}",
+            status_code=303,
+        )
+
     finally:
         conn.close()
+
     return RedirectResponse(
-        url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg=Магазин назначен основным",
+        url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={quote_plus('Магазин назначен основным')}",
         status_code=303,
     )

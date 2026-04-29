@@ -154,6 +154,57 @@ def _ms_headers(token: str) -> dict:
     }
 
 
+def _ms_get_with_retry(
+    url: str,
+    *,
+    headers: dict,
+    params: dict | None = None,
+    timeout: int = 20,
+    context: str = "moysklad.get",
+):
+    """
+    GET в МойСклад с мягким retry/backoff.
+
+    Нужен для ручной синхронизации МС→Эвотор, потому что МойСклад
+    может возвращать 429 при серии запросов к товарам/остаткам.
+    """
+    max_attempts = int(os.getenv("MS_API_RETRY_MAX", "5"))
+    base_wait = float(os.getenv("MS_API_RETRY_BASE_WAIT_SEC", "1.0"))
+    success_delay = float(os.getenv("MS_API_REQUEST_DELAY_SEC", "0.20"))
+
+    last_response = None
+
+    for attempt in range(1, max_attempts + 1):
+        r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        last_response = r
+
+        if r.status_code != 429:
+            if success_delay > 0:
+                time.sleep(success_delay)
+            return r
+
+        retry_after = r.headers.get("Retry-After")
+        if retry_after:
+            try:
+                wait = float(retry_after)
+            except ValueError:
+                wait = base_wait * attempt
+        else:
+            wait = base_wait * attempt
+
+        log.warning(
+            "%s rate limited status=429 attempt=%s/%s wait=%.2fs url=%s",
+            context,
+            attempt,
+            max_attempts,
+            wait,
+            url,
+        )
+        time.sleep(wait)
+
+    return last_response
+
+
 def _upsert_stock_status(
     tenant_id: str,
     status: str,
@@ -221,7 +272,7 @@ def _list_product_mappings(tenant_id: str) -> list[dict]:
     cur = conn.cursor()
     cur.execute(
         aq("""
-        SELECT tenant_id, entity_type, evotor_id, ms_id, created_at, updated_at
+        SELECT tenant_id, evotor_store_id, entity_type, evotor_id, ms_id, created_at, updated_at
         FROM mappings
         WHERE tenant_id = ? AND entity_type = 'product'
         ORDER BY created_at ASC
@@ -583,7 +634,6 @@ def _build_evotor_product_payload(
     payload = dict(current_product) if isinstance(current_product, dict) else {}
 
     ms_product_id = ms_product.get("id", "")
-    ms_product_id = ms_product.get("id", "")
     base_fields = {
         "name": ms_product.get("name", ""),
         "price": sale_price,
@@ -598,9 +648,6 @@ def _build_evotor_product_payload(
         ),
         "article_number": ms_product.get("article", "") or "",
     }
-    # Всегда передаём externalCode = ms_id для идемпотентности
-    if ms_product_id:
-        base_fields["externalCode"] = ms_product_id
     # Всегда передаём externalCode = ms_id для идемпотентности
     if ms_product_id:
         base_fields["externalCode"] = ms_product_id
@@ -702,7 +749,13 @@ def _get_ms_product(ms_token: str, ms_product_id: str, expand: str | None = None
     params = {}
     if expand:
         params["expand"] = expand
-    r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
+    r = _ms_get_with_retry(
+        url,
+        headers=_ms_headers(ms_token),
+        params=params,
+        timeout=20,
+        context="MoySklad get_product",
+    )
     if not r.ok:
         log.error("MoySklad get_product error status=%s body=%s", r.status_code, r.text)
         r.raise_for_status()
@@ -715,7 +768,13 @@ def _search_ms_products(ms_token: str, search: str | None = None, limit: int = 1
     if search:
         params["search"] = search
 
-    r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=30)
+    r = _ms_get_with_retry(
+        url,
+        headers=_ms_headers(ms_token),
+        params=params,
+        timeout=30,
+        context="MoySklad search products",
+    )
     if not r.ok:
         log.error("MoySklad search products error status=%s body=%s", r.status_code, r.text)
         r.raise_for_status()
@@ -730,7 +789,13 @@ def _get_ms_product_stock_for_store(ms_token: str, ms_product_id: str, ms_store_
             f"store={MS_BASE}/entity/store/{ms_store_id}"
         )
     }
-    r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
+    r = _ms_get_with_retry(
+        url,
+        headers=_ms_headers(ms_token),
+        params=params,
+        timeout=20,
+        context="MoySklad stock report by store",
+    )
     if not r.ok:
         log.error(
             "MoySklad stock report by store error status=%s body=%s ms_product_id=%s ms_store_id=%s",
@@ -832,7 +897,13 @@ def _get_ms_product_stock_for_store(ms_token: str, ms_product_id: str, ms_store_
             f"store={MS_BASE}/entity/store/{ms_store_id}"
         )
     }
-    r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
+    r = _ms_get_with_retry(
+        url,
+        headers=_ms_headers(ms_token),
+        params=params,
+        timeout=20,
+        context="MoySklad stock report by store",
+    )
     if not r.ok:
         log.error(
             "MoySklad stock report by store error status=%s body=%s ms_product_id=%s ms_store_id=%s",
@@ -979,6 +1050,7 @@ def _sync_product_to_evotor_store(tenant_id: str, evotor_store_id: str, ms_produ
 
             mapping_store.upsert_mapping(
                 tenant_id=tenant_id,
+                evotor_store_id=evotor_store_id,
                 entity_type="product",
                 evotor_id=evotor_id,
                 ms_id=ms_product_id,
@@ -1024,6 +1096,7 @@ def _sync_product_to_evotor_store(tenant_id: str, evotor_store_id: str, ms_produ
 
         mapping_store.upsert_mapping(
             tenant_id=tenant_id,
+            evotor_store_id=evotor_store_id,
             entity_type="product",
             evotor_id=created_id,
             ms_id=ms_product_id,
@@ -1058,11 +1131,16 @@ def _get_evotor_products(evotor_token: str, store_id: str) -> list:
     return products
 
 
-def _find_ms_product_by_external_code(ms_token: str, external_code: str) -> str | None:
+def _find_ms_product_by_external_code(ms_token: str, external_code: str, _retry: int = 0) -> str | None:
     url = f"{MS_BASE}/entity/product"
     params = {"filter": f"externalCode={external_code}"}
     r = requests.get(url, headers=_ms_headers(ms_token), params=params, timeout=20)
     if not r.ok:
+        if r.status_code == 429 and _retry < 3:
+            wait = 2 ** _retry
+            log.warning("_find_ms_product_by_external_code rate limited retry=%d wait=%ds", _retry + 1, wait)
+            time.sleep(wait)
+            return _find_ms_product_by_external_code(ms_token, external_code, _retry + 1)
         log.error(
             "MoySklad search by externalCode failed status=%s external_code=%s — aborting to prevent duplicate",
             r.status_code,
@@ -1118,7 +1196,7 @@ EVOTOR_TAX_TO_MS: dict[str, dict] = {
     "VAT_18":  {"vat": 18, "vatEnabled": True},
     "VAT_20":  {"vat": 20, "vatEnabled": True},
     "VAT_22":  {"vat": 20, "vatEnabled": True},  # VAT_22 в Эвотор = 20% НДС в МС
-    "VAT_22":  {"vat": 22, "vatEnabled": True},
+    #"VAT_22":  {"vat": 22, "vatEnabled": True},
 }
 
 # Эвотор type → МС trackingType
@@ -1330,39 +1408,37 @@ def _update_ms_product_folder(
         log.warning("_update_ms_product_folder failed ms_id=%s err=%s", ms_product_id, e)
 
 
-def _get_or_create_ms_folder(ms_token: str, folder_name: str) -> dict | None:
-    """
-    Находит или создаёт папку в МС по названию.
-    Возвращает meta объект папки.
-    """
-    # Ищем существующую папку
+def _get_or_create_ms_folder(ms_token: str, folder_name: str, _retry: int = 0) -> dict | None:
+    """Находит или создаёт папку в МС по названию. Возвращает meta объект папки."""
     r = requests.get(
         f"{MS_BASE}/entity/productfolder",
         headers=_ms_headers(ms_token),
         params={"filter": f"name={folder_name}"},
         timeout=20,
     )
+    if r.status_code == 429 and _retry < 3:
+        time.sleep(2 ** _retry)
+        return _get_or_create_ms_folder(ms_token, folder_name, _retry + 1)
     if r.ok:
         rows = r.json().get("rows", [])
         if rows:
             return rows[0].get("meta")
-
-    # Создаём новую папку
     r2 = requests.post(
         f"{MS_BASE}/entity/productfolder",
         headers=_ms_headers(ms_token),
         json={"name": folder_name},
         timeout=20,
     )
+    if r2.status_code == 429 and _retry < 3:
+        time.sleep(2 ** _retry)
+        return _get_or_create_ms_folder(ms_token, folder_name, _retry + 1)
     if r2.ok:
         log.info("Created MS folder name=%s", folder_name)
         return r2.json().get("meta")
-
     log.error("Failed to create MS folder name=%s status=%s", folder_name, r2.status_code)
     return None
 
-
-def _create_ms_product(ms_token: str, product: dict) -> str:
+def _create_ms_product(ms_token: str, product: dict, _retry: int = 0) -> str:
     price_type_meta = _get_default_price_type_meta(ms_token)
     currency_meta = _get_default_currency_meta(ms_token)
 
@@ -1470,6 +1546,11 @@ def _create_ms_product(ms_token: str, product: dict) -> str:
             r.text,
             payload,
         )
+        if r.status_code == 429 and _retry < 3:
+            wait = 2 ** _retry
+            log.warning("_create_ms_product rate limited retry=%d wait=%ds", _retry + 1, wait)
+            time.sleep(wait)
+            return _create_ms_product(ms_token, product, _retry + 1)
         r.raise_for_status()
 
     ms_product = r.json()
@@ -1483,6 +1564,7 @@ def _create_ms_product(ms_token: str, product: dict) -> str:
 @router.post("/sync/{tenant_id}/initial")
 def initial_sync(tenant_id: str):
     tenant = _load_tenant(tenant_id)
+    evotor_store_id = tenant.get("evotor_store_id")
 
     if tenant.get("sync_completed_at"):
         raise HTTPException(
@@ -1493,14 +1575,14 @@ def initial_sync(tenant_id: str):
     if not tenant.get("evotor_token"):
         raise HTTPException(status_code=409, detail="Evotor token is not connected yet")
 
-    if not tenant.get("evotor_store_id"):
+    if not evotor_store_id:
         raise HTTPException(status_code=409, detail="Evotor store is not selected yet")
 
     if not tenant.get("moysklad_token"):
         raise HTTPException(status_code=400, detail="moysklad_token not configured")
 
     try:
-        products = _get_evotor_products(tenant["evotor_token"], tenant["evotor_store_id"])
+        products = _get_evotor_products(tenant["evotor_token"], evotor_store_id)
     except Exception as e:
         log.error("Failed to fetch Evotor products tenant_id=%s err=%s", tenant_id, e)
         raise HTTPException(status_code=502, detail=f"Failed to fetch Evotor products: {e}")
@@ -1509,7 +1591,14 @@ def initial_sync(tenant_id: str):
         now = _now()
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute(aq("UPDATE tenants SET sync_completed_at = ? WHERE id = ?"), (now, tenant_id))
+        cur.execute(
+            aq("UPDATE tenants SET sync_completed_at = ?, updated_at = ? WHERE id = ?"),
+            (now, now, tenant_id),
+        )
+        cur.execute(
+            aq("UPDATE tenant_stores SET sync_completed_at = ?, updated_at = ? WHERE tenant_id = ? AND evotor_store_id = ?"),
+            (now, now, tenant_id, evotor_store_id),
+        )
         conn.commit()
         conn.close()
         log.info("Initial sync completed for empty Evotor catalog tenant_id=%s", tenant_id)
@@ -1535,7 +1624,12 @@ def initial_sync(tenant_id: str):
             skipped += 1
             continue
 
-        existing = store.get_by_evotor_id(tenant_id=tenant_id, entity_type="product", evotor_id=evotor_id)
+        existing = store.get_by_evotor_id(
+            tenant_id=tenant_id,
+            entity_type="product",
+            evotor_id=evotor_id,
+            evotor_store_id=evotor_store_id,
+        )
         if existing:
             log.info("Skipping already mapped product evotor_id=%s ms_id=%s", evotor_id, existing)
             skipped += 1
@@ -1555,8 +1649,28 @@ def initial_sync(tenant_id: str):
                     tenant["evotor_token"], evotor_store_id,
                 )
             else:
-                # Ищем по названию — защита от дублей при переустановке
+                # Ищем по названию — fallback для старых товаров без externalCode.
+                # Важно: name-match безопасен только если найденный ms_id ещё не занят
+                # другим evotor_id в этом же магазине.
                 ms_id = _find_ms_product_by_name(tenant["moysklad_token"], product.get("name", ""))
+                if ms_id:
+                    mapped_evotor_id = store.get_by_ms_id(
+                        tenant_id=tenant_id,
+                        entity_type="product",
+                        ms_id=ms_id,
+                        evotor_store_id=evotor_store_id,
+                    )
+                    if mapped_evotor_id and mapped_evotor_id != evotor_id:
+                        log.warning(
+                            "Unsafe name-match rejected evotor_id=%s name=%s ms_id=%s mapped_evotor_id=%s store=%s",
+                            evotor_id,
+                            product.get("name"),
+                            ms_id,
+                            mapped_evotor_id,
+                            evotor_store_id,
+                        )
+                        ms_id = None
+
                 if ms_id:
                     log.info(
                         "Found existing MS product by name evotor_id=%s ms_id=%s name=%s — saving mapping only",
@@ -1588,19 +1702,43 @@ def initial_sync(tenant_id: str):
             errors.append({"evotor_id": evotor_id, "name": product.get("name"), "error": str(e)})
             continue
 
-        ok = store.upsert_mapping(tenant_id=tenant_id, entity_type="product", evotor_id=evotor_id, ms_id=ms_id)
+        ok = store.upsert_mapping(
+            tenant_id=tenant_id,
+            evotor_store_id=evotor_store_id,
+            entity_type="product",
+            evotor_id=evotor_id,
+            ms_id=ms_id,
+        )
         if ok:
             synced += 1
         else:
-            log.warning("Mapping conflict evotor_id=%s ms_id=%s", evotor_id, ms_id)
+            msg = (
+                f"Mapping conflict: evotor_id={evotor_id} ms_id={ms_id} "
+                f"store={evotor_store_id}; ms_id already mapped to another evotor_id in this store"
+            )
+            log.warning(msg)
             failed += 1
+            errors.append({
+                "evotor_id": evotor_id,
+                "name": product.get("name"),
+                "ms_id": ms_id,
+                "error": msg,
+            })
 
     should_complete = failed == 0 and (synced + skipped) > 0
 
     if should_complete:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute(aq("UPDATE tenants SET sync_completed_at = ? WHERE id = ?"), (_now(), tenant_id))
+        now = _now()
+        cur.execute(
+            aq("UPDATE tenants SET sync_completed_at = ?, updated_at = ? WHERE id = ?"),
+            (now, now, tenant_id),
+        )
+        cur.execute(
+            aq("UPDATE tenant_stores SET sync_completed_at = ?, updated_at = ? WHERE tenant_id = ? AND evotor_store_id = ?"),
+            (now, now, tenant_id, evotor_store_id),
+        )
         conn.commit()
         conn.close()
         log.info(
@@ -1698,6 +1836,7 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
     - если mapping нет -> создаём новый товар через POST /products и сохраняем evotor_id из ответа
     """
     tenant = _load_tenant(tenant_id)
+    evotor_store_id = tenant.get("evotor_store_id")
 
     if not tenant.get("sync_completed_at"):
         raise HTTPException(
@@ -1707,7 +1846,7 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
 
     if not tenant.get("evotor_token"):
         raise HTTPException(status_code=400, detail="evotor_token not configured")
-    if not tenant.get("evotor_store_id"):
+    if not evotor_store_id:
         raise HTTPException(status_code=400, detail="evotor_store_id not configured")
     if not tenant.get("moysklad_token"):
         raise HTTPException(status_code=400, detail="moysklad_token not configured")
@@ -1722,6 +1861,7 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
         tenant_id=tenant_id,
         entity_type="product",
         ms_id=ms_product_id,
+        evotor_store_id=evotor_store_id,
     )
 
     try:
@@ -1773,6 +1913,7 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
             log.info("Found existing Evotor product by externalCode ms_id=%s evotor_id=%s — saving mapping only", ms_product_id, evotor_id)
             store.upsert(
                 tenant_id=tenant_id,
+                evotor_store_id=evotor_store_id,
                 entity_type="product",
                 evotor_id=evotor_id,
                 ms_id=ms_product_id,
@@ -1814,6 +1955,7 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
 
         ok = store.upsert_mapping(
             tenant_id=tenant_id,
+            evotor_store_id=evotor_store_id,
             entity_type="product",
             evotor_id=created_id,
             ms_id=ms_product_id,
@@ -1882,6 +2024,7 @@ def reconcile_stock_to_evotor(tenant_id: str):
     from app.clients.moysklad_client import MoySkladClient
 
     tenant = _load_tenant(tenant_id)
+    evotor_store_id = tenant.get("evotor_store_id")
 
     if not tenant.get("sync_completed_at"):
         raise HTTPException(
@@ -1923,7 +2066,7 @@ def reconcile_stock_to_evotor(tenant_id: str):
         }
 
     ms_client = MoySkladClient(tenant_id)
-    evotor_client = EvotorClient(tenant_id)
+    evotor_clients: dict[str, EvotorClient] = {}
 
     synced = 0
     failed = 0
@@ -1932,13 +2075,20 @@ def reconcile_stock_to_evotor(tenant_id: str):
     for item in mappings:
         ms_id = item["ms_id"]
         evotor_id = item["evotor_id"]
+        item_store_id = item.get("evotor_store_id") or evotor_store_id
         try:
+            if not item_store_id:
+                raise ValueError("evotor_store_id is not configured for mapping")
+
             stock_value = ms_client.get_product_stock(ms_id)
-            evotor_client.update_product_stock(evotor_id, stock_value)
+            if item_store_id not in evotor_clients:
+                evotor_clients[item_store_id] = EvotorClient(tenant_id, store_id=item_store_id)
+            evotor_clients[item_store_id].update_product_stock(evotor_id, stock_value)
             synced += 1
             log.info(
-                "Stock synced tenant_id=%s ms_id=%s evotor_id=%s quantity=%s",
+                "Stock synced tenant_id=%s store=%s ms_id=%s evotor_id=%s quantity=%s",
                 tenant_id,
+                item_store_id,
                 ms_id,
                 evotor_id,
                 stock_value,
@@ -1950,12 +2100,14 @@ def reconcile_stock_to_evotor(tenant_id: str):
                 {
                     "ms_product_id": ms_id,
                     "evotor_product_id": evotor_id,
+                    "evotor_store_id": item.get("evotor_store_id"),
                     "error": err_text,
                 }
             )
             log.error(
-                "Stock reconcile failed tenant_id=%s ms_id=%s evotor_id=%s err=%s",
+                "Stock reconcile failed tenant_id=%s store=%s ms_id=%s evotor_id=%s err=%s",
                 tenant_id,
+                item.get("evotor_store_id"),
                 ms_id,
                 evotor_id,
                 err_text,
@@ -1992,25 +2144,29 @@ def sync_stock_to_evotor(tenant_id: str, ms_product_id: str):
     from app.clients.moysklad_client import MoySkladClient
 
     tenant = _load_tenant(tenant_id)
+    evotor_store_id = tenant.get("evotor_store_id")
 
     if not tenant.get("sync_completed_at"):
         raise HTTPException(
             status_code=409,
             detail="Initial sync not completed. Run POST /sync/{tenant_id}/initial first.",
         )
+    if not evotor_store_id:
+        raise HTTPException(status_code=400, detail="evotor_store_id not configured")
 
     store = MappingStore()
     evotor_product_id = store.get_by_ms_id(
         tenant_id=tenant_id,
         entity_type="product",
         ms_id=ms_product_id,
+        evotor_store_id=evotor_store_id,
     )
     if not evotor_product_id:
         raise HTTPException(status_code=404, detail="Product mapping not found")
 
     try:
         ms_client = MoySkladClient(tenant_id)
-        evotor_client = EvotorClient(tenant_id)
+        evotor_client = EvotorClient(tenant_id, store_id=evotor_store_id)
 
         stock_value = ms_client.get_product_stock(ms_product_id)
         evotor_client.update_product_stock(evotor_product_id, stock_value)
@@ -2732,6 +2888,9 @@ def _import_evotor_stock_to_ms(ms_token: str, tenant_id: str, evotor_store_id: s
 @router.post("/sync/{tenant_id}/stores/{evotor_store_id}/initial")
 def initial_sync_store(tenant_id: str, evotor_store_id: str):
     """Первичная синхронизация конкретного магазина Эвотор -> МойСклад."""
+    if evotor_store_id == "all":
+        return initial_sync_all_stores(tenant_id)
+
     tenant = _load_tenant(tenant_id)
     store = _load_store(tenant_id, evotor_store_id)
 
@@ -2770,16 +2929,66 @@ def initial_sync_store(tenant_id: str, evotor_store_id: str):
             ms_id = _find_ms_product_by_external_code(tenant["moysklad_token"], evotor_id)
             if not ms_id:
                 ms_id = _find_ms_product_by_name(tenant["moysklad_token"], product.get("name", ""))
+                if ms_id:
+                    mapped_evotor_id = ms_store.get_by_ms_id(
+                        tenant_id=tenant_id,
+                        entity_type="product",
+                        ms_id=ms_id,
+                        evotor_store_id=evotor_store_id,
+                    )
+                    if mapped_evotor_id and mapped_evotor_id != evotor_id:
+                        log.warning(
+                            "Unsafe name-match rejected evotor_id=%s name=%s ms_id=%s mapped_evotor_id=%s store=%s",
+                            evotor_id,
+                            product.get("name"),
+                            ms_id,
+                            mapped_evotor_id,
+                            evotor_store_id,
+                        )
+                        ms_id = None
+
             if not ms_id:
+                product["_evotor_token"] = tenant["evotor_token"]
+                product["store_id"] = evotor_store_id
                 ms_id = _create_ms_product(tenant["moysklad_token"], product)
                 log.info(
                     "Created MS product evotor_id=%s ms_id=%s store=%s",
                     evotor_id, ms_id, evotor_store_id,
                 )
+                time.sleep(0.3)  # rate limit МС: не более ~5 req/sec
         except Exception as e:
             failed += 1
             errors.append({"evotor_id": evotor_id, "name": product.get("name"), "error": str(e)})
             continue
+
+        # Финальная защита перед upsert:
+        # даже если ms_id был найден по externalCode или name, нельзя использовать его,
+        # если в этом же магазине он уже связан с другим evotor_id.
+        occupied_evotor_id = ms_store.get_by_ms_id(
+            tenant_id=tenant_id,
+            entity_type="product",
+            ms_id=ms_id,
+            evotor_store_id=evotor_store_id,
+        )
+        if occupied_evotor_id and occupied_evotor_id != evotor_id:
+            log.warning(
+                "Resolved ms_id is occupied; creating separate MS product evotor_id=%s name=%s ms_id=%s occupied_by=%s store=%s",
+                evotor_id,
+                product.get("name"),
+                ms_id,
+                occupied_evotor_id,
+                evotor_store_id,
+            )
+            product["_evotor_token"] = tenant["evotor_token"]
+            product["store_id"] = evotor_store_id
+            ms_id = _create_ms_product(tenant["moysklad_token"], product)
+            log.info(
+                "Created separate MS product for duplicate evotor_id=%s ms_id=%s store=%s",
+                evotor_id,
+                ms_id,
+                evotor_store_id,
+            )
+            time.sleep(0.3)
 
         ok = ms_store.upsert_mapping(
             tenant_id=tenant_id,
@@ -2791,11 +3000,18 @@ def initial_sync_store(tenant_id: str, evotor_store_id: str):
         if ok:
             synced += 1
         else:
-            log.warning(
-                "Mapping conflict evotor_id=%s ms_id=%s store=%s",
-                evotor_id, ms_id, evotor_store_id,
+            msg = (
+                f"Mapping conflict: evotor_id={evotor_id} ms_id={ms_id} "
+                f"store={evotor_store_id}; ms_id already mapped to another evotor_id in this store"
             )
-            skipped += 1
+            log.warning(msg)
+            failed += 1
+            errors.append({
+                "evotor_id": evotor_id,
+                "name": product.get("name"),
+                "ms_id": ms_id,
+                "error": msg,
+            })
 
     # Импортируем остатки из Эвотор в МС через оприходование
     if failed == 0 and products:
@@ -2834,10 +3050,21 @@ def initial_sync_store(tenant_id: str, evotor_store_id: str):
             aq("UPDATE tenant_stores SET sync_completed_at = ?, updated_at = ? WHERE tenant_id = ? AND evotor_store_id = ?"),
             (now, now, tenant_id, evotor_store_id),
         )
-        if store.get("is_primary"):
+        # Обновляем tenants.sync_completed_at если это primary магазин
+        # или если все магазины тенанта теперь синхронизированы
+        cur.execute(
+            aq("""
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN sync_completed_at IS NOT NULL THEN 1 ELSE 0 END) as done
+            FROM tenant_stores WHERE tenant_id = ?
+            """),
+            (tenant_id,),
+        )
+        counts = cur.fetchone()
+        if store.get("is_primary") or (counts and counts["total"] == counts["done"]):
             cur.execute(
-                aq("UPDATE tenants SET sync_completed_at = ? WHERE id = ?"),
-                (now, tenant_id),
+                aq("UPDATE tenants SET sync_completed_at = ?, updated_at = ? WHERE id = ?"),
+                (now, now, tenant_id),
             )
         conn.commit()
         conn.close()
@@ -2905,6 +3132,9 @@ def initial_sync_all_stores(tenant_id: str):
 @router.post("/sync/{tenant_id}/stores/{evotor_store_id}/reconcile")
 def reconcile_stock_store(tenant_id: str, evotor_store_id: str):
     """Синхронизация остатков конкретного магазина."""
+    if evotor_store_id == "all":
+        return reconcile_stock_all_stores(tenant_id)
+
     from app.clients.evotor_client import EvotorClient
     from app.clients.moysklad_client import MoySkladClient
 
@@ -2933,27 +3163,49 @@ def reconcile_stock_store(tenant_id: str, evotor_store_id: str):
 
     ms_client = MoySkladClient(tenant_id)
     evotor_client = EvotorClient(tenant_id, store_id=evotor_store_id)
-
     synced = failed = 0
     errors = []
 
+    # Получаем все остатки одним bulk запросом
+    ms_stock_map: dict[str, float] = {}
+    ms_store_id = store.get("ms_store_id")
+    try:
+        url = f"{MS_BASE}/report/stock/all?limit=1000"
+        if ms_store_id:
+            url += f"&filter=store={MS_BASE}/entity/store/{ms_store_id}"
+        r = requests.get(
+            url,
+            headers=_ms_headers(ms_client.token),
+            timeout=30,
+        )
+        if r.ok:
+            for row in r.json().get("rows", []):
+                pid = _extract_ms_product_id_from_stock_row(row)
+                if pid:
+                    stock = 0.0
+                    for key in ("stock", "quantity", "inStock"):
+                        val = row.get(key)
+                        if val is not None:
+                            try:
+                                stock = float(val)
+                                break
+                            except (TypeError, ValueError):
+                                pass
+                    ms_stock_map[pid] = stock
+            log.info("reconcile_stock_store bulk loaded %d stock rows store=%s", len(ms_stock_map), evotor_store_id)
+        else:
+            log.error("reconcile_stock_store bulk stock error status=%s", r.status_code)
+    except Exception as e:
+        log.error("reconcile_stock_store bulk stock failed err=%s", e)
+
     for item in mappings:
         try:
-            # Остаток по складу магазина если задан ms_store_id
-            if store.get("ms_store_id"):
-                quantity = _get_ms_product_stock_by_store(
-                    ms_client.token,
-                    item["ms_id"],
-                    store["ms_store_id"],
-                )
-            else:
-                quantity = ms_client.get_product_stock(item["ms_id"])
+            quantity = ms_stock_map.get(item["ms_id"], 0.0)
             evotor_client.update_product_stock(item["evotor_id"], quantity)
             synced += 1
         except Exception as e:
             failed += 1
             errors.append({"ms_id": item["ms_id"], "error": str(e)})
-
     return {
         "status": "ok" if failed == 0 else "partial",
         "store": evotor_store_id,
@@ -3054,6 +3306,15 @@ def _extract_ms_product_id_from_stock_row(row: dict) -> str | None:
         if val:
             return val
 
+    # fallback: берём id из row["meta"]["href"] — это стандартная структура /report/stock/all
+    meta = row.get("meta")
+    if isinstance(meta, dict):
+        href = (meta.get("href") or "").strip()
+        if href:
+            # убираем query string (?expand=supplier и т.д.)
+            val = href.rstrip("/").split("/")[-1].split("?")[0]
+            if val:
+                return val
     return None
 
 @router.post("/sync/{tenant_id}/stores/{evotor_store_id}/ms-to-evotor")
@@ -3234,56 +3495,28 @@ def sync_ms_to_evotor_store(tenant_id: str, evotor_store_id: str):
                 failed += len(_chunk)
                 errors.append(f"Bulk update error: {_e}")
 
-    # Удаляем только store-specific orphan mappings:
-    # если товар больше не имеет остатка на этом складе, он удаляется из этого магазина
+    # Безопасный режим: ручная МС→Эвотор синхронизация только добавляет/обновляет товары.
+    # Автоудаление отключено, потому что временный сбой проверки остатков МойСклад
+    # может ошибочно удалить store-specific mapping и товар из Эвотор.
     store_mappings = ms_map.list_by_store(tenant_id, evotor_store_id, "product")
-    to_delete = [m for m in store_mappings if m["ms_id"] not in positive_stock_ids]
+    would_delete = [m for m in store_mappings if m["ms_id"] not in positive_stock_ids]
 
     log.info(
-        "sync_ms_to_evotor_store diff: store=%s mapped=%d current=%d will_delete=%d",
+        "sync_ms_to_evotor_store diff: store=%s mapped=%d current=%d would_delete=%d auto_delete_disabled=true",
         evotor_store_id,
         len(store_mappings),
         len(positive_stock_ids),
-        len(to_delete),
+        len(would_delete),
     )
-
-    for mapping in to_delete:
-        try:
-            import requests as _req
-            r = _req.delete(
-                f"{EVOTOR_BASE}/stores/{evotor_store_id}/products/{mapping['evotor_id']}",
-                headers=_evotor_headers(tenant["evotor_token"]),
-                timeout=20,
-            )
-            if r.ok or r.status_code == 404:
-                ms_map.delete_by_ms_id(
-                    tenant_id=tenant_id,
-                    entity_type="product",
-                    ms_id=mapping["ms_id"],
-                    evotor_store_id=evotor_store_id,
-                )
-                deleted += 1
-                log.info(
-                    "Removed orphan mapping evotor_id=%s ms_id=%s store=%s",
-                    mapping["evotor_id"],
-                    mapping["ms_id"],
-                    evotor_store_id,
-                )
-            else:
-                log.warning(
-                    "Failed to delete orphan from Evotor evotor_id=%s status=%s body=%s",
-                    mapping["evotor_id"],
-                    r.status_code,
-                    r.text[:200],
-                )
-        except Exception as e:
-            log.error("Delete orphan failed evotor_id=%s err=%s", mapping["evotor_id"], e)
 
     return {
         "status": "ok" if failed == 0 else "partial",
         "store": evotor_store_id,
         "checked_products": stock_checked,
+        "products_total": len(all_ms_products),
         "products_with_stock": len(ms_products),
+        "products_without_stock": max(stock_checked - len(ms_products), 0),
+        "stock_check_failed": max(len(all_ms_products) - stock_checked, 0),
         "synced": synced,
         "skipped": skipped,
         "failed": failed,
