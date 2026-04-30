@@ -978,6 +978,15 @@ def _delete_product_mapping_by_evotor_id(tenant_id: str, evotor_id: str) -> None
 
 
 def _sync_product_to_evotor_store(tenant_id: str, evotor_store_id: str, ms_product_id: str) -> dict:
+    """
+    Точечная синхронизация одного товара МойСклад -> Эвотор.
+
+    Важно:
+    - используется при webhook'ах МойСклад;
+    - при существующем mapping товар не пропускается, а обновляется;
+    - productFolder из МойСклад передаётся как parent_id группы Эвотор;
+    - группа Эвотор создаётся автоматически через _apply_product_group().
+    """
     from app.clients.evotor_client import EvotorClient
 
     tenant = _load_tenant(tenant_id)
@@ -992,7 +1001,12 @@ def _sync_product_to_evotor_store(tenant_id: str, evotor_store_id: str, ms_produ
         raise HTTPException(status_code=400, detail="ms_store_id not configured for this store")
 
     try:
-        ms_product = _get_ms_product(merged["moysklad_token"], ms_product_id)
+        # expand=productFolder обязателен, иначе мы не узнаем имя папки МС
+        ms_product = _get_ms_product(
+            merged["moysklad_token"],
+            ms_product_id,
+            expand="productFolder",
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch MS product: {e}")
 
@@ -1005,7 +1019,20 @@ def _sync_product_to_evotor_store(tenant_id: str, evotor_store_id: str, ms_produ
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch store stock: {e}")
 
-    if stock_value <= 0:
+    mapping_store = MappingStore()
+    evotor_client = EvotorClient(tenant_id, store_id=evotor_store_id)
+
+    mapped_evotor_id_for_stock_check = mapping_store.get_by_ms_id(
+        tenant_id=tenant_id,
+        entity_type="product",
+        ms_id=ms_product_id,
+        evotor_store_id=evotor_store_id,
+    )
+
+    # Новый товар без остатка не создаём.
+    # Но если товар уже связан через mapping, карточку всё равно обновляем:
+    # название, цены, маркировку, единицу измерения и productFolder -> parent_id.
+    if stock_value <= 0 and not mapped_evotor_id_for_stock_check:
         return {
             "status": "skipped",
             "reason": "no_stock_on_store",
@@ -1013,14 +1040,60 @@ def _sync_product_to_evotor_store(tenant_id: str, evotor_store_id: str, ms_produ
             "store": evotor_store_id,
         }
 
-    mapping_store = MappingStore()
-    evotor_client = EvotorClient(tenant_id, store_id=evotor_store_id)
-
     try:
-        existing_evotor_product = _find_evotor_product_by_external_code(merged, ms_product_id)
+        existing_evotor_product = None
+        evotor_id = None
 
-        if existing_evotor_product:
-            evotor_id = existing_evotor_product.get("id")
+        # 1. Сначала используем наш store-specific mapping.
+        mapped_evotor_id = mapping_store.get_by_ms_id(
+            tenant_id=tenant_id,
+            entity_type="product",
+            ms_id=ms_product_id,
+            evotor_store_id=evotor_store_id,
+        )
+
+        if mapped_evotor_id:
+            evotor_id = mapped_evotor_id
+            try:
+                r_current = requests.get(
+                    f"{EVOTOR_BASE}/stores/{evotor_store_id}/products/{evotor_id}",
+                    headers=_evotor_headers(merged["evotor_token"]),
+                    timeout=20,
+                )
+                if r_current.ok:
+                    existing_evotor_product = r_current.json()
+                else:
+                    log.warning(
+                        "_sync_product_to_evotor_store: mapped Evotor product not found/update unavailable "
+                        "tenant_id=%s store=%s ms_id=%s evotor_id=%s status=%s body=%s",
+                        tenant_id,
+                        evotor_store_id,
+                        ms_product_id,
+                        evotor_id,
+                        r_current.status_code,
+                        r_current.text[:300],
+                    )
+                    evotor_id = None
+            except Exception as e:
+                log.warning(
+                    "_sync_product_to_evotor_store: failed to fetch mapped Evotor product "
+                    "tenant_id=%s store=%s ms_id=%s evotor_id=%s err=%s",
+                    tenant_id,
+                    evotor_store_id,
+                    ms_product_id,
+                    evotor_id,
+                    e,
+                )
+                evotor_id = None
+
+        # 2. Если mapping не помог, ищем по externalCode.
+        if not existing_evotor_product:
+            existing_evotor_product = _find_evotor_product_by_external_code(merged, ms_product_id)
+            if existing_evotor_product:
+                evotor_id = existing_evotor_product.get("id")
+
+        # 3. Если товар уже есть в Эвоторе — обновляем карточку и группу.
+        if existing_evotor_product and evotor_id:
             evotor_payload = _build_evotor_product_payload(
                 ms_product,
                 evotor_id=evotor_id,
@@ -1028,22 +1101,35 @@ def _sync_product_to_evotor_store(tenant_id: str, evotor_store_id: str, ms_produ
                 for_create=False,
             )
 
-            url = f"{EVOTOR_BASE}/stores/{evotor_store_id}/products/{evotor_id}"
-            r = requests.put(
-                url,
-                headers=_evotor_headers(merged["evotor_token"]),
-                json=evotor_payload,
-                timeout=20,
+            evotor_payload["id"] = evotor_id
+
+            for field in ("store_id", "user_id", "created_at", "updated_at"):
+                evotor_payload.pop(field, None)
+
+            _apply_product_group(
+                payload=evotor_payload,
+                ms_product=ms_product,
+                tenant_id=tenant_id,
+                evotor_store_id=evotor_store_id,
+                evotor_token=merged["evotor_token"],
             )
+
+            r = requests.put(
+                f"{EVOTOR_BASE}/stores/{evotor_store_id}/products",
+                headers=_evotor_headers(merged["evotor_token"]),
+                json=[evotor_payload],
+                timeout=30,
+            )
+
             if not r.ok:
                 log.error(
-                    "Evotor update store product error status=%s ms_id=%s evotor_id=%s store=%s payload=%s body=%s",
+                    "Evotor bulk update product error status=%s ms_id=%s evotor_id=%s store=%s payload=%s body=%s",
                     r.status_code,
                     ms_product_id,
                     evotor_id,
                     evotor_store_id,
                     evotor_payload,
-                    r.text,
+                    r.text[:500],
                 )
                 r.raise_for_status()
 
@@ -1057,14 +1143,25 @@ def _sync_product_to_evotor_store(tenant_id: str, evotor_store_id: str, ms_produ
                 ms_id=ms_product_id,
             )
 
+            log.info(
+                "_sync_product_to_evotor_store: updated product ms_id=%s evotor_id=%s store=%s name=%s parent_id=%s",
+                ms_product_id,
+                evotor_id,
+                evotor_store_id,
+                ms_product.get("name"),
+                evotor_payload.get("parent_id"),
+            )
+
             return {
                 "status": "updated",
                 "ms_product_id": ms_product_id,
                 "evotor_product_id": evotor_id,
                 "store": evotor_store_id,
                 "quantity": stock_value,
+                "parent_id": evotor_payload.get("parent_id"),
             }
 
+        # 4. Если товара нет — создаём новый товар сразу с parent_id группы.
         evotor_payload = _build_evotor_product_payload(
             ms_product,
             evotor_id=None,
@@ -1072,13 +1169,21 @@ def _sync_product_to_evotor_store(tenant_id: str, evotor_store_id: str, ms_produ
             for_create=True,
         )
 
-        url = f"{EVOTOR_BASE}/stores/{evotor_store_id}/products"
+        _apply_product_group(
+            payload=evotor_payload,
+            ms_product=ms_product,
+            tenant_id=tenant_id,
+            evotor_store_id=evotor_store_id,
+            evotor_token=merged["evotor_token"],
+        )
+
         r = requests.post(
-            url,
+            f"{EVOTOR_BASE}/stores/{evotor_store_id}/products",
             headers=_evotor_headers(merged["evotor_token"]),
             json=evotor_payload,
-            timeout=20,
+            timeout=30,
         )
+
         if not r.ok:
             log.error(
                 "Evotor create store product error status=%s ms_id=%s store=%s payload=%s body=%s",
@@ -1086,37 +1191,55 @@ def _sync_product_to_evotor_store(tenant_id: str, evotor_store_id: str, ms_produ
                 ms_product_id,
                 evotor_store_id,
                 evotor_payload,
-                r.text,
+                r.text[:500],
             )
             r.raise_for_status()
 
         created = r.json() if r.text else {}
-        created_id = created.get("id")
-        if not created_id:
-            raise HTTPException(status_code=502, detail="Evotor create product response has no id")
+        evotor_id = created.get("id")
+
+        if not evotor_id:
+            raise RuntimeError(f"Evotor product created without id: {created}")
+
+        evotor_client.update_product_stock(evotor_id, stock_value)
 
         mapping_store.upsert_mapping(
             tenant_id=tenant_id,
             evotor_store_id=evotor_store_id,
             entity_type="product",
-            evotor_id=created_id,
+            evotor_id=evotor_id,
             ms_id=ms_product_id,
         )
 
-        evotor_client.update_product_stock(created_id, stock_value)
+        log.info(
+            "_sync_product_to_evotor_store: created product ms_id=%s evotor_id=%s store=%s name=%s parent_id=%s",
+            ms_product_id,
+            evotor_id,
+            evotor_store_id,
+            ms_product.get("name"),
+            evotor_payload.get("parent_id"),
+        )
 
         return {
             "status": "created",
             "ms_product_id": ms_product_id,
-            "evotor_product_id": created_id,
+            "evotor_product_id": evotor_id,
             "store": evotor_store_id,
             "quantity": stock_value,
+            "parent_id": evotor_payload.get("parent_id"),
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to sync product to store Evotor: {e}")
+        log.exception(
+            "_sync_product_to_evotor_store failed tenant_id=%s store=%s ms_id=%s",
+            tenant_id,
+            evotor_store_id,
+            ms_product_id,
+        )
+        raise HTTPException(status_code=502, detail=f"Failed to sync product to Evotor: {e}")
+
 
 def _get_evotor_products(evotor_token: str, store_id: str) -> list:
     url = f"{EVOTOR_BASE}/stores/{store_id}/products"
@@ -1415,17 +1538,124 @@ def _get_default_currency_meta(ms_token: str) -> dict:
 _uom_cache: dict[str, list] = {}
 
 EVOTOR_MEASURE_TO_MS_CODE = {
-    "шт": "796", "кг": "166", "г": "163", "л": "112",
-    "мл": "111", "м": "006", "см": "004", "мм": "003",
-    "м2": "055", "м3": "113", "км": "008", "т": "168",
-    "упак": "796", "уп": "796", "пара": "796", "компл": "796",
-    "рулон": "736", "блок": "813", "ящ": "812", "пог. м": "018",
+    "шт": "796",
+    "штука": "796",
+    "штук": "796",
+    "pcs": "796",
+    "pc": "796",
+    "piece": "796",
+
+    "кг": "166",
+    "килограмм": "166",
+    "килограммы": "166",
+    "kg": "166",
+
+    "г": "163",
+    "гр": "163",
+    "грамм": "163",
+
+    "л": "112",
+    "литр": "112",
+    "литры": "112",
+
+    "мл": "111",
+    "м": "006",
+    "см": "004",
+    "мм": "003",
+    "м2": "055",
+    "м²": "055",
+    "м3": "113",
+    "м³": "113",
+    "км": "008",
+    "т": "168",
+
+    "упак": "796",
+    "уп": "796",
+    "пара": "796",
+    "компл": "796",
+
+    "рулон": "736",
+    "блок": "813",
+    "ящ": "812",
+    "пог. м": "018",
 }
 
 
-def _get_ms_uom_meta(ms_token: str, measure_name: str) -> dict | None:
+def _normalize_measure_name(value: str | None) -> str:
+    raw = (value or "").strip().lower()
+
+    if not raw:
+        return "шт"
+
+    raw = raw.replace(".", "").replace("ё", "е")
+
+    aliases = {
+        "шт": "шт",
+        "штука": "шт",
+        "штук": "шт",
+        "pcs": "шт",
+        "pc": "шт",
+        "piece": "шт",
+
+        "кг": "кг",
+        "килограмм": "кг",
+        "килограммы": "кг",
+        "kg": "кг",
+
+        "г": "г",
+        "гр": "г",
+        "грамм": "г",
+
+        "л": "л",
+        "литр": "л",
+        "литры": "л",
+
+        "мл": "мл",
+        "м": "м",
+        "см": "см",
+        "мм": "мм",
+        "м2": "м2",
+        "м²": "м2",
+        "м3": "м3",
+        "м³": "м3",
+        "км": "км",
+        "т": "т",
+
+        "упак": "шт",
+        "уп": "шт",
+        "пара": "шт",
+        "компл": "шт",
+    }
+
+    return aliases.get(raw, raw)
+
+
+def _extract_evotor_measure_name(product: dict) -> str:
+    """
+    Эвотор может отдавать единицу в разных полях.
+    Если единицы нет — обычный товар считаем штучным.
+    """
+    for key in ("measure_name", "measureName", "measure", "unitName", "uom"):
+        value = product.get(key)
+        if isinstance(value, str) and value.strip():
+            return _normalize_measure_name(value)
+
+    return "шт"
+
+
+def _get_ms_uom_meta(ms_token: str, measure_name: str | None) -> dict | None:
+    """
+    Возвращает meta единицы измерения МойСклад.
+
+    Важно:
+    - сначала ищем по коду ОКЕИ, чтобы "мл" не совпал с "Мл" = мегалитр;
+    - если единица пустая или неизвестная — fallback на "шт" / code 796.
+    """
     if not measure_name:
-        return None
+        measure_name = "шт"
+
+    measure_lower = _normalize_measure_name(measure_name)
+
     if ms_token not in _uom_cache:
         try:
             r = _request_with_ms_retry(
@@ -1440,20 +1670,51 @@ def _get_ms_uom_meta(ms_token: str, measure_name: str) -> dict | None:
             if r.ok:
                 _uom_cache[ms_token] = r.json().get("rows", [])
             else:
-                return None
+                log.warning(
+                    "Failed to fetch UOM list status=%s body=%s",
+                    r.status_code,
+                    r.text[:300],
+                )
+                _uom_cache[ms_token] = []
         except Exception as e:
             log.warning("Failed to fetch UOM list err=%s", e)
-            return None
-    uoms = _uom_cache[ms_token]
-    measure_lower = measure_name.strip().lower()
-    for uom in uoms:
-        if uom.get("name", "").lower() == measure_lower:
-            return uom.get("meta")
+            _uom_cache[ms_token] = []
+
+    uoms = _uom_cache.get(ms_token) or []
+
+    # 1. Сначала ищем по коду ОКЕИ. Это критично для "мл":
+    # name="Мл" в МС означает мегалитр, а миллилитр имеет name="см3; мл" и code=111.
     ms_code = EVOTOR_MEASURE_TO_MS_CODE.get(measure_lower)
     if ms_code:
         for uom in uoms:
-            if uom.get("code") == ms_code:
+            code = str(uom.get("code") or "")
+            external_code = str(uom.get("externalCode") or "")
+            if code == ms_code or external_code == ms_code:
                 return uom.get("meta")
+
+    # 2. Точное совпадение по name
+    for uom in uoms:
+        name = (uom.get("name") or "").strip().lower().replace(".", "").replace("ё", "е")
+        if name == measure_lower:
+            return uom.get("meta")
+
+    # 3. Составные названия: "л; дм3", "см3; мл"
+    for uom in uoms:
+        name = (uom.get("name") or "").strip().lower().replace(".", "").replace("ё", "е")
+        parts = [p.strip() for p in name.split(";")]
+        if measure_lower in parts:
+            return uom.get("meta")
+
+    # 4. По описанию, например "Штука"
+    for uom in uoms:
+        description = (uom.get("description") or "").strip().lower().replace(".", "").replace("ё", "е")
+        if description == measure_lower or measure_lower in description.split():
+            return uom.get("meta")
+
+    # 5. Fallback на штуки
+    if measure_lower != "шт":
+        return _get_ms_uom_meta(ms_token, "шт")
+
     log.warning("UOM not found for measure_name=%s", measure_name)
     return None
 
@@ -1612,7 +1873,7 @@ def _create_ms_product(ms_token: str, product: dict, _retry: int = 0) -> str:
         }
 
     # --- Единица измерения ---
-    measure_name = product.get("measure_name", "").strip()
+    measure_name = _extract_evotor_measure_name(product)
     if measure_name:
         uom_meta = _get_ms_uom_meta(ms_token, measure_name)
         if uom_meta:
