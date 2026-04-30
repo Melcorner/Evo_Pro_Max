@@ -3055,8 +3055,52 @@ def _import_evotor_stock_to_ms(ms_token: str, tenant_id: str, evotor_store_id: s
         timeout=30,
     )
     if r.ok:
-        log.info("_import_evotor_stock_to_ms: created enter doc store=%s positions=%d", evotor_store_id, len(positions))
-        return {"status": "ok", "entered": len(positions), "skipped": len(products) - len(positions)}
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+
+        result = {
+            "status": "ok",
+            "entered": len(positions),
+            "skipped": len(products) - len(positions),
+            "enter_id": data.get("id"),
+            "enter_href": (data.get("meta") or {}).get("href"),
+        }
+
+        import json as _json
+        import time as _time
+
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                aq("""
+                UPDATE tenant_stores
+                SET
+                    evotor_stock_imported_at = ?,
+                    evotor_stock_import_result_json = ?
+                WHERE tenant_id = ?
+                  AND evotor_store_id = ?
+                """),
+                (
+                    int(_time.time()),
+                    _json.dumps(result, ensure_ascii=False),
+                    tenant_id,
+                    evotor_store_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        log.info(
+            "_import_evotor_stock_to_ms: created enter doc store=%s positions=%d enter_id=%s",
+            evotor_store_id,
+            len(positions),
+            result.get("enter_id"),
+        )
+        return result
     else:
         log.error("_import_evotor_stock_to_ms: failed status=%s body=%s", r.status_code, r.text[:200])
         return {"status": "error", "error": r.text[:200]}
