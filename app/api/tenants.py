@@ -345,69 +345,91 @@ def list_tenants():
 
 @router.delete("/tenants/{tenant_id}")
 def delete_tenant(tenant_id: str):
+    """
+    Безопасно удаляет tenant и связанные локальные данные.
+
+    Важно:
+    - удаляет только данные нашей БД;
+    - не удаляет товары в Эвотор;
+    - не удаляет товары в МойСклад;
+    - не падает, если необязательной таблицы нет.
+    """
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute(aq("SELECT id, name FROM tenants WHERE id = ?"), (tenant_id,))
-    tenant = cur.fetchone()
-    if not tenant:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    deleted = {}
 
     try:
-        cur.execute(aq("DELETE FROM product_group_mappings WHERE tenant_id = ?"), (tenant_id,))
-        cur.execute(aq("DELETE FROM tenant_stores WHERE tenant_id = ?"), (tenant_id,))
-        deleted_tenant_stores = cur.rowcount
+        cur.execute(aq("SELECT id FROM tenants WHERE id = ?"), (tenant_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Tenant not found")
 
-        cur.execute(aq("DELETE FROM mappings WHERE tenant_id = ?"), (tenant_id,))
-        deleted_mappings = cur.rowcount
+        # Находим все реальные таблицы public, где есть колонка tenant_id.
+        # Это безопаснее, чем вручную перечислять sync_locks/action_logs/etc.,
+        # потому что часть таблиц может отсутствовать на конкретном стенде.
+        cur.execute("""
+            SELECT table_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND column_name = 'tenant_id'
+            ORDER BY
+              CASE WHEN table_name = 'tenant_stores' THEN 2 ELSE 1 END,
+              table_name
+        """)
 
-        cur.execute(aq("DELETE FROM errors WHERE tenant_id = ?"), (tenant_id,))
-        deleted_errors = cur.rowcount
+        tables = [row["table_name"] for row in cur.fetchall()]
 
-        cur.execute(aq("DELETE FROM stock_sync_status WHERE tenant_id = ?"), (tenant_id,))
-        deleted_stock_sync_status = cur.rowcount
+        # Удаляем сначала все дочерние таблицы с tenant_id, кроме tenant_stores.
+        # tenant_stores удаляем ближе к концу.
+        for table_name in tables:
+            if table_name == "tenant_stores":
+                continue
 
-        cur.execute(aq("DELETE FROM notification_log WHERE tenant_id = ?"), (tenant_id,))
-        deleted_notification_log = cur.rowcount
+            # table_name берётся только из information_schema, но всё равно держим простую защиту.
+            if not table_name.replace("_", "").isalnum():
+                log.warning("delete_tenant: skipped suspicious table name=%s", table_name)
+                continue
 
-        cur.execute(aq("DELETE FROM telegram_link_tokens WHERE tenant_id = ?"), (tenant_id,))
-        deleted_telegram_link_tokens = cur.rowcount
+            cur.execute(
+                aq(f"DELETE FROM {table_name} WHERE tenant_id = ?"),
+                (tenant_id,),
+            )
+            deleted[table_name] = cur.rowcount
 
-        cur.execute(aq("DELETE FROM fiscalization_checks WHERE tenant_id = ?"), (tenant_id,))
-        deleted_fiscalization_checks = cur.rowcount
-
-        cur.execute(aq("DELETE FROM processed_events WHERE tenant_id = ?"), (tenant_id,))
-        deleted_processed_events = cur.rowcount
-
-        cur.execute(aq("DELETE FROM event_store WHERE tenant_id = ?"), (tenant_id,))
-        deleted_event_store = cur.rowcount
+        if "tenant_stores" in tables:
+            cur.execute(
+                aq("DELETE FROM tenant_stores WHERE tenant_id = ?"),
+                (tenant_id,),
+            )
+            deleted["tenant_stores"] = cur.rowcount
+        else:
+            deleted["tenant_stores"] = 0
 
         cur.execute(aq("DELETE FROM tenants WHERE id = ?"), (tenant_id,))
-        deleted_tenants = cur.rowcount
+        deleted["tenants"] = cur.rowcount
 
         conn.commit()
 
-    except Exception:
+        log.warning("Tenant deleted tenant_id=%s deleted=%s", tenant_id, deleted)
+
+        return {
+            "status": "ok",
+            "tenant_id": tenant_id,
+            "deleted": deleted,
+        }
+
+    except HTTPException:
         conn.rollback()
         raise
+
+    except Exception as e:
+        conn.rollback()
+        log.exception("delete_tenant failed tenant_id=%s", tenant_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete tenant: {type(e).__name__}: {e}",
+        )
+
     finally:
         conn.close()
 
-    return {
-        "status": "ok",
-        "deleted": {
-            "tenant_id": tenant_id,
-            "tenant_name": tenant["name"],
-            "tenants": deleted_tenants,
-            "tenant_stores": deleted_tenant_stores,
-            "mappings": deleted_mappings,
-            "errors": deleted_errors,
-            "stock_sync_status": deleted_stock_sync_status,
-            "notification_log": deleted_notification_log,
-            "telegram_link_tokens": deleted_telegram_link_tokens,
-            "fiscalization_checks": deleted_fiscalization_checks,
-            "processed_events": deleted_processed_events,
-            "event_store": deleted_event_store,
-        }
-    }
