@@ -3004,7 +3004,7 @@ def _import_evotor_stock_to_ms(ms_token: str, tenant_id: str, evotor_store_id: s
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        aq("SELECT ms_store_id, ms_organization_id FROM tenant_stores WHERE tenant_id = ? AND evotor_store_id = ?"),
+        aq("SELECT ms_store_id, ms_organization_id, evotor_stock_imported_at, evotor_stock_import_result_json FROM tenant_stores WHERE tenant_id = ? AND evotor_store_id = ?"),
         (tenant_id, evotor_store_id),
     )
     store_row = cur.fetchone()
@@ -3012,6 +3012,16 @@ def _import_evotor_stock_to_ms(ms_token: str, tenant_id: str, evotor_store_id: s
     if not store_row or not store_row["ms_store_id"] or not store_row["ms_organization_id"]:
         log.warning("_import_evotor_stock_to_ms: ms_store_id or ms_organization_id not set store=%s", evotor_store_id)
         return {"status": "skipped", "reason": "ms_store_id or ms_organization_id not configured"}
+
+    if store_row["evotor_stock_imported_at"]:
+        return {
+            "status": "skipped",
+            "reason": "evotor stock already imported for this store",
+            "entered": 0,
+            "skipped": len(products),
+            "evotor_stock_imported_at": store_row["evotor_stock_imported_at"],
+            "previous_result": store_row["evotor_stock_import_result_json"],
+        }
     ms_store_id = store_row["ms_store_id"]
     ms_org_id = store_row["ms_organization_id"]
     positions = []
@@ -3239,9 +3249,9 @@ def initial_sync_store(tenant_id: str, evotor_store_id: str):
     # Автоматически синхронизируем остатки после первичной синхронизации
     if failed == 0:
         try:
-            reconcile_result = reconcile_stock_store(tenant_id, evotor_store_id)
+            reconcile_result = {"status": "disabled_after_initial_sync", "synced": 0, "failed": 0}
             log.info(
-                "Auto reconcile after initial_sync store=%s synced=%s failed=%s",
+                "Auto reconcile after initial_sync disabled store=%s synced=%s failed=%s",
                 evotor_store_id,
                 reconcile_result.get("synced", 0),
                 reconcile_result.get("failed", 0),
