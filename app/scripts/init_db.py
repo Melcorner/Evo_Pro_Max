@@ -26,6 +26,9 @@ SCHEMA_TABLES = (
     "product_group_mappings",
     "errors",
     "stock_sync_status",
+    "sync_locks",
+    "sync_snapshots",
+    "action_log",
     "fiscalization_checks",
     "service_heartbeats",
     "notification_log",
@@ -98,6 +101,18 @@ INDEX_DEFINITIONS = [
     (
         "idx_notification_log_created_at",
         "CREATE INDEX IF NOT EXISTS idx_notification_log_created_at ON notification_log(created_at)",
+    ),
+    (
+        "idx_sync_snapshots_tenant_created_at",
+        "CREATE INDEX IF NOT EXISTS idx_sync_snapshots_tenant_created_at ON sync_snapshots(tenant_id, created_at)",
+    ),
+    (
+        "idx_action_log_tenant_created_at",
+        "CREATE INDEX IF NOT EXISTS idx_action_log_tenant_created_at ON action_log(tenant_id, created_at)",
+    ),
+    (
+        "idx_action_log_created_at",
+        "CREATE INDEX IF NOT EXISTS idx_action_log_created_at ON action_log(created_at)",
     ),
     (
         "idx_telegram_link_tokens_tenant_created_at",
@@ -500,6 +515,68 @@ def init_db():
             last_error          TEXT,
             synced_items_count  INTEGER NOT NULL DEFAULT 0,
             total_items_count   INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        )
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # sync_locks
+    # ------------------------------------------------------------------
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_locks (
+            tenant_id       TEXT NOT NULL,
+            evotor_store_id TEXT NOT NULL,
+            action_type     TEXT NOT NULL,
+            locked_at       INTEGER NOT NULL,
+            expires_at      INTEGER NOT NULL,
+            owner           TEXT,
+            PRIMARY KEY (tenant_id, evotor_store_id, action_type)
+        )
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # sync_snapshots
+    # ------------------------------------------------------------------
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_snapshots (
+            id                  TEXT PRIMARY KEY,
+            tenant_id           TEXT NOT NULL,
+            evotor_store_id     TEXT,
+            action_type         TEXT NOT NULL,
+            mappings_count      INTEGER NOT NULL DEFAULT 0,
+            products_count      INTEGER,
+            stock_items_count   INTEGER,
+            actor               TEXT,
+            source              TEXT,
+            status              TEXT NOT NULL,
+            message             TEXT,
+            metadata_json       TEXT,
+            created_at          INTEGER NOT NULL,
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        )
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # action_log
+    # ------------------------------------------------------------------
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS action_log (
+            id              TEXT PRIMARY KEY,
+            tenant_id       TEXT NOT NULL,
+            evotor_store_id TEXT,
+            action_type     TEXT NOT NULL,
+            status          TEXT NOT NULL,
+            message         TEXT,
+            actor           TEXT,
+            source          TEXT,
+            metadata_json   TEXT,
+            created_at      INTEGER NOT NULL,
             FOREIGN KEY (tenant_id) REFERENCES tenants(id)
         )
         """

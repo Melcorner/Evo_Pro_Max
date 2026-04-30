@@ -12,6 +12,7 @@ from app.clients.telegram_client import TelegramClient
 from app.db import adapt_query as aq, get_connection
 from app.logger import setup_logging
 from app.services.alert_logic import build_alert_messages, build_alert_snapshot
+from app.services.action_log_service import log_action
 from app.stores.notification_log_store import insert_notification_log
 
 setup_logging()
@@ -246,6 +247,15 @@ def _write_notification_log(
             sent_at=int(time.time()) if status == "sent" else None,
         )
         conn.commit()
+        if tenant_id:
+            log_action(
+                tenant_id=tenant_id,
+                action_type="notification",
+                status=status,
+                message=f"{channel_type} notification {status}: {event_type}",
+                source="alert_worker",
+                metadata={"channel_type": channel_type, "event_type": event_type},
+            )
     except Exception:
         conn.rollback()
         log.exception(
@@ -799,7 +809,7 @@ def main_loop():
         and not telegram_bot_token
         and email_transport_config is None
     ):
-        log.error(
+        log.warning(
             "alert worker has no delivery transports configured",
             extra=_alert_extra(
                 component="alert_worker",
@@ -807,7 +817,6 @@ def main_loop():
                 status="no_channels",
             ),
         )
-        return
 
     previous_snapshot = None
     previous_tenant_snapshot: dict[str, dict] | None = None

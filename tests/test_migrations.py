@@ -84,8 +84,13 @@ def test_init_db_sqlite_creates_current_tables_and_indexes(monkeypatch, tmp_path
 
     assert "notification_log" in tables
     assert "telegram_link_tokens" in tables
+    assert "action_log" in tables
+    assert "sync_snapshots" in tables
+    assert "sync_locks" in tables
     assert "idx_tenants_evotor_user_id_lookup" in indexes
     assert "idx_tenants_evotor_store_id_unique" in indexes
+    assert "idx_action_log_tenant_created_at" in indexes
+    assert "idx_sync_snapshots_tenant_created_at" in indexes
 
 
 def test_onboarding_sessions_migration_adds_current_columns(monkeypatch, tmp_path):

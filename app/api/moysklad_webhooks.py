@@ -9,11 +9,16 @@ from typing import Optional, List
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from app.api.sync import _get_ms_product_stock_for_store, _upsert_stock_status
+from app.api.sync import (
+    _get_ms_product_stock_for_store,
+    _sync_product_to_evotor_store,
+    _upsert_stock_status,
+)
 from app.db import get_connection, adapt_query as aq
 from app.stores.mapping_store import MappingStore
 from app.clients.moysklad_client import MoySkladClient
 from app.clients.evotor_client import EvotorClient
+from app.services.action_log_service import log_action
 
 router = APIRouter(tags=["MoySklad Webhooks"])
 log = logging.getLogger("api.webhooks.moysklad")
@@ -331,6 +336,13 @@ async def moysklad_webhook(
     raw_body = await request.body()
 
     if not _verify_signature(raw_body, x_lognex_signature):
+        log_action(
+            tenant_id=tenant_id,
+            action_type="moysklad_webhook",
+            status="error",
+            message="Invalid MoySklad webhook signature",
+            source="webhook",
+        )
         raise HTTPException(status_code=401, detail="Invalid MoySklad webhook signature")
 
     try:
@@ -338,12 +350,26 @@ async def moysklad_webhook(
         body = MoySkladWebhook.model_validate(payload)
     except Exception as e:
         log.error("Invalid webhook body tenant_id=%s err=%s", tenant_id, e)
+        log_action(
+            tenant_id=tenant_id,
+            action_type="moysklad_webhook",
+            status="error",
+            message=f"Invalid webhook body: {type(e).__name__}",
+            source="webhook",
+        )
         raise HTTPException(status_code=400, detail=f"Invalid webhook body: {e}")
 
     tenant = _load_tenant(tenant_id)
 
     if not tenant.get("sync_completed_at"):
         log.warning("MoySklad webhook received but sync not completed tenant_id=%s", tenant_id)
+        log_action(
+            tenant_id=tenant_id,
+            action_type="moysklad_webhook",
+            status="skipped",
+            message="Initial sync not completed",
+            source="webhook",
+        )
         return {"status": "skipped", "reason": "initial sync not completed"}
 
     started_at: int | None = None
@@ -352,6 +378,10 @@ async def moysklad_webhook(
     total_skipped = 0
     total_failed = 0
     total_products = 0
+    product_events_seen = 0
+    product_synced = 0
+    product_skipped = 0
+    product_failed = 0
     processed_docs = []
 
     ms_client = MoySkladClient(tenant_id)
@@ -364,43 +394,88 @@ async def moysklad_webhook(
 
             # Обработка создания/обновления товара
             if doc_type == "product" and doc_id:
+                product_events_seen += 1
                 log.info("MoySklad product event tenant_id=%s product_id=%s", tenant_id, doc_id)
-                
-                try:
-                    from app.api.sync import sync_ms_to_evotor_store
-                    from app.db import get_connection as _gc, adapt_query as _aq
 
-                    _conn = _gc()
+                stores = _load_stock_sync_stores(tenant_id)
+                store_ids = [
+                    row.get("evotor_store_id")
+                    for row in stores
+                    if row.get("evotor_store_id")
+                ]
+
+                if not store_ids:
+                    product_skipped += 1
+                    processed_docs.append({
+                        "doc_type": "product",
+                        "doc_id": doc_id,
+                        "products": 1,
+                        "synced": 0,
+                        "skipped": 1,
+                        "failed": 0,
+                        "error": "no synced stores",
+                    })
+                    continue
+
+                for store_id in store_ids:
                     try:
-                        _cur = _conn.cursor()
-                        _cur.execute(
-                            _aq("""
-                            SELECT evotor_store_id
-                            FROM tenant_stores
-                            WHERE tenant_id = ?
-                              AND sync_completed_at IS NOT NULL
-                            """),
-                            (tenant_id,),
+                        result = _sync_product_to_evotor_store(
+                            tenant_id=tenant_id,
+                            evotor_store_id=store_id,
+                            ms_product_id=doc_id,
                         )
-                        store_ids = [r["evotor_store_id"] for r in _cur.fetchall()]
-                    finally:
-                        _conn.close()
 
-                    for _sid in store_ids:
-                        try:
-                            _res = sync_ms_to_evotor_store(tenant_id, _sid)
-                            log.info(
-                                "Product sync after MS webhook store=%s synced=%s",
-                                _sid,
-                                _res.get("synced", 0),
-                            )
-                        except Exception as _e:
-                            log.error("Product sync failed store=%s err=%s", _sid, _e)
-                
-                except Exception as e:
-                    log.error("Failed to handle product webhook err=%s", e)
-                
+                        status = result.get("status")
+
+                        if status == "skipped":
+                            product_skipped += 1
+                            synced_count = 0
+                            skipped_count = 1
+                        else:
+                            product_synced += 1
+                            synced_count = 1
+                            skipped_count = 0
+
+                        log.info(
+                            "Product sync after MS webhook tenant_id=%s store=%s product_id=%s status=%s",
+                            tenant_id,
+                            store_id,
+                            doc_id,
+                            status,
+                        )
+
+                        processed_docs.append({
+                            "doc_type": "product",
+                            "doc_id": doc_id,
+                            "store": store_id,
+                            "products": 1,
+                            "synced": synced_count,
+                            "skipped": skipped_count,
+                            "failed": 0,
+                            "error": result.get("reason"),
+                        })
+
+                    except Exception as exc:
+                        log.exception(
+                            "Product sync after MS webhook failed tenant_id=%s store=%s product_id=%s",
+                            tenant_id,
+                            store_id,
+                            doc_id,
+                        )
+                        product_failed += 1
+                        processed_docs.append({
+                            "doc_type": "product",
+                            "doc_id": doc_id,
+                            "store": store_id,
+                            "products": 1,
+                            "synced": 0,
+                            "skipped": 0,
+                            "failed": 1,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        })
+
                 continue
+
 
             if not doc_type or doc_type not in STOCK_TRIGGER_TYPES:
                 log.info("Skipping non-stock doc_type=%s href=%s", doc_type, href)
@@ -493,14 +568,31 @@ async def moysklad_webhook(
 
         if not stock_sync_started:
             log.info("MoySklad webhook contains no stock-trigger documents tenant_id=%s", tenant_id)
+            final_status = "ok" if product_failed == 0 else "partial"
+            log_action(
+                tenant_id=tenant_id,
+                action_type="moysklad_webhook",
+                status=final_status,
+                message=(
+                    f"Product webhook processed: events={product_events_seen}, "
+                    f"synced={product_synced}, skipped={product_skipped}, failed={product_failed}"
+                ),
+                source="webhook",
+                metadata={
+                    "product_events": product_events_seen,
+                    "synced": product_synced,
+                    "skipped": product_skipped,
+                    "failed": product_failed,
+                },
+            )
             return {
-                "status": "ok",
-                "docs_processed": 0,
+                "status": final_status,
+                "docs_processed": len(processed_docs),
                 "products_total": 0,
-                "synced": 0,
-                "skipped": 0,
-                "failed": 0,
-                "details": [],
+                "synced": product_synced,
+                "skipped": product_skipped,
+                "failed": product_failed,
+                "details": processed_docs,
             }
 
         final_status = "ok" if total_failed == 0 else "error"
@@ -523,13 +615,32 @@ async def moysklad_webhook(
             tenant_id, len(processed_docs), total_synced, total_skipped, total_failed,
         )
 
+        log_action(
+            tenant_id=tenant_id,
+            action_type="moysklad_webhook",
+            status="ok" if total_failed == 0 and product_failed == 0 else "partial",
+            message=(
+                f"Webhook processed: docs={len(processed_docs)}, "
+                f"stock_synced={total_synced}, product_synced={product_synced}, "
+                f"failed={total_failed + product_failed}"
+            ),
+            source="webhook",
+            metadata={
+                "docs_processed": len(processed_docs),
+                "stock_synced": total_synced,
+                "product_synced": product_synced,
+                "skipped": total_skipped + product_skipped,
+                "failed": total_failed + product_failed,
+            },
+        )
+
         return {
-            "status": "ok" if total_failed == 0 else "partial",
+            "status": "ok" if total_failed == 0 and product_failed == 0 else "partial",
             "docs_processed": len(processed_docs),
             "products_total": total_products,
-            "synced": total_synced,
-            "skipped": total_skipped,
-            "failed": total_failed,
+            "synced": total_synced + product_synced,
+            "skipped": total_skipped + product_skipped,
+            "failed": total_failed + product_failed,
             "details": processed_docs,
         }
 
@@ -544,6 +655,13 @@ async def moysklad_webhook(
                 synced_items_count=total_synced,
                 total_items_count=total_products,
             )
+        log_action(
+            tenant_id=tenant_id,
+            action_type="moysklad_webhook",
+            status="error",
+            message=f"Webhook exception: {type(e).__name__}",
+            source="webhook",
+        )
         raise
 
 

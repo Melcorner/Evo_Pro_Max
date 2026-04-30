@@ -15,12 +15,14 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from app.clients.evotor_client import fetch_stores_by_token
 from app.clients.telegram_client import TelegramClient
 from app.db import get_connection, adapt_query as aq
+from app.services.action_log_service import list_recent_actions, log_action
 from app.stores.telegram_link_token_store import (
     create_telegram_link_token,
     get_active_telegram_link_token,
     get_telegram_link_token_by_value,
     mark_telegram_link_token_linked,
 )
+from app.services.stale_mapping_service import cleanup_stale_product_mappings
 
 
 from app.services.product_snapshot_service import (
@@ -264,7 +266,7 @@ def _load_tenant_stores(tenant_id: str) -> list[dict]:
         conn.close()
 
 
-def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None, int, dict | None]:
+def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, int, dict | None, int, dict | None, list[dict]]:
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -340,7 +342,9 @@ def _get_lk_data(tenant_id: str) -> tuple[dict, dict, int, dict | None, int, dic
         except Exception:
             pass
 
-    return tenant, event_counts, mappings_count, store_mappings_count, stock_row, ms_products_count, last_event
+    recent_actions = list_recent_actions(tenant_id, limit=20)
+
+    return tenant, event_counts, mappings_count, store_mappings_count, stock_row, ms_products_count, last_event, recent_actions
 
 
 def _is_valid_email(email: str) -> bool:
@@ -526,6 +530,64 @@ def _badge(ok: bool, ok_text: str, fail_text: str) -> str:
     return f'<span class="{cls}">{ok_text if ok else fail_text}</span>'
 
 
+def _action_label(action_type: str | None) -> str:
+    labels = {
+        "initial_sync": "Первичная синхронизация",
+        "initial_sync_store": "Первичная синхронизация магазина",
+        "initial_sync_all_stores": "Первичная синхронизация всех магазинов",
+        "stock_reconcile": "Сверка остатков",
+        "stock_reconcile_store": "Сверка остатков магазина",
+        "stock_reconcile_all_stores": "Сверка остатков всех магазинов",
+        "ms_to_evotor_store": "МС -> Эвотор",
+        "moysklad_webhook": "Webhook МойСклад",
+        "notification": "Уведомление",
+        "set_primary_store": "Основной магазин",
+        "token_update": "Обновление токена",
+        "product_snapshot": "Snapshot товаров",
+        "product_rollback": "Откат товаров",
+        "cleanup_stale_mappings": "Очистка связей",
+    }
+    return labels.get(action_type or "", action_type or "-")
+
+
+def _render_recent_actions(actions: list[dict]) -> str:
+    if not actions:
+        rows = '<div class="lk-row"><span class="lk-row-label">Действий пока нет</span></div>'
+    else:
+        rows = ""
+        status_classes = {
+            "ok": "badge-ok",
+            "sent": "badge-ok",
+            "started": "badge-warn",
+            "partial": "badge-warn",
+            "skipped": "badge-warn",
+            "failed": "badge-err",
+            "error": "badge-err",
+        }
+        for item in actions[:20]:
+            status = str(item.get("status") or "-")
+            cls = status_classes.get(status, "badge-neutral")
+            store = item.get("evotor_store_id") or "all"
+            message = html.escape(item.get("message") or "")
+            if len(message) > 140:
+                message = message[:137] + "..."
+            rows += f"""
+            <div class="lk-row" style="align-items:flex-start;gap:12px;">
+                <div style="min-width:112px;font-size:12px;color:#6b7280;">{_format_ts(item.get("created_at"))}</div>
+                <div style="flex:1;min-width:0;">
+                    <div style="font-size:14px;font-weight:600;color:#1a1d2e;">{html.escape(_action_label(item.get("action_type")))}</div>
+                    <div style="font-size:12px;color:#6b7280;margin-top:2px;">Магазин: {html.escape(str(store))}{(" · " + message) if message else ""}</div>
+                </div>
+                <span class="{cls}" style="white-space:nowrap;">{html.escape(status)}</span>
+            </div>"""
+
+    return f"""
+    <div class="lk-card" style="margin-top:16px;">
+        <div class="lk-card-title">Последние действия</div>
+        {rows}
+    </div>"""
+
+
 def _ob_layout(title: str, body: str, back_url: str | None = None) -> str:
     back_btn = f'<a href="{html.escape(back_url)}" class="back-btn">← Назад</a>' if back_url else ""
     return f"""<!DOCTYPE html>
@@ -611,6 +673,18 @@ def _run_initial_sync(tenant_id: str) -> dict:
                 "_run_initial_sync: store=%s synced=%s failed=%s",
                 store_id, result.get("synced", 0), result.get("failed", 0),
             )
+        except HTTPException as e:
+            if e.status_code == 409:
+                return {
+                    "status": "error",
+                    "error": str(e.detail),
+                    "synced": total_synced,
+                    "failed": 1,
+                    "skipped": total_skipped,
+                }
+            log.exception("_run_initial_sync: store=%s failed err=%s", store_id, e)
+            total_failed += 1
+            all_errors.append({"store": store_id, "error": str(e.detail)})
         except Exception as e:
             log.exception("_run_initial_sync: store=%s failed err=%s", store_id, e)
             total_failed += 1
@@ -1974,7 +2048,7 @@ def _save_evotor_and_sync(
 
 @router.get("/onboarding/tenants/{tenant_id}", response_class=HTMLResponse)
 def lk_overview(tenant_id: str):
-    tenant, event_counts, mappings_count, store_mappings_count, stock_row, ms_products_count, last_event = _get_lk_data(tenant_id)
+    tenant, event_counts, mappings_count, store_mappings_count, stock_row, ms_products_count, last_event, recent_actions = _get_lk_data(tenant_id)
     ms_ok = bool(tenant.get("moysklad_token"))
     evotor_ok = bool(tenant.get("evotor_token"))
     sync_ok = bool(tenant.get("sync_completed_at"))
@@ -2110,6 +2184,8 @@ def lk_overview(tenant_id: str):
         </div>
         {stores_rows}
     </div>"""
+
+    content += _render_recent_actions(recent_actions)
 
     return _lk_layout(tenant, "overview", content)
 
@@ -2804,6 +2880,14 @@ def onboarding_tenant_token_submit(tenant_id: str, moysklad_token: str = Form(..
         return _lk_layout(tenant, "integration", "", error_message=str(e))
     finally:
         conn.close()
+    log_action(
+        tenant_id=tenant_id,
+        action_type="token_update",
+        status="ok",
+        message=f"MoySklad token updated; organizations={len(orgs)}",
+        actor="user",
+        source="lk",
+    )
     tenant = _load_tenant(tenant_id)
     return _lk_layout(tenant, "integration", "", info_message=f"Токен обновлён. Найдено организаций: {len(orgs)}")
 
@@ -2814,38 +2898,46 @@ def onboarding_tenant_token_submit(tenant_id: str, moysklad_token: str = Form(..
 
 @router.post("/onboarding/tenants/{tenant_id}/sync", response_class=HTMLResponse)
 def onboarding_tenant_sync(tenant_id: str):
-    from app.stores.mapping_store import MappingStore
     from urllib.parse import quote_plus
-    # Сбрасываем sync для всех магазинов
-    conn = get_connection()
+
     try:
-        cur = conn.cursor()
-        cur.execute(aq("UPDATE tenants SET sync_completed_at = NULL WHERE id = ?"), (tenant_id,))
-        cur.execute(
-            aq("UPDATE tenant_stores SET sync_completed_at = NULL, updated_at = ? WHERE tenant_id = ?"),
-            (int(time.time()), tenant_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    # Не удаляем mappings перед повторной синхронизацией.
-    # Повторный sync должен только добирать/обновлять связи, но не ломать рабочие mappings
-    # при частичной ошибке или rate limit 429 от МойСклад.
-    # Запускаем синхронизацию
-    result = _run_initial_sync(tenant_id)
-    synced = result.get("synced", 0)
-    failed = result.get("failed", 0)
-    msg = f"Синхронизация завершена: связей восстановлено — {synced}, ошибок — {failed}."
-    if failed > 0:
+        result = _run_initial_sync(tenant_id)
+
+        synced = int(result.get("synced", 0) or 0)
+        skipped = int(result.get("skipped", 0) or 0)
+        failed = int(result.get("failed", 0) or 0)
+
+        if result.get("error"):
+            msg = str(result["error"])
+        else:
+            msg = (
+                f"Синхронизация завершена: новых связей — {synced}, "
+                f"уже существующих — {skipped}, ошибок — {failed}."
+            )
+
+        if failed > 0 or result.get("status") == "error":
+            return RedirectResponse(
+                url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(msg)}",
+                status_code=303,
+            )
+
         return RedirectResponse(
-            url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(msg)}",
+            url=f"/onboarding/tenants/{tenant_id}/actions?msg={quote_plus(msg)}",
             status_code=303,
         )
-    return RedirectResponse(
-        url=f"/onboarding/tenants/{tenant_id}/actions?msg={quote_plus(msg)}",
-        status_code=303,
-    )
 
+    except HTTPException as e:
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(str(e.detail))}",
+            status_code=303,
+        )
+
+    except Exception as e:
+        log.exception("onboarding_tenant_sync failed tenant_id=%s", tenant_id)
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(str(e))}",
+            status_code=303,
+        )
 
 @router.post("/onboarding/tenants/{tenant_id}/reconcile", response_class=HTMLResponse)
 def onboarding_tenant_reconcile(tenant_id: str):
@@ -2860,6 +2952,15 @@ def onboarding_tenant_reconcile(tenant_id: str):
             result = reconcile_stock_store(tenant_id, store["evotor_store_id"])
             total_synced += result.get("synced", 0)
             total_failed += result.get("failed", 0)
+        except HTTPException as e:
+            if e.status_code == 409:
+                msg = str(e.detail)
+                return RedirectResponse(
+                    url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(msg)}",
+                    status_code=303,
+                )
+            log.error("reconcile store=%s err=%s", store["evotor_store_id"], e.detail)
+            total_failed += 1
         except Exception as e:
             log.error("reconcile store=%s err=%s", store["evotor_store_id"], e)
             total_failed += 1
@@ -2908,6 +3009,15 @@ def onboarding_tenant_sync_ms_to_evotor(tenant_id: str):
             total_products_without_stock += products_without_stock
             total_stock_check_failed += int(result.get("stock_check_failed", 0) or 0)
 
+        except HTTPException as e:
+            if e.status_code == 409:
+                msg = str(e.detail)
+                return RedirectResponse(
+                    url=f"/onboarding/tenants/{tenant_id}/actions?err={quote_plus(msg)}",
+                    status_code=303,
+                )
+            log.error("sync_ms_to_evotor store=%s err=%s", store["evotor_store_id"], e.detail)
+            total_failed += 1
         except Exception as e:
             log.error("sync_ms_to_evotor store=%s err=%s", store["evotor_store_id"], e)
             total_failed += 1
@@ -3511,58 +3621,19 @@ def store_add(
 @router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/sync", response_class=HTMLResponse)
 def store_sync(tenant_id: str, evotor_store_id: str):
     from app.api.sync import initial_sync_store
-    from app.stores.mapping_store import MappingStore
     from urllib.parse import quote_plus
 
-    now = int(time.time())
-
-    conn = get_connection()
     try:
-        cur = conn.cursor()
-
-        cur.execute(
-            aq("""
-            UPDATE tenant_stores
-            SET sync_completed_at = NULL,
-                updated_at = ?
-            WHERE tenant_id = ?
-              AND evotor_store_id = ?
-            """),
-            (now, tenant_id, evotor_store_id),
-        )
-
-        cur.execute(
-            aq("""
-            UPDATE tenants
-            SET sync_completed_at = NULL,
-                updated_at = ?
-            WHERE id = ?
-              AND evotor_store_id = ?
-            """),
-            (now, tenant_id, evotor_store_id),
-        )
-
-        conn.commit()
-    finally:
-        conn.close()
-
-    try:
-        ms_store = MappingStore()
-        deleted = ms_store.delete_by_store(tenant_id, evotor_store_id)
-        log.info(
-            "store_sync: deleted %s mappings tenant_id=%s store=%s",
-            deleted,
-            tenant_id,
-            evotor_store_id,
-        )
-
         result = initial_sync_store(tenant_id, evotor_store_id)
 
-        synced = result.get("synced", 0)
-        skipped = result.get("skipped", 0)
-        failed = result.get("failed", 0)
+        synced = int(result.get("synced", 0) or 0)
+        skipped = int(result.get("skipped", 0) or 0)
+        failed = int(result.get("failed", 0) or 0)
 
-        msg = f"Синхронизация завершена: {synced + skipped} товаров, {failed} ошибок."
+        msg = (
+            f"Синхронизация завершена: новых связей — {synced}, "
+            f"уже существующих — {skipped}, ошибок — {failed}."
+        )
 
         if failed > 0:
             return RedirectResponse(
@@ -3575,12 +3646,22 @@ def store_sync(tenant_id: str, evotor_store_id: str):
             status_code=303,
         )
 
+    except HTTPException as e:
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(str(e.detail))}",
+            status_code=303,
+        )
+
     except Exception as e:
+        log.exception(
+            "store_sync failed tenant_id=%s store=%s",
+            tenant_id,
+            evotor_store_id,
+        )
         return RedirectResponse(
             url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(str(e))}",
             status_code=303,
         )
-
 
 @router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/reconcile", response_class=HTMLResponse)
 def store_reconcile(tenant_id: str, evotor_store_id: str):
@@ -3605,6 +3686,11 @@ def store_reconcile(tenant_id: str, evotor_store_id: str):
         )
 
     except Exception as e:
+        if isinstance(e, HTTPException):
+            return RedirectResponse(
+                url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(str(e.detail))}",
+                status_code=303,
+            )
         return RedirectResponse(
             url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(str(e))}",
             status_code=303,
@@ -3653,6 +3739,11 @@ def store_sync_ms_to_evotor(tenant_id: str, evotor_store_id: str):
         )
 
     except Exception as e:
+        if isinstance(e, HTTPException):
+            return RedirectResponse(
+                url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(str(e.detail))}",
+                status_code=303,
+            )
         log.exception(
             "store_sync_ms_to_evotor failed tenant_id=%s store=%s",
             tenant_id,
@@ -3729,6 +3820,15 @@ def store_set_primary(tenant_id: str, evotor_store_id: str):
         )
 
         conn.commit()
+        log_action(
+            tenant_id=tenant_id,
+            evotor_store_id=evotor_store_id,
+            action_type="set_primary_store",
+            status="ok",
+            message="Store selected as primary",
+            actor="user",
+            source="lk",
+        )
 
     except Exception as e:
         conn.rollback()
@@ -3757,6 +3857,16 @@ def lk_create_product_snapshot(tenant_id: str):
             tenant_id=tenant_id,
             evotor_store_id="all",
             reason="manual_lk",
+        )
+        log_action(
+            tenant_id=tenant_id,
+            evotor_store_id="all",
+            action_type="product_snapshot",
+            status="ok",
+            message="Product snapshot created",
+            actor="user",
+            source="lk",
+            metadata={"snapshot_path": snapshot_path},
         )
         msg = f"Точка восстановления товаров создана: {snapshot_path}"
         return RedirectResponse(
@@ -3789,6 +3899,15 @@ def lk_rollback_latest_product_snapshot(tenant_id: str):
         )
 
         if result["failed"] == 0:
+            log_action(
+                tenant_id=tenant_id,
+                evotor_store_id="all",
+                action_type="product_rollback",
+                status="ok",
+                message=f"Product rollback restored={result['restored']}, failed=0",
+                actor="user",
+                source="lk",
+            )
             msg = f"Карточки товаров восстановлены из последней точки: восстановлено — {result['restored']}, ошибок — 0. Теперь рекомендуется синхронизировать остатки."
             return RedirectResponse(
                 f"/onboarding/tenants/{tenant_id}/actions?ok={_urlparse.quote(msg)}",
