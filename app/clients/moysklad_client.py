@@ -136,6 +136,8 @@ class MoySkladClient:
                 }
             payload = dict(payload)
             payload["externalCode"] = external_code
+        else:
+            payload = dict(payload)
 
         if "httpbin.org" in self.BASE_URL:
             url = f"{self.BASE_URL}/post"
@@ -157,6 +159,95 @@ class MoySkladClient:
             "raw_response": response_json,
             "idempotent": False,
         }
+
+
+    def find_retail_demand_by_external_code(self, external_code: str) -> dict | None:
+        """
+        Ищет retaildemand в МойСклад по externalCode.
+        Используется для идемпотентного создания розничных продаж.
+        """
+        external_code = str(external_code or "").strip()
+        if not external_code:
+            return None
+
+        url = f"{self.BASE_URL}/entity/retaildemand"
+        r = requests.get(
+            url,
+            headers=self._headers(),
+            params={"filter": f"externalCode={external_code}"},
+            timeout=20,
+        )
+        self._handle_error(r)
+
+        rows = r.json().get("rows", [])
+        return rows[0] if rows else None
+
+    def create_retail_demand(self, payload: dict, external_code: str | None = None):
+        """
+        Создаёт retaildemand в МойСклад.
+        create_sale_document оставляем как fallback через demand.
+        """
+        external_code = str(
+            external_code
+            or payload.get("syncId")
+            or payload.get("externalCode")
+            or ""
+        ).strip()
+
+        if external_code:
+            existing = self.find_retail_demand_by_external_code(external_code)
+            if existing:
+                log.info(
+                    "RetailDemand already exists externalCode=%s id=%s — skipping create (idempotent)",
+                    external_code,
+                    existing.get("id"),
+                )
+                return {
+                    "success": True,
+                    "result_ref": existing.get("id"),
+                    "raw_response": existing,
+                    "idempotent": True,
+                    "document_type": "retaildemand",
+                }
+
+            payload = dict(payload)
+            payload["externalCode"] = external_code
+        else:
+            payload = dict(payload)
+
+        # retaildemand.syncId в МойСклад должен быть UUID.
+        # Для идемпотентности используем externalCode, поэтому syncId не отправляем.
+        payload.pop("syncId", None)
+
+        if "httpbin.org" in self.BASE_URL:
+            url = f"{self.BASE_URL}/post"
+        else:
+            url = f"{self.BASE_URL}/entity/retaildemand"
+
+        log.info("Creating retail demand url=%s externalCode=%s", url, external_code)
+        log.debug("RetailDemand payload=%s", payload)
+
+        r = requests.post(
+            url,
+            headers=self._headers(),
+            json=payload,
+            timeout=20,
+        )
+
+        log.info("MoySklad retaildemand response=%s", r.status_code)
+        self._handle_error(r)
+
+        response_json = r.json()
+        result_ref = "httpbin:created" if "httpbin.org" in self.BASE_URL else response_json.get("id")
+
+        return {
+            "success": True,
+            "result_ref": result_ref,
+            "raw_response": response_json,
+            "idempotent": False,
+            "document_type": "retaildemand",
+        }
+
 
     # -----------------------------
     # Stock helpers

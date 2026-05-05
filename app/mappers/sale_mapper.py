@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 
 from app.stores.mapping_store import MappingStore
 
@@ -332,3 +333,156 @@ def map_sale_to_ms(
     )
 
     return ms_payload
+
+
+def _now_ms_moment() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _extract_document_total(payload: dict) -> float:
+    body = payload.get("body", {}) or {}
+
+    if body.get("sum") is not None:
+        return float(body.get("sum") or 0)
+
+    total = 0.0
+    for item in body.get("positions", []) or []:
+        result_sum_raw = item.get("result_sum", item.get("resultSum"))
+        if result_sum_raw is not None:
+            total += float(result_sum_raw or 0)
+            continue
+
+        quantity = float(item.get("quantity", 0) or 0)
+        price = float(item.get("price", 0) or 0)
+        total += float(item.get("sum", 0) or (quantity * price))
+
+    return total
+
+
+def _extract_payment_sums(payload: dict, total_sum: float) -> tuple[int, int]:
+    """
+    Возвращает (cash_sum, no_cash_sum) в копейках.
+
+    Пока делаем безопасный fallback:
+    - если явно видим CARD/CASHLESS/ELECTRONIC — считаем безналом;
+    - иначе считаем наличными.
+    """
+    body = payload.get("body", {}) or {}
+    payments = body.get("payments") or payload.get("payments") or []
+
+    cash_sum = 0.0
+    no_cash_sum = 0.0
+
+    if isinstance(payments, list) and payments:
+        for payment in payments:
+            if not isinstance(payment, dict):
+                continue
+
+            raw_sum = (
+                payment.get("sum")
+                or payment.get("amount")
+                or payment.get("value")
+                or payment.get("result_sum")
+                or payment.get("resultSum")
+                or 0
+            )
+            try:
+                value = float(raw_sum or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+
+            payment_type = str(
+                payment.get("type")
+                or payment.get("payment_type")
+                or payment.get("paymentType")
+                or payment.get("method")
+                or ""
+            ).strip().upper()
+
+            if payment_type in ("CARD", "CASHLESS", "ELECTRONIC", "BANK_CARD", "NO_CASH"):
+                no_cash_sum += value
+            else:
+                cash_sum += value
+
+    if cash_sum <= 0 and no_cash_sum <= 0 and total_sum > 0:
+        cash_sum = total_sum
+
+    return round(cash_sum * 100), round(no_cash_sum * 100)
+
+
+def map_sale_to_ms_retail_demand(
+    payload: dict,
+    sync_id: str = None,
+    tenant_id: str = None,
+    ms_organization_id: str = None,
+    ms_store_id: str = None,
+    ms_agent_id: str = None,
+    ms_retail_store_id: str = None,
+    ms_retail_shift_id: str = None,
+    ms_cashier_id: str = None,
+    counterparty_resolution_source: str | None = None,
+    evotor_store_id: str | None = None,
+) -> dict:
+    """
+    Маппинг кассового чека Эвотор в Розничную продажу МойСклад /entity/retaildemand.
+
+    Старый map_sale_to_ms оставлен для режима demand.
+    """
+    base = map_sale_to_ms(
+        payload=payload,
+        sync_id=sync_id,
+        tenant_id=tenant_id,
+        ms_organization_id=ms_organization_id,
+        ms_store_id=ms_store_id,
+        ms_agent_id=ms_agent_id,
+        counterparty_resolution_source=counterparty_resolution_source,
+        evotor_store_id=evotor_store_id,
+    )
+
+    if not ms_retail_store_id:
+        raise SalePayloadError("ms_retail_store_id is required for retaildemand mode")
+
+    total_sum = _extract_document_total(payload)
+    cash_sum, no_cash_sum = _extract_payment_sums(payload, total_sum)
+
+    retail_payload = {
+        # Для retaildemand не передаём syncId: МойСклад ожидает UUID.
+        # Для нашей идемпотентности используем externalCode.
+        "externalCode": base.get("externalCode"),
+        "name": base.get("name"),
+        "description": base.get("description"),
+        "moment": _now_ms_moment(),
+        "positions": base.get("positions", []),
+        "retailStore": _meta("retailstore", ms_retail_store_id),
+        "cashSum": cash_sum,
+        "noCashSum": no_cash_sum,
+    }
+
+    if base.get("organization"):
+        retail_payload["organization"] = base["organization"]
+
+    if base.get("store"):
+        retail_payload["store"] = base["store"]
+
+    if base.get("agent"):
+        retail_payload["agent"] = base["agent"]
+
+    if ms_cashier_id:
+        retail_payload["cashier"] = _meta("employee", ms_cashier_id)
+
+    if ms_retail_shift_id:
+        retail_payload["retailShift"] = _meta("retailshift", ms_retail_shift_id)
+
+    log.info(
+        "Mapped retaildemand payload syncId=%s store=%s positions=%s cashSum=%s noCashSum=%s retailStore=%s shift=%s",
+        retail_payload.get("syncId"),
+        evotor_store_id,
+        len(retail_payload.get("positions", [])),
+        cash_sum,
+        no_cash_sum,
+        ms_retail_store_id,
+        bool(ms_retail_shift_id),
+    )
+
+    return retail_payload
+
