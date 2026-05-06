@@ -7,6 +7,12 @@ from app.clients.moysklad_client import MoySkladClient
 from app.mappers.sale_mapper import map_sale_to_ms, map_sale_to_ms_retail_demand, SalePayloadError, MappingNotFoundError
 from app.services.counterparty_resolver import resolve_counterparty_for_sale
 from app.db import get_connection, adapt_query as aq
+from app.stores.mapping_store import MappingStore
+from app.api.sync import (
+    _find_ms_product_by_external_code,
+    _get_or_create_ms_folder,
+    _create_ms_product,
+)
 
 log = logging.getLogger("sale_handler")
 
@@ -52,7 +58,8 @@ def _load_ms_config(tenant_id: str, evotor_store_id: str | None = None) -> dict:
                     COALESCE(NULLIF(ts.sale_document_mode, ''), 'demand') AS sale_document_mode,
                     ts.ms_retail_store_id AS ms_retail_store_id,
                     ts.ms_retail_shift_id AS ms_retail_shift_id,
-                    ts.ms_cashier_id AS ms_cashier_id
+                    ts.ms_cashier_id AS ms_cashier_id,
+                    t.evotor_token AS evotor_token
                 FROM tenants t
                 LEFT JOIN tenant_stores ts
                   ON ts.tenant_id = t.id
@@ -215,6 +222,150 @@ def _ensure_retail_shift(
     return shift_id
 
 
+
+EVOTOR_CREATED_PRODUCTS_FOLDER_NAME = "Товары, созданные на Эвоторе"
+
+
+def _extract_sale_positions(payload: dict) -> list[dict]:
+    body = payload.get("body") or {}
+    positions = body.get("positions") or []
+    return positions if isinstance(positions, list) else []
+
+
+def _build_ms_product_from_sale_position(
+    evotor_product_id: str,
+    sale_position: dict,
+) -> dict:
+    """
+    Собирает минимальный товар для МойСклад, если товар был создан на кассе
+    и продан раньше, чем попал в синхронизацию товаров.
+    """
+    name = (
+        sale_position.get("product_name")
+        or sale_position.get("productName")
+        or sale_position.get("name")
+        or f"Товар Эвотор {evotor_product_id}"
+    )
+
+    price = sale_position.get("price", 0)
+
+    barcodes = sale_position.get("barcodes") or []
+    if isinstance(barcodes, str):
+        barcodes = [barcodes]
+    if not isinstance(barcodes, list):
+        barcodes = []
+
+    return {
+        "id": evotor_product_id,
+        "name": str(name).strip() or f"Товар Эвотор {evotor_product_id}",
+        "description": "Автоматически создано при загрузке продажи из Эвотор",
+        "price": price or 0,
+        "cost_price": 0,
+        "measure_name": sale_position.get("measure_name") or sale_position.get("measureName") or "шт",
+        "tax": sale_position.get("tax") or "",
+        "type": "NORMAL",
+        "barcodes": barcodes,
+    }
+
+
+def _ensure_sale_product_mappings(
+    payload: dict,
+    tenant_id: str,
+    evotor_store_id: str | None,
+    ms_token: str,
+) -> None:
+    """
+    Гарантирует, что все товары из кассовой продажи имеют mapping Evotor -> МойСклад.
+
+    Бизнес-правило:
+    продажу пропускать нельзя. Если товара нет в mapping, создаём его в МойСклад
+    в папке "Товары, созданные на Эвоторе" и сохраняем mapping.
+    """
+    if not tenant_id or not evotor_store_id:
+        log.warning(
+            "Cannot ensure sale product mappings without tenant/store tenant_id=%s store=%s",
+            tenant_id,
+            evotor_store_id,
+        )
+        return
+
+    positions = _extract_sale_positions(payload)
+    if not positions:
+        return
+
+    mapping_store = MappingStore()
+    folder_meta = None
+
+    for i, item in enumerate(positions):
+        evotor_product_id = item.get("product_id") or item.get("productId")
+        if not evotor_product_id:
+            continue
+
+        evotor_product_id = str(evotor_product_id).strip()
+        if not evotor_product_id:
+            continue
+
+        existing_ms_id = mapping_store.get_by_evotor_id(
+            tenant_id=tenant_id,
+            entity_type="product",
+            evotor_id=evotor_product_id,
+            evotor_store_id=evotor_store_id,
+        )
+
+        if existing_ms_id:
+            continue
+
+        # Защита от дублей: если товар уже был создан в МС по externalCode,
+        # просто восстанавливаем mapping.
+        existing_ms_id = _find_ms_product_by_external_code(ms_token, evotor_product_id)
+        if existing_ms_id:
+            mapping_store.upsert_mapping(
+                tenant_id=tenant_id,
+                evotor_store_id=evotor_store_id,
+                entity_type="product",
+                evotor_id=evotor_product_id,
+                ms_id=existing_ms_id,
+            )
+            log.info(
+                "Sale product mapping restored from MS externalCode position=%s evotor_id=%s ms_id=%s store=%s",
+                i,
+                evotor_product_id,
+                existing_ms_id,
+                evotor_store_id,
+            )
+            continue
+
+        product_payload = _build_ms_product_from_sale_position(
+            evotor_product_id=evotor_product_id,
+            sale_position=item,
+        )
+
+        if folder_meta is None:
+            folder_meta = _get_or_create_ms_folder(ms_token, EVOTOR_CREATED_PRODUCTS_FOLDER_NAME)
+
+        if folder_meta:
+            product_payload["productFolder"] = {"meta": folder_meta}
+
+        ms_id = _create_ms_product(ms_token, product_payload)
+
+        mapping_store.upsert_mapping(
+            tenant_id=tenant_id,
+            evotor_store_id=evotor_store_id,
+            entity_type="product",
+            evotor_id=evotor_product_id,
+            ms_id=ms_id,
+        )
+
+        log.warning(
+            "Auto-created MS product from sale position=%s evotor_id=%s ms_id=%s name=%s store=%s",
+            i,
+            evotor_product_id,
+            ms_id,
+            product_payload.get("name"),
+            evotor_store_id,
+        )
+
+
 def handle_sale(event_row):
     log.info(f"Handle sale event_id={event_row['id']} event_key={event_row['event_key']}")
 
@@ -239,6 +390,13 @@ def handle_sale(event_row):
     )
 
     sale_document_mode = str(ms_config.get("sale_document_mode") or "demand").strip().lower()
+    _ensure_sale_product_mappings(
+        payload=payload,
+        tenant_id=tenant_id,
+        evotor_store_id=evotor_store_id,
+        ms_token=MoySkladClient(tenant_id).token,
+    )
+
     client = MoySkladClient(tenant_id)
 
     try:

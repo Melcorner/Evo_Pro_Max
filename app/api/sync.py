@@ -1872,6 +1872,14 @@ def _create_ms_product(ms_token: str, product: dict, _retry: int = 0) -> str:
             "currency": {"meta": currency_meta},
         }
 
+    # --- Папка товара ---
+    product_folder = product.get("productFolder")
+    if isinstance(product_folder, dict):
+        if "meta" in product_folder:
+            payload["productFolder"] = product_folder
+        elif product_folder.get("href"):
+            payload["productFolder"] = {"meta": product_folder}
+
     # --- Единица измерения ---
     measure_name = _extract_evotor_measure_name(product)
     if measure_name:
