@@ -122,10 +122,155 @@ def _save_retail_shift_id(tenant_id: str, evotor_store_id: str, shift_id: str) -
         conn.close()
 
 
+
+def _extract_evotor_shift_id(payload: dict) -> str | None:
+    """
+    Достаёт shiftId кассовой смены Эвотор из разных форматов webhook.
+    """
+    for key in ("shiftId", "shift_id", "evotor_shift_id"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+
+    body = payload.get("body") or {}
+    if isinstance(body, dict):
+        for key in ("shiftId", "shift_id"):
+            value = body.get(key)
+            if value not in (None, ""):
+                return str(value)
+
+    data = payload.get("data") or {}
+    if isinstance(data, dict):
+        for key in ("shiftId", "shift_id"):
+            value = data.get(key)
+            if value not in (None, ""):
+                return str(value)
+
+    source_data = payload.get("source_data") or {}
+    if isinstance(source_data, dict):
+        for key in ("shiftId", "shift_id"):
+            value = source_data.get(key)
+            if value not in (None, ""):
+                return str(value)
+
+    return None
+
+
+def _extract_evotor_device_id(payload: dict) -> str:
+    """
+    Достаёт deviceId кассы Эвотор. Если его нет — возвращает пустую строку,
+    чтобы смена была хотя бы на уровне магазина.
+    """
+    for key in ("deviceId", "device_id", "evotor_device_id"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+
+    body = payload.get("body") or {}
+    if isinstance(body, dict):
+        for key in ("deviceId", "device_id"):
+            value = body.get(key)
+            if value not in (None, ""):
+                return str(value)
+
+    data = payload.get("data") or {}
+    if isinstance(data, dict):
+        for key in ("deviceId", "device_id"):
+            value = data.get(key)
+            if value not in (None, ""):
+                return str(value)
+
+    source_data = payload.get("source_data") or {}
+    if isinstance(source_data, dict):
+        for key in ("deviceId", "device_id"):
+            value = source_data.get(key)
+            if value not in (None, ""):
+                return str(value)
+
+    return ""
+
+
+def _get_evotor_shift_mapping(
+    tenant_id: str,
+    evotor_store_id: str,
+    evotor_device_id: str,
+    evotor_shift_id: str,
+) -> str | None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("""
+            SELECT ms_retail_shift_id
+            FROM evotor_shift_mappings
+            WHERE tenant_id = ?
+              AND evotor_store_id = ?
+              AND evotor_device_id = ?
+              AND evotor_shift_id = ?
+              AND status = 'open'
+            LIMIT 1
+            """),
+            (tenant_id, evotor_store_id, evotor_device_id or "", evotor_shift_id),
+        )
+        row = cur.fetchone()
+        return row["ms_retail_shift_id"] if row else None
+    finally:
+        conn.close()
+
+
+def _save_evotor_shift_mapping(
+    tenant_id: str,
+    evotor_store_id: str,
+    evotor_device_id: str,
+    evotor_shift_id: str,
+    ms_retail_shift_id: str,
+    opened_at: int | None = None,
+) -> None:
+    now = int(time.time())
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            aq("""
+            INSERT INTO evotor_shift_mappings (
+                tenant_id,
+                evotor_store_id,
+                evotor_device_id,
+                evotor_shift_id,
+                ms_retail_shift_id,
+                status,
+                opened_at,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)
+            ON CONFLICT (tenant_id, evotor_store_id, evotor_device_id, evotor_shift_id)
+            DO UPDATE SET
+                ms_retail_shift_id = excluded.ms_retail_shift_id,
+                status = 'open',
+                updated_at = excluded.updated_at
+            """),
+            (
+                tenant_id,
+                evotor_store_id,
+                evotor_device_id or "",
+                evotor_shift_id,
+                ms_retail_shift_id,
+                opened_at or now,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _ensure_retail_shift(
     tenant_id: str,
     evotor_store_id: str,
     ms_config: dict,
+    payload: dict | None = None,
 ) -> str:
     """
     Возвращает retailShift для создания retaildemand.
@@ -134,8 +279,29 @@ def _ensure_retail_shift(
     Если не сохранён — ищем смену по externalCode.
     Если не нашли — создаём новую смену и сохраняем её в tenant_stores.
     """
+    evotor_shift_id = _extract_evotor_shift_id(payload or {})
+    evotor_device_id = _extract_evotor_device_id(payload or {})
+
+    if evotor_shift_id:
+        mapped_shift_id = _get_evotor_shift_mapping(
+            tenant_id=tenant_id,
+            evotor_store_id=evotor_store_id,
+            evotor_device_id=evotor_device_id,
+            evotor_shift_id=evotor_shift_id,
+        )
+        if mapped_shift_id:
+            log.info(
+                "Retail shift mapped from Evotor shift tenant_id=%s store=%s device=%s evotor_shift_id=%s ms_shift_id=%s",
+                tenant_id,
+                evotor_store_id,
+                evotor_device_id,
+                evotor_shift_id,
+                mapped_shift_id,
+            )
+            return mapped_shift_id
+
     current_shift_id = str(ms_config.get("ms_retail_shift_id") or "").strip()
-    if current_shift_id:
+    if current_shift_id and not evotor_shift_id:
         return current_shift_id
 
     retail_store_id = str(ms_config.get("ms_retail_store_id") or "").strip()
@@ -153,7 +319,12 @@ def _ensure_retail_shift(
     base_url = client.BASE_URL
     headers = client._headers()
 
-    base_external_code = f"evomspro-shift-{tenant_id[:8]}-{evotor_store_id[:8]}"
+    if evotor_shift_id:
+        safe_device = evotor_device_id[:12] if evotor_device_id else "store"
+        base_external_code = f"evomspro-shift-{tenant_id[:8]}-{evotor_store_id[:8]}-{safe_device}-{evotor_shift_id}"
+    else:
+        base_external_code = f"evomspro-shift-{tenant_id[:8]}-{evotor_store_id[:8]}"
+
     external_code = base_external_code
 
     # 1. Ищем уже созданную смену.
@@ -210,6 +381,15 @@ def _ensure_retail_shift(
 
     _save_retail_shift_id(tenant_id, evotor_store_id, shift_id)
     ms_config["ms_retail_shift_id"] = shift_id
+
+    if evotor_shift_id:
+        _save_evotor_shift_mapping(
+            tenant_id=tenant_id,
+            evotor_store_id=evotor_store_id,
+            evotor_device_id=evotor_device_id,
+            evotor_shift_id=evotor_shift_id,
+            ms_retail_shift_id=shift_id,
+        )
 
     log.info(
         "Retail shift created tenant_id=%s store=%s shift_id=%s externalCode=%s",
@@ -405,6 +585,7 @@ def handle_sale(event_row):
                 tenant_id=tenant_id,
                 evotor_store_id=evotor_store_id,
                 ms_config=ms_config,
+                payload=payload,
             )
 
             ms_payload = map_sale_to_ms_retail_demand(

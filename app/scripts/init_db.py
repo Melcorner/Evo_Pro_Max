@@ -24,6 +24,7 @@ SCHEMA_TABLES = (
     "processed_events",
     "mappings",
     "product_group_mappings",
+    "evotor_shift_mappings",
     "errors",
     "stock_sync_status",
     "sync_locks",
@@ -36,6 +37,14 @@ SCHEMA_TABLES = (
 )
 
 INDEX_DEFINITIONS = [
+    (
+        "idx_evotor_shift_mappings_tenant_store",
+        "CREATE INDEX IF NOT EXISTS idx_evotor_shift_mappings_tenant_store ON evotor_shift_mappings(tenant_id, evotor_store_id)",
+    ),
+    (
+        "idx_evotor_shift_mappings_ms_shift",
+        "CREATE INDEX IF NOT EXISTS idx_evotor_shift_mappings_ms_shift ON evotor_shift_mappings(ms_retail_shift_id)",
+    ),
     (
         "idx_event_unique",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_unique ON event_store(tenant_id, event_key)",
@@ -424,6 +433,26 @@ def init_db():
     )
 
     # ------------------------------------------------------------------
+    # evotor_shift_mappings
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evotor_shift_mappings (
+            tenant_id           TEXT NOT NULL,
+            evotor_store_id    TEXT NOT NULL,
+            evotor_device_id   TEXT NOT NULL DEFAULT '',
+            evotor_shift_id    TEXT NOT NULL,
+            ms_retail_shift_id TEXT NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'open',
+            opened_at          INTEGER,
+            closed_at          INTEGER,
+            created_at         INTEGER NOT NULL,
+            updated_at         INTEGER NOT NULL,
+
+            UNIQUE (tenant_id, evotor_store_id, evotor_device_id, evotor_shift_id)
+        )
+        """
+    )
+
     # event_store
     # ------------------------------------------------------------------
     cur.execute(
