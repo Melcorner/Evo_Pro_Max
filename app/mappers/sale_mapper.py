@@ -361,53 +361,126 @@ def _extract_document_total(payload: dict) -> float:
 
 def _extract_payment_sums(payload: dict, total_sum: float) -> tuple[int, int]:
     """
-    Возвращает (cash_sum, no_cash_sum) в копейках.
+    Возвращает суммы оплаты для retaildemand в копейках:
+    - cashSum — наличные;
+    - noCashSum — безналичная оплата.
 
-    Пока делаем безопасный fallback:
-    - если явно видим CARD/CASHLESS/ELECTRONIC — считаем безналом;
-    - иначе считаем наличными.
+    Поддерживаем два режима:
+    1. Если в payload есть явная разбивка payments/payment/paymentsList — считаем по ней.
+    2. Если разбивки нет, используем paymentSource из исходного чека Эвотор.
+
+    Для неизвестного способа оплаты временно используем cashSum, чтобы не потерять продажу.
     """
-    body = payload.get("body", {}) or {}
-    payments = body.get("payments") or payload.get("payments") or []
+    total_sum = float(total_sum or 0)
 
-    cash_sum = 0.0
-    no_cash_sum = 0.0
+    def _norm(value) -> str:
+        return str(value or "").strip().upper()
 
-    if isinstance(payments, list) and payments:
-        for payment in payments:
+    def _amount_from_payment(payment: dict) -> float:
+        for key in ("sum", "amount", "value", "total", "paidSum", "paymentSum"):
+            if payment.get(key) is not None:
+                try:
+                    return float(payment.get(key) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
+
+    def _payment_type(payment: dict) -> str:
+        for key in ("type", "paymentType", "payment_source", "paymentSource", "source", "kind"):
+            value = payment.get(key)
+            if value:
+                return _norm(value)
+        return ""
+
+    def _is_cash(value: str) -> bool:
+        return value in {
+            "CASH",
+            "PAY_CASH",
+            "CASH_PAYMENT",
+            "нал",
+            "НАЛ",
+            "НАЛИЧНЫЕ",
+        }
+
+    def _is_cashless(value: str) -> bool:
+        return value in {
+            "CARD",
+            "PAY_CARD",
+            "BANK_CARD",
+            "ELECTRONIC",
+            "CASHLESS",
+            "NO_CASH",
+            "NON_CASH",
+            "SBP",
+            "SBERBANK",
+            "QR",
+            "безнал",
+            "БЕЗНАЛ",
+            "БЕЗНАЛИЧНЫЕ",
+        }
+
+    source_data = payload.get("source_data") or {}
+    body = payload.get("body") or {}
+
+    # 1. Явная разбивка оплат, если она появится в реальных чеках.
+    payment_lists = []
+    for container in (payload, body, source_data):
+        for key in ("payments", "payment", "paymentsList", "paymentList"):
+            value = container.get(key) if isinstance(container, dict) else None
+            if isinstance(value, list):
+                payment_lists.extend(value)
+            elif isinstance(value, dict):
+                payment_lists.append(value)
+
+    if payment_lists:
+        cash_sum = 0.0
+        no_cash_sum = 0.0
+        unknown_sum = 0.0
+
+        for payment in payment_lists:
             if not isinstance(payment, dict):
                 continue
 
-            raw_sum = (
-                payment.get("sum")
-                or payment.get("amount")
-                or payment.get("value")
-                or payment.get("result_sum")
-                or payment.get("resultSum")
-                or 0
-            )
-            try:
-                value = float(raw_sum or 0)
-            except (TypeError, ValueError):
-                value = 0.0
+            payment_type = _payment_type(payment)
+            amount = _amount_from_payment(payment)
 
-            payment_type = str(
-                payment.get("type")
-                or payment.get("payment_type")
-                or payment.get("paymentType")
-                or payment.get("method")
-                or ""
-            ).strip().upper()
-
-            if payment_type in ("CARD", "CASHLESS", "ELECTRONIC", "BANK_CARD", "NO_CASH"):
-                no_cash_sum += value
+            if _is_cash(payment_type):
+                cash_sum += amount
+            elif _is_cashless(payment_type):
+                no_cash_sum += amount
             else:
-                cash_sum += value
+                unknown_sum += amount
 
-    if cash_sum <= 0 and no_cash_sum <= 0 and total_sum > 0:
-        cash_sum = total_sum
+        # Неизвестную часть не теряем.
+        cash_sum += unknown_sum
 
-    return round(cash_sum * 100), round(no_cash_sum * 100)
+        # Если список оплат был, но суммы в нём не распознаны — fallback по paymentSource.
+        if cash_sum > 0 or no_cash_sum > 0:
+            return round(cash_sum * 100), round(no_cash_sum * 100)
+
+    # 2. Основной сценарий Эвотор: paymentSource в source_data.
+    payment_source = _norm(
+        source_data.get("paymentSource")
+        or payload.get("paymentSource")
+        or body.get("paymentSource")
+        or source_data.get("payment_source")
+        or payload.get("payment_source")
+        or body.get("payment_source")
+    )
+
+    if _is_cashless(payment_source):
+        return 0, round(total_sum * 100)
+
+    if _is_cash(payment_source):
+        return round(total_sum * 100), 0
+
+    # 3. Fallback: продажу не теряем, но оставляем в наличных.
+    log.warning(
+        "Unknown paymentSource for retaildemand; fallback to cashSum paymentSource=%s total_sum=%s",
+        payment_source,
+        total_sum,
+    )
+    return round(total_sum * 100), 0
 
 
 def map_sale_to_ms_retail_demand(
