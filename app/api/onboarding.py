@@ -79,6 +79,47 @@ def _ms_headers(token: str) -> dict:
         "Accept-Encoding": "gzip",
     }
 
+
+
+def _ms_options(data):
+    """
+    Нормализует ответ МойСклад в список option-объектов для HTML select.
+
+    Поддерживает:
+    - {"rows": [...]}
+    - [...]
+    """
+    if isinstance(data, dict):
+        rows = data.get("rows", [])
+    elif isinstance(data, list):
+        rows = data
+    else:
+        rows = []
+
+    result = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        item_id = row.get("id")
+        if not item_id:
+            meta = row.get("meta") or {}
+            href = meta.get("href") or ""
+            if href:
+                item_id = href.rstrip("/").split("/")[-1]
+
+        if not item_id:
+            continue
+
+        name = row.get("name") or str(item_id)
+
+        result.append({
+            "id": str(item_id),
+            "name": str(name),
+        })
+
+    return result
+
 def _ms_fetch(path: str, token: str, params: dict | None = None) -> dict:
     url = f"{MS_BASE}{path}"
     r = requests.get(url, headers=_ms_headers(token), params=params, timeout=20)
@@ -95,6 +136,8 @@ def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
     orgs = extract(_ms_fetch("/entity/organization", token))
     stores = extract(_ms_fetch("/entity/store", token))
     agents = extract(_ms_fetch("/entity/counterparty", token, params={"limit": 100}))
+    retailstores = extract(_ms_fetch("/entity/retailstore", token, params={"limit": 100}))
+    employees = extract(_ms_fetch("/entity/employee", token, params={"limit": 100}))
     return orgs, stores, agents
 
 
@@ -254,7 +297,12 @@ def _load_tenant_stores(tenant_id: str) -> list[dict]:
         cur.execute(
             aq("""
             SELECT id, tenant_id, evotor_store_id, name, ms_store_id,
-                   ms_organization_id, ms_agent_id, is_primary, sync_completed_at, created_at
+                   ms_organization_id, ms_agent_id,
+                   COALESCE(NULLIF(sale_document_mode, ''), 'demand') AS sale_document_mode,
+                   ms_retail_store_id,
+                   ms_cashier_id,
+                   ms_retail_shift_id,
+                   is_primary, sync_completed_at, created_at
             FROM tenant_stores
             WHERE tenant_id = ?
             ORDER BY is_primary DESC, created_at ASC
@@ -1037,6 +1085,12 @@ def wizard_step3(tenant_id: str, session_id: str, store_id: str, err: str | None
         <div class="field"><label>Организация</label>{_select("ms_organization_id", ms_orgs)}</div>
         <div class="field"><label>Склад</label>{_select("ms_store_id", ms_stores)}</div>
         <div class="field"><label>Контрагент по умолчанию</label>{_select("ms_agent_id", ms_agents)}</div>
+        <div class="field"><label>Режим продаж</label>{_select("sale_document_mode", [
+            {"id": "retaildemand", "name": "Розничная продажа"},
+            {"id": "demand", "name": "Отгрузка"}
+        ])}</div>
+        <div class="field"><label>Точка продаж МойСклад</label>{_select("ms_retail_store_id", (locals().get("ms_data") or {}).get("retailstores", []))}</div>
+        <div class="field"><label>Кассир МойСклад</label>{_select("ms_cashier_id", (locals().get("ms_data") or {}).get("employees", []))}</div>
 
         <div class="section-title">Фискализация <span style="font-weight:400;color:#9ca3af;">(необязательно)</span></div>
         <div class="field"><label>Fiscal Token</label><input type="text" name="fiscal_token" placeholder="Оставьте пустым если не нужна" /></div>
@@ -1060,6 +1114,9 @@ def wizard_step3_submit(
     ms_organization_id: str = Form(...),
     ms_store_id: str = Form(...),
     ms_agent_id: str = Form(...),
+    sale_document_mode: str = Form("retaildemand"),
+    ms_retail_store_id: str = Form(""),
+    ms_cashier_id: str = Form(""),
     fiscal_token: str = Form(""),
     fiscal_client_uid: str = Form(""),
     fiscal_device_uid: str = Form(""),
@@ -1093,7 +1150,7 @@ def wizard_step3_submit(
         cur.execute(
             aq("""
             INSERT INTO tenant_stores
-                (id, tenant_id, evotor_store_id, name, ms_store_id, ms_organization_id, ms_agent_id, is_primary, created_at, updated_at)
+                (id, tenant_id, evotor_store_id, name, ms_store_id, ms_organization_id, ms_agent_id, sale_document_mode, ms_retail_store_id, ms_cashier_id, is_primary, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (evotor_store_id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
@@ -1101,11 +1158,17 @@ def wizard_step3_submit(
                 ms_store_id = EXCLUDED.ms_store_id,
                 ms_organization_id = EXCLUDED.ms_organization_id,
                 ms_agent_id = EXCLUDED.ms_agent_id,
+                sale_document_mode = EXCLUDED.sale_document_mode,
+                ms_retail_store_id = EXCLUDED.ms_retail_store_id,
+                ms_cashier_id = EXCLUDED.ms_cashier_id,
                 is_primary = EXCLUDED.is_primary,
                 updated_at = EXCLUDED.updated_at
             """),
             (str(uuid.uuid4()), tenant_id, store_id, final_name,
              ms_store_id.strip(), ms_organization_id.strip(), ms_agent_id.strip(),
+             sale_document_mode.strip() or "retaildemand",
+             ms_retail_store_id.strip() or None,
+             ms_cashier_id.strip() or None,
              primary_val, now, now),
         )
 
@@ -1125,6 +1188,9 @@ def wizard_step3_submit(
                     updated_at = ?
                 WHERE id = ?"""),
                 (ms_organization_id.strip(), ms_store_id.strip(), ms_agent_id.strip(),
+                 sale_document_mode.strip() or "retaildemand",
+                 ms_retail_store_id.strip() or None,
+                 ms_cashier_id.strip() or None,
                  store_id, now, tenant_id),
             )
         conn.commit()
@@ -1439,6 +1505,12 @@ def onboarding_ms_token_submit(session_id: str, store_id: str, moysklad_token: s
         <div class="field"><label>Организация</label>{_select("ms_organization_id", orgs)}</div>
         <div class="field"><label>Склад</label>{_select("ms_store_id", ms_stores)}</div>
         <div class="field"><label>Контрагент по умолчанию</label>{_select("ms_agent_id", agents)}</div>
+        <div class="field"><label>Режим продаж</label>{_select("sale_document_mode", [
+            {"id": "retaildemand", "name": "Розничная продажа"},
+            {"id": "demand", "name": "Отгрузка"}
+        ])}</div>
+        <div class="field"><label>Точка продаж МойСклад</label>{_select("ms_retail_store_id", (locals().get("ms_data") or {}).get("retailstores", []))}</div>
+        <div class="field"><label>Кассир МойСклад</label>{_select("ms_cashier_id", (locals().get("ms_data") or {}).get("employees", []))}</div>
 
         <div class="section-title">Уведомления (необязательно)</div>
         <div class="field"><label>Email</label><input type="email" name="alert_email" placeholder="owner@example.com" /></div>
@@ -1470,6 +1542,9 @@ def onboarding_store_profile_submit(
     ms_organization_id: str = Form(...),
     ms_store_id: str = Form(...),
     ms_agent_id: str = Form(...),
+    sale_document_mode: str = Form("retaildemand"),
+    ms_retail_store_id: str = Form(""),
+    ms_cashier_id: str = Form(""),
     alert_email: str = Form(""),
     alerts_email_enabled: bool = Form(False),
     fiscal_token: str = Form(""),
@@ -1556,6 +1631,9 @@ def onboarding_store_profile_submit(
                     ms_store_id,
                     ms_organization_id,
                     ms_agent_id,
+                    sale_document_mode,
+                    ms_retail_store_id,
+                    ms_cashier_id,
                     is_primary,
                     created_at,
                     updated_at
@@ -1567,6 +1645,9 @@ def onboarding_store_profile_submit(
                     ms_store_id = COALESCE(EXCLUDED.ms_store_id, tenant_stores.ms_store_id),
                     ms_organization_id = COALESCE(EXCLUDED.ms_organization_id, tenant_stores.ms_organization_id),
                     ms_agent_id = COALESCE(EXCLUDED.ms_agent_id, tenant_stores.ms_agent_id),
+                    sale_document_mode = COALESCE(NULLIF(EXCLUDED.sale_document_mode, ''), tenant_stores.sale_document_mode),
+                    ms_retail_store_id = COALESCE(EXCLUDED.ms_retail_store_id, tenant_stores.ms_retail_store_id),
+                    ms_cashier_id = COALESCE(EXCLUDED.ms_cashier_id, tenant_stores.ms_cashier_id),
                     is_primary = 1,
                     updated_at = EXCLUDED.updated_at
             """),
@@ -1578,6 +1659,9 @@ def onboarding_store_profile_submit(
                 ms_store_id.strip() or None,
                 ms_organization_id.strip() or None,
                 ms_agent_id.strip() or None,
+                sale_document_mode.strip() or "retaildemand",
+                ms_retail_store_id.strip() or None,
+                ms_cashier_id.strip() or None,
                 now,
                 now,
             ),
@@ -1915,6 +1999,9 @@ def onboarding_tenant_evotor_store_submit(
     ms_organization_id: str = Form(""),
     ms_store_id: str = Form(""),
     ms_agent_id: str = Form(""),
+    sale_document_mode: str = Form("retaildemand"),
+    ms_retail_store_id: str = Form(""),
+    ms_cashier_id: str = Form(""),
 ):
     tenant = _load_tenant(tenant_id)
     return _save_evotor_and_sync(tenant_id, tenant, evotor_token, store_id, store_name,
@@ -1973,6 +2060,7 @@ def _save_evotor_and_sync(
                 INSERT INTO tenant_stores (
                     id, tenant_id, evotor_store_id, name,
                     ms_store_id, ms_organization_id, ms_agent_id,
+                    sale_document_mode, ms_retail_store_id, ms_cashier_id,
                     is_primary, created_at, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
@@ -1982,6 +2070,9 @@ def _save_evotor_and_sync(
                     ms_store_id = COALESCE(EXCLUDED.ms_store_id, tenant_stores.ms_store_id),
                     ms_organization_id = COALESCE(EXCLUDED.ms_organization_id, tenant_stores.ms_organization_id),
                     ms_agent_id = COALESCE(EXCLUDED.ms_agent_id, tenant_stores.ms_agent_id),
+                    sale_document_mode = COALESCE(NULLIF(EXCLUDED.sale_document_mode, ''), tenant_stores.sale_document_mode),
+                    ms_retail_store_id = COALESCE(EXCLUDED.ms_retail_store_id, tenant_stores.ms_retail_store_id),
+                    ms_cashier_id = COALESCE(EXCLUDED.ms_cashier_id, tenant_stores.ms_cashier_id),
                     is_primary = 1,
                     updated_at = EXCLUDED.updated_at
             """),
@@ -1993,6 +2084,9 @@ def _save_evotor_and_sync(
                 ms_store_id.strip() or None,
                 ms_organization_id.strip() or None,
                 ms_agent_id.strip() or None,
+                sale_document_mode.strip() or "retaildemand",
+                ms_retail_store_id.strip() or None,
+                ms_cashier_id.strip() or None,
                 now,
                 now,
             ),
@@ -3052,12 +3146,16 @@ def lk_stores(tenant_id: str, msg: str | None = None, err: str | None = None):
     ms_orgs = []
     ms_stores_list = []
     ms_agents = []
+    ms_retailstores = _ms_options(_ms_fetch("/entity/retailstore", tenant["moysklad_token"], params={"limit": 100}))
+    ms_employees = _ms_options(_ms_fetch("/entity/employee", tenant["moysklad_token"], params={"limit": 100}))
     ms_load_error = ""
     ms_store_name_map = {}
 
     if tenant.get("moysklad_token"):
         try:
             ms_orgs, ms_stores_list, ms_agents = _ms_fetch_all(tenant["moysklad_token"])
+            ms_retailstores = _ms_options(_ms_fetch("/entity/retailstore", tenant["moysklad_token"], params={"limit": 100}))
+            ms_employees = _ms_options(_ms_fetch("/entity/employee", tenant["moysklad_token"], params={"limit": 100}))
             ms_store_name_map = {
                 str(item["id"]): item["name"]
                 for item in ms_stores_list
@@ -3217,6 +3315,12 @@ def lk_stores(tenant_id: str, msg: str | None = None, err: str | None = None):
         '<div class="form-field">',
         '<label class="form-label">Контрагент по умолчанию</label>',
         build_select("ms_agent_id", ms_agents, "UUID контрагента"),
+        build_select("sale_document_mode", [
+            {"id": "retaildemand", "name": "Розничная продажа"},
+            {"id": "demand", "name": "Отгрузка"}
+        ], "Режим продаж"),
+        build_select("ms_retail_store_id", ms_retailstores, "UUID точки продаж"),
+        build_select("ms_cashier_id", ms_employees, "UUID кассира"),
         '</div>',
 
         '<div style="display:flex;align-items:center;gap:10px;">',
@@ -3272,10 +3376,14 @@ def lk_store_detail(
     ms_store_name_map = {}
     ms_org_name_map = {}
     ms_agent_name_map = {}
+    ms_retail_store_name_map = {}
+    ms_cashier_name_map = {}
 
     if tenant.get("moysklad_token"):
         try:
             ms_orgs, ms_stores_list, ms_agents = _ms_fetch_all(tenant["moysklad_token"])
+            ms_retailstores = _ms_options(_ms_fetch("/entity/retailstore", tenant["moysklad_token"], params={"limit": 100}))
+            ms_employees = _ms_options(_ms_fetch("/entity/employee", tenant["moysklad_token"], params={"limit": 100}))
             ms_store_name_map = {
                 str(item["id"]): item["name"]
                 for item in ms_stores_list
@@ -3289,6 +3397,16 @@ def lk_store_detail(
             ms_agent_name_map = {
                 str(item["id"]): item["name"]
                 for item in ms_agents
+                if item.get("id")
+            }
+            ms_retail_store_name_map = {
+                str(item["id"]): item["name"]
+                for item in ms_retailstores
+                if item.get("id")
+            }
+            ms_cashier_name_map = {
+                str(item["id"]): item["name"]
+                for item in ms_employees
                 if item.get("id")
             }
         except Exception as e:
@@ -3320,6 +3438,29 @@ def lk_store_detail(
     )
     ms_agent_display = html.escape(
         ms_agent_name_map.get(str(store.get("ms_agent_id") or ""), "Контрагент не выбран")
+    )
+
+    sale_document_mode_value = str(store.get("sale_document_mode") or "demand").strip().lower()
+    sale_document_mode_display = html.escape(
+        "Розничная продажа" if sale_document_mode_value == "retaildemand" else "Отгрузка"
+    )
+
+    ms_retail_store_display = html.escape(
+        ms_retail_store_name_map.get(
+            str(store.get("ms_retail_store_id") or ""),
+            "Точка продаж не выбрана",
+        )
+    )
+
+    ms_cashier_display = html.escape(
+        ms_cashier_name_map.get(
+            str(store.get("ms_cashier_id") or ""),
+            "Кассир не выбран",
+        )
+    )
+
+    ms_retail_shift_display = html.escape(
+        str(store.get("ms_retail_shift_id") or "Будет создана при продаже")
     )
 
     store_switcher = ""
@@ -3380,6 +3521,18 @@ def lk_store_detail(
 
         '<div class="lk-row"><span class="lk-row-label">Контрагент по умолчанию</span>'
         f'<span class="lk-row-value">{ms_agent_display}</span></div>',
+
+        '<div class="lk-row"><span class="lk-row-label">Режим продаж</span>'
+        f'<span class="lk-row-value">{sale_document_mode_display}</span></div>',
+
+        '<div class="lk-row"><span class="lk-row-label">Точка продаж МойСклад</span>'
+        f'<span class="lk-row-value">{ms_retail_store_display}</span></div>',
+
+        '<div class="lk-row"><span class="lk-row-label">Кассир МойСклад</span>'
+        f'<span class="lk-row-value">{ms_cashier_display}</span></div>',
+
+        '<div class="lk-row"><span class="lk-row-label">Розничная смена МойСклад</span>'
+        f'<span class="lk-row-value">{ms_retail_shift_display}</span></div>',
 
         '<div class="lk-row"><span class="lk-row-label">Первичная синхронизация</span>'
         + _badge(sync_ok, "Выполнена " + _format_ts(store.get("sync_completed_at")), "Не выполнена")
@@ -3455,6 +3608,9 @@ def store_add(
     ms_store_id: str = Form(""),
     ms_organization_id: str = Form(""),
     ms_agent_id: str = Form(""),
+    sale_document_mode: str = Form("retaildemand"),
+    ms_retail_store_id: str = Form(""),
+    ms_cashier_id: str = Form(""),
     is_primary: bool = Form(False),
 ):
     tenant = _load_tenant(tenant_id)
@@ -3526,7 +3682,7 @@ def store_add(
         sql = (
             "INSERT INTO tenant_stores "
             "(id, tenant_id, evotor_store_id, name, ms_store_id, "
-            "ms_organization_id, ms_agent_id, is_primary, created_at, updated_at) "
+            "ms_organization_id, ms_agent_id, sale_document_mode, ms_retail_store_id, ms_cashier_id, is_primary, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (evotor_store_id) DO UPDATE SET "
             "tenant_id = EXCLUDED.tenant_id, "
@@ -3534,6 +3690,9 @@ def store_add(
             "ms_store_id = COALESCE(EXCLUDED.ms_store_id, tenant_stores.ms_store_id), "
             "ms_organization_id = COALESCE(EXCLUDED.ms_organization_id, tenant_stores.ms_organization_id), "
             "ms_agent_id = COALESCE(EXCLUDED.ms_agent_id, tenant_stores.ms_agent_id), "
+            "sale_document_mode = COALESCE(NULLIF(EXCLUDED.sale_document_mode, ''), tenant_stores.sale_document_mode), "
+            "ms_retail_store_id = COALESCE(EXCLUDED.ms_retail_store_id, tenant_stores.ms_retail_store_id), "
+            "ms_cashier_id = COALESCE(EXCLUDED.ms_cashier_id, tenant_stores.ms_cashier_id), "
             "is_primary = EXCLUDED.is_primary, "
             "updated_at = EXCLUDED.updated_at"
         )
@@ -3548,6 +3707,9 @@ def store_add(
                 ms_store_id.strip() or None,
                 ms_organization_id.strip() or None,
                 ms_agent_id.strip() or None,
+                sale_document_mode.strip() or "retaildemand",
+                ms_retail_store_id.strip() or None,
+                ms_cashier_id.strip() or None,
                 final_primary,
                 now,
                 now,
