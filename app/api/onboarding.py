@@ -3239,15 +3239,20 @@ def lk_stores(tenant_id: str, msg: str | None = None, err: str | None = None):
 
     rows_html = ''.join(rows_parts)
 
-    def build_select(field_name, items, placeholder):
+    def build_select(field_name, items, placeholder, selected=""):
+        selected = str(selected or "")
+
         if not items:
-            return f'<input class="form-input" name="{field_name}" placeholder="{placeholder}" />'
+            safe_value = html.escape(selected)
+            return f'<input class="form-input" name="{field_name}" value="{safe_value}" placeholder="{placeholder}" />'
 
         options = '<option value="">— выберите —</option>'
         for item in items:
-            item_id = html.escape(item["id"])
-            item_name = html.escape(item["name"])
-            options += f'<option value="{item_id}">{item_name}</option>'
+            raw_id = str(item["id"])
+            item_id = html.escape(raw_id)
+            item_name = html.escape(str(item["name"]))
+            selected_attr = " selected" if raw_id == selected else ""
+            options += f'<option value="{item_id}"{selected_attr}>{item_name}</option>'
 
         return f'<select class="form-input" name="{field_name}">{options}</select>'
 
@@ -3501,6 +3506,24 @@ def lk_store_detail(
             '</div></div>'
         )
 
+    def build_select(field_name, items, placeholder, selected=""):
+        selected = str(selected or "")
+
+        if not items:
+            safe_value = html.escape(selected)
+            return f'<input class="form-input" name="{field_name}" value="{safe_value}" placeholder="{placeholder}" />'
+
+        options = '<option value="">— выберите —</option>'
+        for item in items:
+            raw_id = str(item["id"])
+            item_id = html.escape(raw_id)
+            item_name = html.escape(str(item["name"]))
+            selected_attr = " selected" if raw_id == selected else ""
+            options += f'<option value="{item_id}"{selected_attr}>{item_name}</option>'
+
+        return f'<select class="form-input" name="{field_name}">{options}</select>'
+
+
     content_parts = [
         f'<a href="/onboarding/tenants/{tid}/stores" '
         'style="display:inline-flex;align-items:center;gap:6px;font-size:13px;'
@@ -3545,6 +3568,50 @@ def lk_store_detail(
         '</div>',
 
         '<div class="lk-card">',
+
+        '<div class="lk-card" style="margin-top:16px;">',
+        '<div class="lk-card-title">Настройки магазина</div>',
+        f'<form method="post" action="/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/settings">',
+        '<div style="display:flex;flex-direction:column;gap:12px;">',
+
+        '<div class="form-field">',
+        '<label class="form-label">Организация МойСклад</label>',
+        build_select("ms_organization_id", ms_orgs, "UUID организации", selected=str(store.get("ms_organization_id") or "")),
+        '</div>',
+
+        '<div class="form-field">',
+        '<label class="form-label">Склад МойСклад</label>',
+        build_select("ms_store_id", ms_stores_list, "UUID склада", selected=str(store.get("ms_store_id") or "")),
+        '</div>',
+
+        '<div class="form-field">',
+        '<label class="form-label">Контрагент по умолчанию</label>',
+        build_select("ms_agent_id", ms_agents, "UUID контрагента", selected=str(store.get("ms_agent_id") or "")),
+        '</div>',
+
+        '<div class="form-field">',
+        '<label class="form-label">Режим продаж</label>',
+        build_select("sale_document_mode", [
+            {"id": "retaildemand", "name": "Розничная продажа"},
+            {"id": "demand", "name": "Отгрузка"},
+        ], "Режим продаж", selected=str(store.get("sale_document_mode") or "retaildemand")),
+        '</div>',
+
+        '<div class="form-field">',
+        '<label class="form-label">Точка продаж МойСклад</label>',
+        build_select("ms_retail_store_id", ms_retailstores, "UUID точки продаж", selected=str(store.get("ms_retail_store_id") or "")),
+        '</div>',
+
+        '<div class="form-field">',
+        '<label class="form-label">Кассир МойСклад</label>',
+        build_select("ms_cashier_id", ms_employees, "UUID кассира", selected=str(store.get("ms_cashier_id") or "")),
+        '</div>',
+
+        '<button type="submit" class="btn btn-primary" style="align-self:flex-start;">Сохранить настройки</button>',
+        '</div>',
+        '</form>',
+        '</div>',
+
         '<div class="lk-card-title">Действия</div>',
         '<div class="actions-list">',
 
@@ -3683,7 +3750,7 @@ def store_add(
             "INSERT INTO tenant_stores "
             "(id, tenant_id, evotor_store_id, name, ms_store_id, "
             "ms_organization_id, ms_agent_id, sale_document_mode, ms_retail_store_id, ms_cashier_id, is_primary, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (evotor_store_id) DO UPDATE SET "
             "tenant_id = EXCLUDED.tenant_id, "
             "name = COALESCE(EXCLUDED.name, tenant_stores.name), "
@@ -3776,6 +3843,99 @@ def store_add(
         from urllib.parse import quote_plus
         return RedirectResponse(
             url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(f'Магазин добавлен, но синхронизация не выполнена: {e}')}",
+            status_code=303,
+        )
+
+
+
+@router.post("/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}/settings", response_class=HTMLResponse)
+def update_store_settings(
+    tenant_id: str,
+    evotor_store_id: str,
+    ms_organization_id: str = Form(""),
+    ms_store_id: str = Form(""),
+    ms_agent_id: str = Form(""),
+    sale_document_mode: str = Form("retaildemand"),
+    ms_retail_store_id: str = Form(""),
+    ms_cashier_id: str = Form(""),
+):
+    sale_document_mode = (sale_document_mode or "retaildemand").strip().lower()
+
+    if sale_document_mode not in {"demand", "retaildemand"}:
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus('Некорректный режим продаж')}",
+            status_code=303,
+        )
+
+    try:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+
+            cur.execute(
+                aq("""
+                SELECT tenant_id, evotor_store_id
+                FROM tenant_stores
+                WHERE tenant_id = ?
+                  AND evotor_store_id = ?
+                """),
+                (tenant_id, evotor_store_id),
+            )
+            row = cur.fetchone()
+
+            if not row:
+                return RedirectResponse(
+                    url=f"/onboarding/tenants/{tenant_id}/stores?err={quote_plus('Магазин не найден')}",
+                    status_code=303,
+                )
+
+            cur.execute(
+                aq("""
+                UPDATE tenant_stores
+                SET ms_organization_id = ?,
+                    ms_store_id = ?,
+                    ms_agent_id = ?,
+                    sale_document_mode = ?,
+                    ms_retail_store_id = ?,
+                    ms_cashier_id = ?,
+                    updated_at = ?
+                WHERE tenant_id = ?
+                  AND evotor_store_id = ?
+                """),
+                (
+                    ms_organization_id.strip() or None,
+                    ms_store_id.strip() or None,
+                    ms_agent_id.strip() or None,
+                    sale_document_mode,
+                    ms_retail_store_id.strip() or None,
+                    ms_cashier_id.strip() or None,
+                    int(time.time()),
+                    tenant_id,
+                    evotor_store_id,
+                ),
+            )
+
+            conn.commit()
+
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?msg={quote_plus('Настройки магазина сохранены')}",
+            status_code=303,
+        )
+
+    except Exception as e:
+        log.exception(
+            "Failed to update store settings tenant_id=%s store=%s",
+            tenant_id,
+            evotor_store_id,
+        )
+        return RedirectResponse(
+            url=f"/onboarding/tenants/{tenant_id}/stores/{evotor_store_id}?err={quote_plus(str(e))}",
             status_code=303,
         )
 
