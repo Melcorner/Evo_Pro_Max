@@ -3918,19 +3918,38 @@ def sync_ms_to_evotor_store(tenant_id: str, evotor_store_id: str):
                         upd_payload, ms_product_full,
                         tenant_id, evotor_store_id, tenant["evotor_token"],
                     )
+                    # Остаток выбранного склада МойСклад обязательно передаём в Эвотор.
+                    upd_payload["quantity"] = float(row.get("_store_stock") or 0)
                     bulk_update_items.append(upd_payload)
                 except Exception as _e:
                     log.warning("Failed to build update payload ms_id=%s err=%s", ms_id, _e)
                     skipped += 1
                 continue
 
+            # Для нового товара берём полную карточку МойСклад с productFolder,
+            # иначе товар может создаться в Эвотор без папки/группы.
+            ms_product_full = _get_ms_product(
+                tenant["moysklad_token"],
+                ms_id,
+                expand="productFolder",
+            )
+
             payload = _build_evotor_product_payload(
-                row,
+                ms_product_full,
                 evotor_id=None,
                 current_product=None,
                 for_create=True,
             )
-            _apply_product_group(payload, row, tenant_id, evotor_store_id, tenant["evotor_token"])
+            _apply_product_group(
+                payload,
+                ms_product_full,
+                tenant_id,
+                evotor_store_id,
+                tenant["evotor_token"],
+            )
+
+            # Новый товар создаём сразу с остатком выбранного склада.
+            payload["quantity"] = float(row.get("_store_stock") or 0)
 
             r = _req.post(
                 f"{EVOTOR_BASE}/stores/{evotor_store_id}/products",
@@ -4257,5 +4276,4 @@ def _update_fiscal_check_state(uid: str, state: dict) -> None:
         conn.commit()
     finally:
         conn.close()
-
 

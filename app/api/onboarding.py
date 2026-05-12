@@ -127,7 +127,7 @@ def _ms_fetch(path: str, token: str, params: dict | None = None) -> dict:
     return r.json()
 
 
-def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
+def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict]]:
     def extract(data: dict) -> list[dict]:
         return [
             {"id": row["id"], "name": row.get("name") or row.get("description") or row["id"]}
@@ -138,7 +138,7 @@ def _ms_fetch_all(token: str) -> tuple[list[dict], list[dict], list[dict]]:
     agents = extract(_ms_fetch("/entity/counterparty", token, params={"limit": 100}))
     retailstores = extract(_ms_fetch("/entity/retailstore", token, params={"limit": 100}))
     employees = extract(_ms_fetch("/entity/employee", token, params={"limit": 100}))
-    return orgs, stores, agents
+    return orgs, stores, agents, retailstores, employees
 
 
 # ---------------------------------------------------------------------------
@@ -1046,34 +1046,56 @@ def wizard_step3(tenant_id: str, session_id: str, store_id: str, err: str | None
     tenant = _load_tenant(tenant_id)
     session = _load_session(session_id)
     store = _get_session_store(session, store_id)
+
     if not store:
-        return HTMLResponse(_ob_step_layout(3, 5, "Ошибка", '<div class="ob-error">Магазин не найден.</div>'))
+        return HTMLResponse(
+            _ob_step_layout(
+                3,
+                5,
+                "Ошибка",
+                '<div class="ob-error">Магазин не найден.</div>',
+            )
+        )
 
     store_name = _extract_store_name(store, store_id)
 
-    # Загружаем данные МС
-    ms_orgs, ms_stores, ms_agents = [], [], []
+    # Загружаем данные МойСклад.
+    ms_orgs = []
+    ms_stores = []
+    ms_agents = []
+    ms_retailstores = []
+    ms_employees = []
     ms_err = ""
+
     try:
-        ms_orgs, ms_stores, ms_agents = _ms_fetch_all(tenant["moysklad_token"])
+        ms_orgs, ms_stores, ms_agents, ms_retailstores, ms_employees = _ms_fetch_all(tenant["moysklad_token"])
+        ms_retailstores = _ms_options(
+            _ms_fetch("/entity/retailstore", tenant["moysklad_token"], params={"limit": 100})
+        )
+        ms_employees = _ms_options(
+            _ms_fetch("/entity/employee", tenant["moysklad_token"], params={"limit": 100})
+        )
     except Exception as e:
         ms_err = str(e)
 
     err_html = f'<div class="ob-error">{html.escape(err)}</div>' if err else ""
-    ms_err_html = f'<div class="ob-error">Ошибка загрузки данных МС: {html.escape(ms_err)}</div>' if ms_err else ""
+    ms_err_html = f'<div class="ob-error">Ошибка загрузки данных МойСклад: {html.escape(ms_err)}</div>' if ms_err else ""
 
-    # Определяем первичный ли это магазин
+    # Определяем, первичный ли это магазин.
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(aq("SELECT COUNT(*) as cnt FROM tenant_stores WHERE tenant_id = ?"), (tenant_id,))
-    is_first = cur.fetchone()["cnt"] == 0
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(aq("SELECT COUNT(*) as cnt FROM tenant_stores WHERE tenant_id = ?"), (tenant_id,))
+        is_first = cur.fetchone()["cnt"] == 0
+    finally:
+        conn.close()
 
     body = f"""
     {err_html}{ms_err_html}
     <div class="ob-success" style="margin-bottom:20px;">
         <strong>Магазин:</strong> {html.escape(store_name)}
     </div>
+
     <form method="post" action="/onboarding/wizard/{html.escape(tenant_id)}/step3/{html.escape(session_id)}/{html.escape(store_id)}">
         <div class="field">
             <label>Название магазина</label>
@@ -1082,27 +1104,71 @@ def wizard_step3(tenant_id: str, session_id: str, store_id: str, err: str | None
         </div>
 
         <div class="section-title">Настройки МойСклад</div>
-        <div class="field"><label>Организация</label>{_select("ms_organization_id", ms_orgs)}</div>
-        <div class="field"><label>Склад</label>{_select("ms_store_id", ms_stores)}</div>
-        <div class="field"><label>Контрагент по умолчанию</label>{_select("ms_agent_id", ms_agents)}</div>
-        <div class="field"><label>Режим продаж</label>{_select("sale_document_mode", [
-            {"id": "retaildemand", "name": "Розничная продажа"},
-            {"id": "demand", "name": "Отгрузка"}
-        ])}</div>
-        <div class="field"><label>Точка продаж МойСклад</label>{_select("ms_retail_store_id", (locals().get("ms_data") or {}).get("retailstores", []))}</div>
-        <div class="field"><label>Кассир МойСклад</label>{_select("ms_cashier_id", (locals().get("ms_data") or {}).get("employees", []))}</div>
+
+        <div class="field">
+            <label>Организация</label>
+            {_select("ms_organization_id", ms_orgs)}
+        </div>
+
+        <div class="field">
+            <label>Склад</label>
+            {_select("ms_store_id", ms_stores)}
+        </div>
+
+        <div class="field">
+            <label>Контрагент по умолчанию</label>
+            {_select("ms_agent_id", ms_agents)}
+        </div>
+
+        <div class="field">
+            <label>Режим продаж</label>
+            {_select("sale_document_mode", [
+                {"id": "retaildemand", "name": "Розничная продажа"},
+                {"id": "demand", "name": "Отгрузка"},
+            ])}
+        </div>
+
+        <div class="field">
+            <label>Точка продаж МойСклад</label>
+            {_select("ms_retail_store_id", ms_retailstores)}
+        </div>
+
+        <div class="field">
+            <label>Кассир МойСклад</label>
+            {_select("ms_cashier_id", ms_employees)}
+        </div>
 
         <div class="section-title">Фискализация <span style="font-weight:400;color:#9ca3af;">(необязательно)</span></div>
-        <div class="field"><label>Fiscal Token</label><input type="text" name="fiscal_token" placeholder="Оставьте пустым если не нужна" /></div>
-        <div class="field"><label>Fiscal Client UID</label><input type="text" name="fiscal_client_uid" /></div>
-        <div class="field"><label>Fiscal Device UID</label><input type="text" name="fiscal_device_uid" /></div>
+
+        <div class="field">
+            <label>Fiscal Token</label>
+            <input type="text" name="fiscal_token" placeholder="Оставьте пустым если не нужна" />
+        </div>
+
+        <div class="field">
+            <label>Fiscal Client UID</label>
+            <input type="text" name="fiscal_client_uid" />
+        </div>
+
+        <div class="field">
+            <label>Fiscal Device UID</label>
+            <input type="text" name="fiscal_device_uid" />
+        </div>
 
         {"<input type='hidden' name='is_primary' value='1' />" if is_first else ""}
         <button type="submit" class="ob-btn" style="margin-top:8px;">Синхронизировать →</button>
-    </form>"""
+    </form>
+    """
 
-    return HTMLResponse(_ob_step_layout(3, 5, "Настройка магазина", body,
-                        back_url=f"/onboarding/wizard/{tenant_id}/step2/{session_id}"))
+    return HTMLResponse(
+        _ob_step_layout(
+            3,
+            5,
+            "Настройка магазина",
+            body,
+            back_url=f"/onboarding/wizard/{tenant_id}/step2/{session_id}",
+        )
+    )
 
 
 @router.post("/onboarding/wizard/{tenant_id}/step3/{session_id}/{store_id}", response_class=HTMLResponse)
@@ -1123,35 +1189,81 @@ def wizard_step3_submit(
     is_primary: str = Form("0"),
 ):
     from urllib.parse import quote_plus
+
     tenant = _load_tenant(tenant_id)
     session = _load_session(session_id)
     store = _get_session_store(session, store_id)
+
     if not store:
-        return HTMLResponse(_ob_step_layout(3, 5, "Ошибка", '<div class="ob-error">Магазин не найден.</div>'))
+        return HTMLResponse(
+            _ob_step_layout(
+                3,
+                5,
+                "Ошибка",
+                '<div class="ob-error">Магазин не найден.</div>',
+            )
+        )
+
+    sale_document_mode = (sale_document_mode or "retaildemand").strip().lower()
+    if sale_document_mode not in {"demand", "retaildemand"}:
+        return RedirectResponse(
+            url=f"/onboarding/wizard/{tenant_id}/step3/{session_id}/{store_id}?err={quote_plus('Некорректный режим продаж')}",
+            status_code=303,
+        )
 
     store_name = _extract_store_name(store, store_id)
     final_name = name.strip() or store_name
     now = int(time.time())
 
-    # Сохраняем evotor_token в тенант если ещё не сохранён
     conn = get_connection()
     try:
         cur = conn.cursor()
+
+        # Сохраняем токен Эвотор в tenant.
         cur.execute(
-            aq("UPDATE tenants SET evotor_token = ?, evotor_store_id = COALESCE(evotor_store_id, ?), updated_at = ? WHERE id = ?"),
-            (session["evotor_token"], store_id, now, tenant_id),
+            aq("""
+            UPDATE tenants
+            SET evotor_token = ?,
+                evotor_api_key = COALESCE(NULLIF(evotor_api_key, ''), ?),
+                evotor_store_id = COALESCE(evotor_store_id, ?),
+                updated_at = ?
+            WHERE id = ?
+            """),
+            (
+                session["evotor_token"],
+                session["evotor_token"],
+                store_id,
+                now,
+                tenant_id,
+            ),
         )
 
-        # Создаём или обновляем tenant_store
         primary_val = 1 if is_primary == "1" else 0
+
         if primary_val:
-            cur.execute(aq("UPDATE tenant_stores SET is_primary = 0 WHERE tenant_id = ?"), (tenant_id,))
+            cur.execute(
+                aq("UPDATE tenant_stores SET is_primary = 0 WHERE tenant_id = ?"),
+                (tenant_id,),
+            )
 
         cur.execute(
             aq("""
-            INSERT INTO tenant_stores
-                (id, tenant_id, evotor_store_id, name, ms_store_id, ms_organization_id, ms_agent_id, sale_document_mode, ms_retail_store_id, ms_cashier_id, is_primary, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tenant_stores (
+                id,
+                tenant_id,
+                evotor_store_id,
+                name,
+                ms_store_id,
+                ms_organization_id,
+                ms_agent_id,
+                sale_document_mode,
+                ms_retail_store_id,
+                ms_cashier_id,
+                is_primary,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (evotor_store_id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
                 name = EXCLUDED.name,
@@ -1164,43 +1276,79 @@ def wizard_step3_submit(
                 is_primary = EXCLUDED.is_primary,
                 updated_at = EXCLUDED.updated_at
             """),
-            (str(uuid.uuid4()), tenant_id, store_id, final_name,
-             ms_store_id.strip(), ms_organization_id.strip(), ms_agent_id.strip(),
-             sale_document_mode.strip() or "retaildemand",
-             ms_retail_store_id.strip() or None,
-             ms_cashier_id.strip() or None,
-             primary_val, now, now),
+            (
+                str(uuid.uuid4()),
+                tenant_id,
+                store_id,
+                final_name,
+                ms_store_id.strip(),
+                ms_organization_id.strip(),
+                ms_agent_id.strip(),
+                sale_document_mode,
+                ms_retail_store_id.strip() or None,
+                ms_cashier_id.strip() or None,
+                primary_val,
+                now,
+                now,
+            ),
         )
 
         if fiscal_token.strip() and fiscal_client_uid.strip() and fiscal_device_uid.strip():
             cur.execute(
-                aq("UPDATE tenants SET fiscal_token=?, fiscal_client_uid=?, fiscal_device_uid=? WHERE id=?"),
-                (fiscal_token.strip(), fiscal_client_uid.strip(), fiscal_device_uid.strip(), tenant_id),
+                aq("""
+                UPDATE tenants
+                SET fiscal_token = ?,
+                    fiscal_client_uid = ?,
+                    fiscal_device_uid = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """),
+                (
+                    fiscal_token.strip(),
+                    fiscal_client_uid.strip(),
+                    fiscal_device_uid.strip(),
+                    now,
+                    tenant_id,
+                ),
             )
-        # Если это основной магазин — обновляем поля в tenants тоже
+
+        # Если магазин основной — дублируем базовые настройки в tenants для fallback.
         if primary_val:
             cur.execute(
-                aq("""UPDATE tenants SET
-                    ms_organization_id = ?,
+                aq("""
+                UPDATE tenants
+                SET ms_organization_id = ?,
                     ms_store_id = ?,
                     ms_agent_id = ?,
                     evotor_store_id = ?,
                     updated_at = ?
-                WHERE id = ?"""),
-                (ms_organization_id.strip(), ms_store_id.strip(), ms_agent_id.strip(),
-                 sale_document_mode.strip() or "retaildemand",
-                 ms_retail_store_id.strip() or None,
-                 ms_cashier_id.strip() or None,
-                 store_id, now, tenant_id),
+                WHERE id = ?
+                """),
+                (
+                    ms_organization_id.strip(),
+                    ms_store_id.strip(),
+                    ms_agent_id.strip(),
+                    store_id,
+                    now,
+                    tenant_id,
+                ),
             )
+
         conn.commit()
+
     except Exception as e:
         conn.rollback()
-        conn.close()
+        log.exception(
+            "wizard_step3_submit failed tenant_id=%s session_id=%s store_id=%s",
+            tenant_id,
+            session_id,
+            store_id,
+        )
         return RedirectResponse(
             url=f"/onboarding/wizard/{tenant_id}/step3/{session_id}/{store_id}?err={quote_plus(str(e))}",
             status_code=303,
         )
+
     finally:
         conn.close()
 
@@ -1462,7 +1610,7 @@ def onboarding_ms_token_submit(session_id: str, store_id: str, moysklad_token: s
     if not moysklad_token:
         return HTMLResponse(_ob_layout("Ошибка", '<div class="ob-error">Токен обязателен.</div>'), status_code=400)
     try:
-        orgs, ms_stores, agents = _ms_fetch_all(moysklad_token)
+        orgs, ms_stores, agents, retailstores, employees = _ms_fetch_all(moysklad_token)
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else "?"
         msg = "Неверный токен." if status == 401 else f"Ошибка API: {status}"
@@ -2954,7 +3102,7 @@ def onboarding_tenant_token_submit(tenant_id: str, moysklad_token: str = Form(..
     if not moysklad_token:
         return _lk_layout(tenant, "integration", "", error_message="Токен обязателен.")
     try:
-        orgs, _, _ = _ms_fetch_all(moysklad_token)
+        orgs, _, _, _, _ = _ms_fetch_all(moysklad_token)
         if not orgs:
             raise ValueError("Нет организаций")
     except requests.HTTPError as e:
@@ -3153,7 +3301,7 @@ def lk_stores(tenant_id: str, msg: str | None = None, err: str | None = None):
 
     if tenant.get("moysklad_token"):
         try:
-            ms_orgs, ms_stores_list, ms_agents = _ms_fetch_all(tenant["moysklad_token"])
+            ms_orgs, ms_stores_list, ms_agents, ms_retailstores, ms_employees = _ms_fetch_all(tenant["moysklad_token"])
             ms_retailstores = _ms_options(_ms_fetch("/entity/retailstore", tenant["moysklad_token"], params={"limit": 100}))
             ms_employees = _ms_options(_ms_fetch("/entity/employee", tenant["moysklad_token"], params={"limit": 100}))
             ms_store_name_map = {
@@ -3323,9 +3471,19 @@ def lk_stores(tenant_id: str, msg: str | None = None, err: str | None = None):
         build_select("sale_document_mode", [
             {"id": "retaildemand", "name": "Розничная продажа"},
             {"id": "demand", "name": "Отгрузка"}
-        ], "Режим продаж"),
-        build_select("ms_retail_store_id", ms_retailstores, "UUID точки продаж"),
-        build_select("ms_cashier_id", ms_employees, "UUID кассира"),
+        ], "Режим продаж", selected="retaildemand"),
+        build_select(
+            "ms_retail_store_id",
+            ms_retailstores,
+            "UUID точки продаж",
+            selected=str(ms_retailstores[0]["id"]) if len(ms_retailstores) == 1 else "",
+        ),
+        build_select(
+            "ms_cashier_id",
+            ms_employees,
+            "UUID кассира",
+            selected=str(ms_employees[0]["id"]) if len(ms_employees) == 1 else "",
+        ),
         '</div>',
 
         '<div style="display:flex;align-items:center;gap:10px;">',
@@ -3386,7 +3544,7 @@ def lk_store_detail(
 
     if tenant.get("moysklad_token"):
         try:
-            ms_orgs, ms_stores_list, ms_agents = _ms_fetch_all(tenant["moysklad_token"])
+            ms_orgs, ms_stores_list, ms_agents, ms_retailstores, ms_employees = _ms_fetch_all(tenant["moysklad_token"])
             ms_retailstores = _ms_options(_ms_fetch("/entity/retailstore", tenant["moysklad_token"], params={"limit": 100}))
             ms_employees = _ms_options(_ms_fetch("/entity/employee", tenant["moysklad_token"], params={"limit": 100}))
             ms_store_name_map = {
