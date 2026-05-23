@@ -190,6 +190,90 @@ def _extract_evotor_device_id(payload: dict) -> str:
     return ""
 
 
+
+def _extract_evotor_shift_display_name(payload: dict, evotor_shift_id: str | None = None) -> str:
+    """
+    Возвращает короткое имя смены для МойСклад.
+
+    Приоритет:
+    1) номер смены из payload Эвотор: 23
+    2) shiftNumber/sessionNumber из вложенных объектов
+    3) evotor_shift_id
+    4) fallback по времени
+    """
+    payload = payload or {}
+
+    def clean(value):
+        if value is None:
+            return None
+
+        value = str(value).strip()
+        if not value:
+            return None
+
+        if value.endswith(".0") and value[:-2].isdigit():
+            value = value[:-2]
+
+        return value
+
+    direct_keys = (
+        "shiftNumber",
+        "shift_number",
+        "sessionNumber",
+        "session_number",
+        "shiftNo",
+        "shift_no",
+    )
+
+    for key in direct_keys:
+        value = clean(payload.get(key))
+        if value:
+            return value
+
+    nested_sources = [
+        payload.get("shift"),
+        payload.get("session"),
+        payload.get("body"),
+        payload.get("source_data"),
+        payload.get("sourceData"),
+        payload.get("receipt"),
+        payload.get("data"),
+    ]
+
+    nested_keys = (
+        "shiftNumber",
+        "shift_number",
+        "sessionNumber",
+        "session_number",
+        "number",
+        "num",
+    )
+
+    for source in nested_sources:
+        if not isinstance(source, dict):
+            continue
+
+        for key in nested_keys:
+            value = clean(source.get(key))
+            if value:
+                return value
+
+        for nested_name in ("shift", "session"):
+            nested = source.get(nested_name)
+            if not isinstance(nested, dict):
+                continue
+
+            for key in nested_keys:
+                value = clean(nested.get(key))
+                if value:
+                    return value
+
+    shift_id = clean(evotor_shift_id)
+    if shift_id:
+        return shift_id
+
+    return f"EvomsPro shift {int(time.time())}"
+
 def _get_evotor_shift_mapping(
     tenant_id: str,
     evotor_store_id: str,
@@ -357,7 +441,7 @@ def _ensure_retail_shift(
         external_code = f"{base_external_code}-{int(time.time())}"
 
     payload = {
-        "name": f"EvomsPro shift {int(time.time())}",
+        "name": _extract_evotor_shift_display_name(payload or {}, evotor_shift_id),
         "externalCode": external_code,
         "organization": _ms_meta(base_url, "organization", organization_id),
         "retailStore": _ms_meta(base_url, "retailstore", retail_store_id),

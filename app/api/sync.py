@@ -2288,7 +2288,7 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
         raise HTTPException(status_code=400, detail="moysklad_token not configured")
 
     try:
-        ms_product = _get_ms_product(tenant["moysklad_token"], ms_product_id)
+        ms_product = _get_ms_product(tenant["moysklad_token"], ms_product_id, expand="uom")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch MS product: {e}")
 
@@ -2311,7 +2311,7 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
             )
 
             url = f"{EVOTOR_BASE}/stores/{tenant['evotor_store_id']}/products/{existing_evotor_id}"
-            r = requests.patch(
+            r = requests.put(
                 url,
                 headers=_evotor_headers(tenant["evotor_token"]),
                 json=evotor_payload,
@@ -2329,11 +2329,12 @@ def sync_product_to_evotor(tenant_id: str, ms_product_id: str):
                 r.raise_for_status()
 
             log.info(
-                "Evotor product updated evotor_id=%s ms_id=%s type=%s tax=%s",
+                "Evotor product updated evotor_id=%s ms_id=%s type=%s tax=%s measure_name=%s",
                 existing_evotor_id,
                 ms_product_id,
                 evotor_payload.get("type"),
                 evotor_payload.get("tax"),
+                evotor_payload.get("measure_name"),
             )
             return {
                 "status": "updated",

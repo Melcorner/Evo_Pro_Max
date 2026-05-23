@@ -311,6 +311,54 @@ def _shorten_text(text: str | None, limit: int = 160) -> str | None:
     return normalized[: limit - 3] + "..."
 
 
+
+def _format_event_ts(ts: int | None) -> str:
+    if ts in (None, ""):
+        return "-"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+    except Exception:
+        return str(ts)
+
+
+def _normalize_event_row(row) -> dict | None:
+    if not row:
+        return None
+
+    return {
+        "id": row["id"],
+        "event_type": row["event_type"],
+        "event_key": row["event_key"],
+        "retries": int(row["retries"] or 0),
+        "last_error_code": _shorten_text(row["last_error_code"], limit=120),
+        "last_error_message": _shorten_text(row["last_error_message"], limit=500),
+        "updated_at": row["updated_at"],
+    }
+
+
+def _build_event_detail_parts(prefix: str, event: dict | None) -> list[str]:
+    if not event:
+        return []
+
+    parts = [
+        f"{prefix}_event_id={event.get('id') or '-'}",
+        f"{prefix}_event_type={event.get('event_type') or '-'}",
+        f"{prefix}_event_key={event.get('event_key') or '-'}",
+        f"{prefix}_retries={event.get('retries', 0)}",
+    ]
+
+    if event.get("last_error_code"):
+        parts.append(f"{prefix}_error_code={event['last_error_code']}")
+
+    if event.get("last_error_message"):
+        parts.append(f"{prefix}_error_message={event['last_error_message']}")
+
+    if event.get("updated_at") is not None:
+        parts.append(f"{prefix}_updated_at={_format_event_ts(event.get('updated_at'))}")
+
+    return parts
+
+
 def _empty_tenant_alert_state(tenant_id: str, channels: dict | None = None) -> dict:
     channels = channels or {}
     return {
@@ -324,6 +372,8 @@ def _empty_tenant_alert_state(tenant_id: str, channels: dict | None = None) -> d
         "alerts_telegram_enabled": bool(channels.get("alerts_telegram_enabled")),
         "failed_events_count": 0,
         "retry_events_count": 0,
+        "latest_failed_event": None,
+        "latest_retry_event": None,
         "stock_error_present": False,
         "stock_last_error": None,
         "synced_items_count": 0,
@@ -436,6 +486,45 @@ def _collect_tenant_alert_snapshot() -> dict[str, dict]:
 
         cur.execute(
             """
+            SELECT
+                tenant_id,
+                id,
+                event_type,
+                event_key,
+                retries,
+                last_error_code,
+                last_error_message,
+                updated_at
+            FROM (
+                SELECT
+                    tenant_id,
+                    id,
+                    event_type,
+                    event_key,
+                    retries,
+                    last_error_code,
+                    last_error_message,
+                    updated_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY tenant_id
+                        ORDER BY updated_at DESC, id DESC
+                    ) AS rn
+                FROM event_store
+                WHERE status = 'FAILED'
+            ) latest_events
+            WHERE rn = 1
+            """
+        )
+        for row in cur.fetchall():
+            tenant_id = row["tenant_id"]
+            state = tenant_states.setdefault(
+                tenant_id,
+                _empty_tenant_alert_state(tenant_id, tenant_channels.get(tenant_id)),
+            )
+            state["latest_failed_event"] = _normalize_event_row(row)
+
+        cur.execute(
+            """
             SELECT tenant_id, COUNT(*) AS cnt
             FROM event_store
             WHERE status = 'RETRY'
@@ -449,6 +538,45 @@ def _collect_tenant_alert_snapshot() -> dict[str, dict]:
                 _empty_tenant_alert_state(tenant_id, tenant_channels.get(tenant_id)),
             )
             state["retry_events_count"] = max(int(row["cnt"] or 0), 0)
+
+        cur.execute(
+            """
+            SELECT
+                tenant_id,
+                id,
+                event_type,
+                event_key,
+                retries,
+                last_error_code,
+                last_error_message,
+                updated_at
+            FROM (
+                SELECT
+                    tenant_id,
+                    id,
+                    event_type,
+                    event_key,
+                    retries,
+                    last_error_code,
+                    last_error_message,
+                    updated_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY tenant_id
+                        ORDER BY updated_at DESC, id DESC
+                    ) AS rn
+                FROM event_store
+                WHERE status = 'RETRY'
+            ) latest_events
+            WHERE rn = 1
+            """
+        )
+        for row in cur.fetchall():
+            tenant_id = row["tenant_id"]
+            state = tenant_states.setdefault(
+                tenant_id,
+                _empty_tenant_alert_state(tenant_id, tenant_channels.get(tenant_id)),
+            )
+            state["latest_retry_event"] = _normalize_event_row(row)
 
         cur.execute(
             """
@@ -479,11 +607,18 @@ def _collect_tenant_alert_snapshot() -> dict[str, dict]:
 
 
 def _build_tenant_failed_problem_message(state: dict) -> str:
-    return (
-        "ALERT: tenant FAILED events detected"
-        f" | tenant_id={state['tenant_id']}"
-        f" | failed_events_count={state['failed_events_count']}"
-    )
+    parts = [
+        "ALERT: tenant FAILED events detected",
+        f"tenant_id={state['tenant_id']}",
+    ]
+
+    if state.get("tenant_name"):
+        parts.append(f"tenant_name={state['tenant_name']}")
+
+    parts.append(f"failed_events_count={state['failed_events_count']}")
+    parts.extend(_build_event_detail_parts("latest_failed", state.get("latest_failed_event")))
+
+    return " | ".join(parts)
 
 
 def _build_tenant_failed_recovery_message(state: dict) -> str:
@@ -491,11 +626,18 @@ def _build_tenant_failed_recovery_message(state: dict) -> str:
 
 
 def _build_tenant_retry_problem_message(state: dict) -> str:
-    return (
-        "ALERT: tenant RETRY events detected"
-        f" | tenant_id={state['tenant_id']}"
-        f" | retry_events_count={state['retry_events_count']}"
-    )
+    parts = [
+        "ALERT: tenant RETRY events detected",
+        f"tenant_id={state['tenant_id']}",
+    ]
+
+    if state.get("tenant_name"):
+        parts.append(f"tenant_name={state['tenant_name']}")
+
+    parts.append(f"retry_events_count={state['retry_events_count']}")
+    parts.extend(_build_event_detail_parts("latest_retry", state.get("latest_retry_event")))
+
+    return " | ".join(parts)
 
 
 def _build_tenant_retry_recovery_message(state: dict) -> str:
@@ -524,16 +666,20 @@ def _build_tenant_alert_messages(previous_state: dict | None, current_state: dic
     previous_state = previous_state or _empty_tenant_alert_state(current_state["tenant_id"])
     messages: list[str] = []
 
-    previous_failed_present = previous_state["failed_events_count"] > 0
-    current_failed_present = current_state["failed_events_count"] > 0
-    if not previous_failed_present and current_failed_present:
+    previous_failed_count = int(previous_state["failed_events_count"] or 0)
+    current_failed_count = int(current_state["failed_events_count"] or 0)
+    previous_failed_present = previous_failed_count > 0
+    current_failed_present = current_failed_count > 0
+    if current_failed_present and current_failed_count > previous_failed_count:
         messages.append(_build_tenant_failed_problem_message(current_state))
     elif previous_failed_present and not current_failed_present:
         messages.append(_build_tenant_failed_recovery_message(current_state))
 
-    previous_retry_present = previous_state["retry_events_count"] > 0
-    current_retry_present = current_state["retry_events_count"] > 0
-    if not previous_retry_present and current_retry_present:
+    previous_retry_count = int(previous_state["retry_events_count"] or 0)
+    current_retry_count = int(current_state["retry_events_count"] or 0)
+    previous_retry_present = previous_retry_count > 0
+    current_retry_present = current_retry_count > 0
+    if current_retry_present and current_retry_count > previous_retry_count:
         messages.append(_build_tenant_retry_problem_message(current_state))
     elif previous_retry_present and not current_retry_present:
         messages.append(_build_tenant_retry_recovery_message(current_state))
@@ -654,6 +800,7 @@ def _deliver_tenant_message(
     event_type = _infer_tenant_event_type(message)
     had_requested_channel = False
     had_failed_channel = False
+    message_delivered = False
 
     if tenant_state["alerts_telegram_requested"]:
         had_requested_channel = True
@@ -696,6 +843,7 @@ def _deliver_tenant_message(
             else:
                 try:
                     telegram_client.send_message(message)
+                    message_delivered = True
                     _write_notification_log(
                         tenant_id=tenant_state["tenant_id"],
                         channel_type="telegram",
@@ -759,6 +907,7 @@ def _deliver_tenant_message(
             else:
                 try:
                     email_client.send_message(subject=subject, text=message)
+                    message_delivered = True
                     _write_notification_log(
                         tenant_id=tenant_state["tenant_id"],
                         channel_type="email",
@@ -785,7 +934,13 @@ def _deliver_tenant_message(
         log.info("tenant alert skipped: no tenant channels configured tenant_id=%s", tenant_state["tenant_id"])
         return True
 
-    return not had_failed_channel
+    if message_delivered and had_failed_channel:
+        log.warning(
+            "tenant alert delivered partially; advancing state tenant_id=%s",
+            tenant_state["tenant_id"],
+        )
+
+    return message_delivered or not had_failed_channel
 
 
 def main_loop():
